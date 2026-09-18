@@ -1,0 +1,21 @@
+# Generated volumes are large: manifests and configs are committed, data is not.
+data/
+runs/
+predictions/
+wandb/
+
+.venv
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+.DS_Store
+.idea/
+.vscode/

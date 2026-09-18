@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "relational3d"
+version = "1.0.0"
+description = "Segment a 3D structure from its spatial relations to named anchors"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "nibabel>=5.2",
+    "pyyaml>=6.0",
+    "torch>=2.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+logging = ["wandb>=0.19"]
+notebooks = ["plotly>=5.20"]
+
+[tool.setuptools.packages.find]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error::DeprecationWarning"]
