@@ -10,7 +10,7 @@ away.
 | [02 — Data and relations](02_data.md) | scenes, the direction rule, anchor selection, augmentation | `src/geometry.py`, `src/synthetic.py`, `src/data.py` |
 | [03 — Prompt encoder](03_prompt_encoder.md) | how a sentence becomes three tokens | `src/vocab.py`, `src/models.py` |
 | [04 — Stage A](04_stage_a.md) | the promptable structure segmenter | `src/models.py` |
-| [05 — Stage B](05_stage_b.md) | the relational target segmenter | `src/models.py` |
+| [05 — Stage B](05_stage_b.md) | the relational target segmenter | `src/models.py` · [drawio](flowcharts/05_stage_b.drawio) |
 | [06 — Training](06_training.md) | losses, schedule, the four phases | `src/engine.py` |
 | [07 — Evaluation](07_evaluation.md) | metrics, and the counterfactuals that matter more | `scripts/evaluate.py` |
 | [08 — Scaling](08_scaling.md) | real MRI, real structure names, 128³ | — |
@@ -39,14 +39,15 @@ Two networks:
                                               │
    prompt ──► three clause tokens ────────────┤
                                               ▼
-   labels > 0 (anonymous occupancy) ──────► Stage B ──► target mask
+   occupancy (same source as the anchors) ─► Stage B ──► target mask
 ```
 
-Splitting them is what makes the claim testable. Train Stage B with ground-truth
-anchors and you measure the relational architecture alone; swap in Stage A's
-predictions, change nothing else, and the difference is segmentation error. And
-because the supervised target classes are held out per split, a good score on
-validation and test is a score on structures never once supervised as a target.
+Splitting them is what makes the claim testable. `train.stage_b.mode: oracle`
+trains Stage B on ground-truth anchors and measures the relational architecture
+alone; `predicted` (the default) swaps in Stage A's predictions, changes nothing
+else, and the difference is segmentation error. And because the supervised
+target classes are held out per split, a good score on validation and test is a
+score on structures never once supervised as a target.
 
 ## Layout
 

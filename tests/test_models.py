@@ -173,7 +173,7 @@ def test_stage_b_sees_the_anchors_and_an_anonymous_occupancy_and_nothing_else(co
             seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
         ),
     )
-    prediction = StageBTask(model, corpus.vocab)(batch)
+    prediction = StageBTask(model, corpus.vocab, mode="oracle")(batch)
 
     target, anchors = prediction.target, masks_from(batch["labels"], batch["anchors"])
     # The encoder sees the anchor channels and nothing else - not the target, not
@@ -188,6 +188,51 @@ def test_stage_b_sees_the_anchors_and_an_anonymous_occupancy_and_nothing_else(co
     assert set(seen["occupancy"].unique().tolist()) <= {0.0, 1.0}
     assert float(seen["occupancy"].sum()) > float(target.sum()) * 1.5
     assert prediction.groups == [[n] for n in batch["target_name"]]
+
+
+def test_stage_b_anchors_only_occupancy_vanishes_after_subtract(corpus, monkeypatch):
+    """The decoder never sees the anchors twice: they are the given, not occupancy."""
+    from src.data import ExampleDataset, collate
+
+    dataset = ExampleDataset(corpus, "train")
+    batch = collate([dataset[0], dataset[1]])
+    model = StageB(
+        len(corpus.vocab), min(corpus.shape), corpus.n_anchors,
+        encoder_channels=(4, 8, 8, 8), token_dim=16, num_heads=2,
+    )
+    seen: dict[str, torch.Tensor] = {}
+    decode = model.decoder.forward
+    monkeypatch.setattr(
+        model.decoder,
+        "forward",
+        lambda features, *, context=None, occupancy=None: (
+            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
+        ),
+    )
+    StageBTask(model, corpus.vocab, mode="oracle", occupancy_mode="anchors-only")(batch)
+    assert not seen["occupancy"].any()
+
+
+def test_stage_b_none_occupancy_is_an_empty_channel(corpus, monkeypatch):
+    from src.data import ExampleDataset, collate
+
+    dataset = ExampleDataset(corpus, "train")
+    batch = collate([dataset[0], dataset[1]])
+    model = StageB(
+        len(corpus.vocab), min(corpus.shape), corpus.n_anchors,
+        encoder_channels=(4, 8, 8, 8), token_dim=16, num_heads=2,
+    )
+    seen: dict[str, torch.Tensor] = {}
+    decode = model.decoder.forward
+    monkeypatch.setattr(
+        model.decoder,
+        "forward",
+        lambda features, *, context=None, occupancy=None: (
+            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
+        ),
+    )
+    StageBTask(model, corpus.vocab, mode="oracle", occupancy_mode="none")(batch)
+    assert not seen["occupancy"].any()
 
 
 # -- geometry features -------------------------------------------------------

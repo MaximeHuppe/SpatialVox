@@ -20,16 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import load_config
 from src.data import Corpus, build_examples, load_nifti, normalize
-from src.engine import StageBTask, dice_iou, hausdorff, load_model, resolve_device, surface
+from src.engine import (
+    StageBTask, dice_iou, hausdorff, load_model, load_stage_a, resolve_device,
+    resolve_phase_a_checkpoint, resolve_stage_b_mode, surface,
+)
 from src.geometry import DIRECTIONS
 
 CORPUS = "data/processed"          # a corpus directory
 STAGE_B = "runs/stage_b/best.pt"   # segments the target from the relations
-STAGE_A = "runs/stage_a/best.pt"   # segments the named anchors from the image;
-                                   # set to None to hand Stage B the ground-truth
-                                   # anchors instead, which is the difference
-                                   # between measuring the whole pipeline and
-                                   # measuring the relational model alone
+# Stage A path and oracle-vs-predicted follow configs/config.yaml
+# (train.stage_b.mode / phase_a_checkpoint). Override with --set there.
 SCENE = None                       # a scene id, or None for the first test scene
 TARGET = None                      # a structure name, or None for the first feasible one
 
@@ -77,12 +77,22 @@ for slot, (anchor, direction) in enumerate(zip(example["anchors"], example["dire
 
 # %%
 stage_b = load_model(STAGE_B, device)
-stage_a = load_model(STAGE_A, device) if STAGE_A else None
-task = StageBTask(stage_b, vocab, segmenter=stage_a, threshold=cfg.train.threshold)
-print(f"anchors: {'predicted by Stage A' if stage_a else 'ground truth'}")
+mode = resolve_stage_b_mode(cfg.train.stage_b)
+segmenter_path = resolve_phase_a_checkpoint(cfg.train.stage_b)
+stage_a = load_stage_a(segmenter_path, device) if segmenter_path else None
+task = StageBTask(
+    stage_b, vocab,
+    mode=mode,
+    segmenter=stage_a,
+    threshold=cfg.train.threshold,
+    occupancy_mode=str(cfg.train.stage_b.occupancy_mode),
+)
+print(f"mode {task.mode}: anchors {'predicted by Stage A' if stage_a else 'ground truth'}")
+print(f"occupancy: {task.occupancy_mode} from {'segmenter' if stage_a else 'gt'}")
 
-# This is the whole contract: anchors, the clause indices, and a label volume
-# that only ever becomes `labels > 0` occupancy and the supervision target.
+# Anchors, the clause indices, and a label volume. Occupancy comes from
+# `train.stage_b.occupancy_mode` of either the segmenter or the ground truth;
+# the label volume is also the supervision target.
 batch = {
     "image": torch.from_numpy(normalize(image, cfg.data.normalize))[None, None].to(device),
     "labels": torch.from_numpy(labels.astype(np.int64))[None].to(device),

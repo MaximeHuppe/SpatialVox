@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 import torch
 
-from src.data import ExampleDataset, SceneDataset, loader
+from src.data import ExampleDataset, SceneDataset, collate, loader
 from src.engine import (
     Metrics,
     StageATask,
@@ -17,6 +18,9 @@ from src.engine import (
     hausdorff,
     load_model,
     masks_from,
+    occupancy_from,
+    resolve_phase_a_checkpoint,
+    resolve_stage_b_mode,
     segmentation_loss,
 )
 from src.models import StageA, StageB
@@ -95,6 +99,130 @@ def test_masks_from_labels_matches_an_explicit_comparison():
     assert torch.equal(masks[1, 1], (labels[1] == 4).float())
 
 
+def _stage_b_batch(corpus):
+    return collate([ExampleDataset(corpus, "train")[0]])
+
+
+def test_occupancy_all_includes_the_target(corpus):
+    """The ceiling: occupancy is labels > 0, target included."""
+    batch = _stage_b_batch(corpus)
+    occupancy = occupancy_from(batch, "all")
+    target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
+    assert occupancy.shape == (1, 1, *batch["labels"].shape[1:])
+    assert torch.equal(occupancy, (batch["labels"] > 0).float().unsqueeze(1))
+    assert (occupancy * target).sum() == target.sum()
+    assert occupancy.sum() > target.sum()
+
+
+def test_occupancy_anchors_only_is_the_union_of_the_anchors(corpus):
+    batch = _stage_b_batch(corpus)
+    occupancy = occupancy_from(batch, "anchors-only")
+    anchors = masks_from(batch["labels"], batch["anchors"])
+    target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
+    assert torch.equal(occupancy, anchors.amax(1, keepdim=True))
+    assert not (occupancy * target).any()
+    fake = torch.ones_like(anchors)
+    assert torch.equal(occupancy_from(batch, "anchors-only", anchors=fake), fake.amax(1, keepdim=True))
+
+
+def test_occupancy_none_is_empty(corpus):
+    batch = _stage_b_batch(corpus)
+    occupancy = occupancy_from(batch, "none")
+    assert occupancy.shape == (1, 1, *batch["labels"].shape[1:])
+    assert occupancy.dtype == torch.float32
+    assert not occupancy.any()
+
+
+def test_occupancy_mode_is_validated(corpus):
+    with pytest.raises(ValueError, match="occupancy_mode"):
+        occupancy_from(_stage_b_batch(corpus), "named_union")
+    with pytest.raises(ValueError, match="occupancy_mode"):
+        StageBTask(
+            StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **SMALL),
+            corpus.vocab, mode="oracle", occupancy_mode="predicted",
+        )
+
+
+def test_predicted_mode_queries_stage_a_once_and_ignores_labels(corpus):
+    """One forward: occupancy_mode=all queries the vocab; anchors-only queries three names."""
+    batch = _stage_b_batch(corpus)
+    model = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **SMALL)
+    segmenter = StageA(len(corpus.vocab), min(corpus.shape), **SMALL).eval()
+    calls: list[int] = []
+
+    def fake_masks(image, name_ids, threshold=0.5):
+        calls.append(int(name_ids.shape[1]))
+        return torch.ones(image.shape[0], name_ids.shape[1], *image.shape[2:], device=image.device)
+
+    segmenter.masks_for = fake_masks
+    poisoned = dict(batch)
+    poisoned["labels"] = torch.zeros_like(batch["labels"])
+
+    StageBTask(model, corpus.vocab, segmenter=segmenter, occupancy_mode="all")(poisoned)
+    assert calls == [len(corpus.vocab)]
+    StageBTask(model, corpus.vocab, segmenter=segmenter, occupancy_mode="anchors-only")(poisoned)
+    assert calls[-1] == corpus.n_anchors
+
+
+def test_predicted_all_from_a_perfect_segmenter_still_contains_the_target(corpus, monkeypatch):
+    """occupancy_mode=all is the ceiling: a segmenter that knows the target will paint it."""
+    batch = _stage_b_batch(corpus)
+    model = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **SMALL)
+    segmenter = StageA(len(corpus.vocab), min(corpus.shape), **SMALL).eval()
+    segmenter.masks_for = lambda image, name_ids, threshold=0.5: masks_from(batch["labels"], name_ids + 1)
+    seen: dict[str, torch.Tensor] = {}
+    decode = model.decoder.forward
+    monkeypatch.setattr(
+        model.decoder,
+        "forward",
+        lambda features, *, context=None, occupancy=None: (
+            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
+        ),
+    )
+    StageBTask(model, corpus.vocab, segmenter=segmenter, occupancy_mode="all")(batch)
+    target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
+    assert (seen["occupancy"] * target).sum() == target.sum()
+
+
+def test_stage_b_task_rejects_a_mismatched_source(corpus):
+    model = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **SMALL)
+    segmenter = StageA(len(corpus.vocab), min(corpus.shape), **SMALL)
+    with pytest.raises(ValueError, match="predicted"):
+        StageBTask(model, corpus.vocab)
+    with pytest.raises(ValueError, match="oracle"):
+        StageBTask(model, corpus.vocab, mode="oracle", segmenter=segmenter)
+    with pytest.raises(TypeError, match="StageA"):
+        StageBTask(model, corpus.vocab, segmenter=model)
+
+
+def test_resolve_phase_a_checkpoint_requires_a_path_unless_mode_is_oracle():
+    with pytest.raises(ValueError, match="predicted"):
+        resolve_phase_a_checkpoint({})
+    with pytest.raises(ValueError, match="predicted"):
+        resolve_phase_a_checkpoint({"mode": "predicted"})
+    with pytest.raises(ValueError, match="predicted"):
+        resolve_phase_a_checkpoint({"mode": "predicted", "phase_a_checkpoint": None})
+    with pytest.raises(ValueError, match="predicted"):
+        resolve_phase_a_checkpoint({"phase_a_checkpoint": ""})
+    assert resolve_stage_b_mode({}) == "predicted"
+    assert resolve_stage_b_mode({"mode": "oracle"}) == "oracle"
+    assert resolve_phase_a_checkpoint({"mode": "oracle"}) is None
+    assert resolve_phase_a_checkpoint({"mode": "oracle", "phase_a_checkpoint": None}) is None
+    assert resolve_phase_a_checkpoint({"mode": "oracle", "phase_a_checkpoint": "runs/a.pt"}) is None
+    assert resolve_phase_a_checkpoint({"phase_a_checkpoint": "runs/a.pt"}) == Path("runs/a.pt")
+    assert resolve_phase_a_checkpoint(
+        {"mode": "predicted", "phase_a_checkpoint": "runs/a.pt"}
+    ) == Path("runs/a.pt")
+    assert resolve_phase_a_checkpoint(
+        {"phase_a_checkpoint": "runs/a.pt"}, override="runs/other.pt"
+    ) == Path("runs/other.pt")
+    assert resolve_phase_a_checkpoint({}, override="runs/cli.pt") == Path("runs/cli.pt")
+    with pytest.raises(ValueError, match="oracle"):
+        resolve_phase_a_checkpoint({"mode": "oracle"}, override="runs/cli.pt")
+    with pytest.raises(ValueError, match="mode"):
+        resolve_phase_a_checkpoint({"mode": "gt", "phase_a_checkpoint": "runs/a.pt"})
+
+
 # -- training ----------------------------------------------------------------
 def _trainer(task, dataset, tmp_path, epochs=2, lr=3e-3):
     batches = loader(dataset, batch_size=2, shuffle=False)
@@ -121,7 +249,7 @@ def test_stage_a_trains_and_writes_a_usable_checkpoint(corpus, tmp_path):
 def test_stage_b_trains_on_oracle_anchors(corpus, tmp_path):
     model = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **SMALL)
     dataset = ExampleDataset(corpus, "train")
-    trainer = _trainer(StageBTask(model, corpus.vocab), dataset, tmp_path)
+    trainer = _trainer(StageBTask(model, corpus.vocab, mode="oracle"), dataset, tmp_path)
     history = trainer.fit()
     assert history[-1]["train"]["loss"] < history[0]["train"]["loss"]
     assert "by_name" in history[-1]["val_full"]
@@ -147,7 +275,7 @@ def test_stage_b_overfits_a_single_example(corpus, tmp_path):
     dataset = ExampleDataset(corpus, "train", limit=1)
     batches = loader(dataset, batch_size=1, shuffle=False)
     trainer = Trainer(
-        StageBTask(model, corpus.vocab), batches, batches, CFG, tmp_path,
+        StageBTask(model, corpus.vocab, mode="oracle"), batches, batches, CFG, tmp_path,
         # One example, so one optimiser step per epoch.
         stage={**STAGE, "epochs": 150, "optimizer": {**STAGE["optimizer"], "lr": 8e-3}},
         verbose=False,

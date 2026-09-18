@@ -44,11 +44,12 @@ Silicon).
 .venv/bin/python scripts/generate_data.py           # 500 scenes
 
 .venv/bin/python scripts/train.py a                 # Stage A
-.venv/bin/python scripts/train.py b --overfit 1 --set train.stage_b.epochs=200
-.venv/bin/python scripts/train.py b                 # Stage B, ground-truth anchors
+.venv/bin/python scripts/train.py b --overfit 1 --set train.stage_b.epochs=200 --set train.stage_b.mode=oracle
+.venv/bin/python scripts/train.py b                 # Stage B, predicted anchors (needs Stage A)
+.venv/bin/python scripts/train.py b --set train.stage_b.mode=oracle  # Stage B, ground-truth anchors
 
 .venv/bin/python scripts/evaluate.py runs/stage_b/best.pt
-.venv/bin/python scripts/evaluate.py runs/stage_b/best.pt --segmenter runs/stage_a/best.pt
+.venv/bin/python scripts/evaluate.py runs/stage_b/best.pt --set train.stage_b.mode=oracle
 ```
 
 Every tunable lives in `configs/config.yaml`; any leaf can be overridden from the

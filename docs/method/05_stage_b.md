@@ -1,6 +1,6 @@
 # 05 — Stage B: the relational target segmenter
 
-`src/models.py: StageB`
+`src/models.py: StageB` · [`05_stage_b.drawio`](flowcharts/05_stage_b.drawio) (open in diagrams.net or the VS Code Draw.io extension)
 
 Three ordered anchor masks, three clause tokens and one anonymous occupancy map
 in; the target mask out. It never receives the label volume, the target mask, the
@@ -17,7 +17,7 @@ anchors [B, 3, V, V, V] ──► Encoder (+ world x,y,z at every scale) ──�
                                                   │
      Intersection([H_1, H_2, H_3, H_1·H_2·H_3]) ──┤
                                                   ▼
- occupancy (labels>0, anchors removed) ──► Decoder (skips, FiLM) ──► logits [B,1,V,V,V]
+ occupancy (same source as anchors, then anchors removed) ──► Decoder (skips, FiLM) ──► logits [B,1,V,V,V]
 ```
 
 ## What goes in, and what deliberately does not
@@ -26,7 +26,7 @@ anchors [B, 3, V, V, V] ──► Encoder (+ world x,y,z at every scale) ──�
 |---|---|---|
 | anchor masks, ordered | encoder | the WHERE signal: the only geometry the prompt refers to |
 | clause tokens | grounding branches, decoder FiLM | the relations themselves |
-| occupancy `labels > 0`, anchors subtracted | decoder only | the WHAT signal: "some structure is here" |
+| occupancy from the same source as the anchors, then anchors subtracted | decoder only | the WHAT signal: "some structure is here" |
 | label volume, target mask, target name, target centroid | **nothing** | they are the answer |
 
 Two placements carry most of the design.
@@ -43,6 +43,17 @@ answer; leaving them in would hand the decoder a free copy of the conditioning i
 is supposed to be reasoning about. What remains is a single binary channel in
 which the target is one unmarked structure among several — it says "something is
 here", never "this one".
+
+`train.stage_b.mode` is one switch for both streams:
+
+- **predicted** (default) — Stage A, one forward. Requires
+  `phase_a_checkpoint` or `--segmenter`.
+- **oracle** — ground-truth labels. The only way to skip the checkpoint.
+
+`occupancy_mode` then chooses which of that source's masks are unioned: `all`
+(the ceiling: the target is included if the source can name it),
+`anchors-only` (the shipped default), or `none`. After `StageB.forward`
+subtracts the anchors, `anchors-only` is empty at the decoder.
 
 ## Structure tokens: geometry read off the masks
 

@@ -257,6 +257,96 @@ def masks_from(labels: Tensor, ids: Tensor) -> Tensor:
     return (labels.unsqueeze(1) == ids[..., None, None, None]).float()
 
 
+OCCUPANCY_MODES = ("all", "anchors-only", "none")
+STAGE_B_MODES = ("predicted", "oracle")
+
+
+def _take_channels(masks: Tensor, ids: Tensor) -> Tensor:
+    """``masks [B, C, ...]`` indexed by ``ids [B, K]`` along the channel axis."""
+    extra = (1,) * (masks.ndim - 2)
+    index = ids.to(dtype=torch.long).reshape(*ids.shape, *extra)
+    return masks.gather(1, index.expand(-1, -1, *masks.shape[2:]))
+
+
+def occupancy_from(
+    batch: Mapping[str, Any],
+    mode: str = "all",
+    *,
+    anchors: Tensor | None = None,
+    full: Tensor | None = None,
+) -> Tensor:
+    """Which masks of an already-chosen source are unioned into occupancy.
+
+    Source is resolved by :class:`StageBTask` — this function never queries a
+    segmenter. Omitted ``anchors`` / ``full`` fall back to ground-truth labels
+    (the oracle source).
+
+    * ``all`` - every shape the source can name. Ceiling: ground truth includes
+      the target, and a segmenter trained on the target's name will paint it too.
+    * ``anchors-only`` - the union of the prompt's three anchors. After
+      :meth:`StageB.forward` subtracts those same channels, the decoder
+      occupancy is empty.
+    * ``none`` - an empty channel; Stage B has to localise from the relations
+      alone.
+    """
+    if mode not in OCCUPANCY_MODES:
+        raise ValueError(f"occupancy_mode must be one of {OCCUPANCY_MODES}, got {mode!r}")
+
+    labels: Tensor = batch["labels"]
+    batch_size, device, spatial = labels.shape[0], labels.device, labels.shape[1:]
+    if mode == "none":
+        return torch.zeros(batch_size, 1, *spatial, dtype=torch.float32, device=device)
+    if mode == "anchors-only":
+        if anchors is None:
+            anchors = masks_from(labels, batch["anchors"])
+        return anchors.amax(dim=1, keepdim=True)
+    return full if full is not None else (labels > 0).float().unsqueeze(1)
+
+
+def resolve_stage_b_mode(stage_cfg: Mapping[str, Any]) -> str:
+    """``train.stage_b.mode``: ``predicted`` (default) or ``oracle``."""
+    raw = stage_cfg["mode"] if "mode" in stage_cfg else "predicted"
+    mode = str(raw)
+    if mode not in STAGE_B_MODES:
+        raise ValueError(f"train.stage_b.mode must be one of {STAGE_B_MODES}, got {mode!r}")
+    return mode
+
+
+def resolve_phase_a_checkpoint(
+    stage_cfg: Mapping[str, Any], override: Path | str | None = None
+) -> Path | None:
+    """The Stage A checkpoint Stage B should use, or ``None`` for ground truth.
+
+    ``train.stage_b.mode`` defaults to ``predicted``, which *requires* a Stage A
+    checkpoint from ``train.stage_b.phase_a_checkpoint`` or the CLI
+    ``--segmenter``. Missing that path is an error. The only bypass is
+    ``mode: oracle``, which reads ground-truth anchors and occupancy and
+    ignores a leftover checkpoint path in the config.
+
+    ``override`` is the CLI ``--segmenter``. In predicted mode it wins over the
+    config path. In oracle mode it is rejected: pick one source.
+    """
+    mode = resolve_stage_b_mode(stage_cfg)
+    if mode == "oracle":
+        if override is not None:
+            raise ValueError(
+                "train.stage_b.mode is 'oracle' (ground-truth anchors); "
+                "do not pass --segmenter. Set train.stage_b.mode: predicted "
+                "to use a Stage A checkpoint."
+            )
+        return None
+    raw = override if override is not None else (
+        stage_cfg["phase_a_checkpoint"] if "phase_a_checkpoint" in stage_cfg else None
+    )
+    if raw in (None, "", "null"):
+        raise ValueError(
+            "Stage B mode is 'predicted' and needs a pretrained Stage A checkpoint. "
+            "Set train.stage_b.phase_a_checkpoint, pass --segmenter, or set "
+            "train.stage_b.mode: oracle to use ground-truth anchors."
+        )
+    return Path(raw)
+
+
 @dataclass
 class Prediction:
     """What a task hands back: what to score, what to score it against, and how."""
@@ -295,40 +385,77 @@ class StageATask:
 
 @dataclass
 class StageBTask:
-    """Segment the relational target. ``segmenter`` switches the anchor source.
+    """Segment the relational target from one mask source.
 
-    ``None`` uses the ground-truth anchor masks (the primary measurement:
-    it isolates the relational architecture from segmentation error); a trained
-    :class:`~src.models.StageA` instead predicts them from the image, which is
-    the end-to-end setting and the one real MRI will be in.
+    ``mode: predicted`` (default) requires a :class:`~src.models.StageA`
+    ``segmenter``; one forward produces both the encoder anchors and the
+    occupancy union. ``mode: oracle`` reads ground-truth labels and rejects a
+    segmenter. ``occupancy_mode`` then chooses which of that source's masks
+    are unioned: ``all``, ``anchors-only``, or ``none``.
     """
 
     model: StageB
     vocab: Any
+    mode: str = "predicted"
     segmenter: StageA | None = None
     threshold: float = 0.5
+    occupancy_mode: str = "all"
     loss_weights: Mapping[str, float] = field(default_factory=dict)
     anchor_scores: list[float] = field(default_factory=list)
 
+    def __post_init__(self) -> None:
+        if self.occupancy_mode not in OCCUPANCY_MODES:
+            raise ValueError(
+                f"occupancy_mode must be one of {OCCUPANCY_MODES}, got {self.occupancy_mode!r}"
+            )
+        self.mode = resolve_stage_b_mode({"mode": self.mode})
+        if self.mode == "oracle":
+            if self.segmenter is not None:
+                raise ValueError("Stage B mode is 'oracle'; do not pass a segmenter")
+            return
+        if self.segmenter is None:
+            raise ValueError("Stage B mode is 'predicted' and needs a Stage A segmenter")
+        if not isinstance(self.segmenter, StageA):
+            raise TypeError(f"segmenter must be a StageA, got {type(self.segmenter).__name__}")
+        if int(self.segmenter.config["vocab_size"]) != len(self.vocab):
+            raise ValueError(
+                f"Stage A vocab_size {self.segmenter.config['vocab_size']} "
+                f"!= Stage B vocab {len(self.vocab)}"
+            )
+        self.segmenter.eval()
+
     @property
     def name(self) -> str:
-        return "stage_b_predicted" if self.segmenter is not None else "stage_b"
+        return "stage_b_predicted" if self.mode == "predicted" else "stage_b"
 
-    def anchors(self, batch: Mapping[str, Any]) -> Tensor:
+    def source(self, batch: Mapping[str, Any]) -> tuple[Tensor, Tensor | None]:
+        """Anchor channels and, when needed, the full occupancy union. One source."""
         oracle = masks_from(batch["labels"], batch["anchors"])
-        if self.segmenter is None:
-            return oracle
-        with torch.no_grad():
-            predicted = self.segmenter.masks_for(batch["image"], batch["anchors"] - 1, self.threshold)
+        if self.mode == "oracle":
+            full = (batch["labels"] > 0).float().unsqueeze(1) if self.occupancy_mode == "all" else None
+            return oracle, full
+        image = batch["image"]
+        name_ids = batch["anchors"] - 1
+        if self.occupancy_mode == "all":
+            vocab_ids = torch.arange(len(self.vocab), device=image.device).unsqueeze(0).expand(image.shape[0], -1)
+            all_masks = self.segmenter.masks_for(image, vocab_ids, self.threshold)
+            predicted = _take_channels(all_masks, name_ids)
+            full = all_masks.amax(dim=1, keepdim=True)
+        else:
+            predicted = self.segmenter.masks_for(image, name_ids, self.threshold)
+            full = None
         self.anchor_scores += dice_iou(predicted, oracle)[0].flatten().tolist()
-        return predicted
+        return predicted, full
 
     def __call__(self, batch: Mapping[str, Any]) -> Prediction:
-        occupancy = (batch["labels"] > 0).float().unsqueeze(1)
+        anchor_masks, full = self.source(batch)
+        occupancy = occupancy_from(
+            batch, self.occupancy_mode, anchors=anchor_masks, full=full,
+        )
         # The anchor names the prompt uses default to the ones the channels hold.
         # A counterfactual overrides `name_ids` to break exactly that link.
         name_ids = batch.get("name_ids", batch["anchors"] - 1)
-        output = self.model(self.anchors(batch), batch["direction_ids"], name_ids, occupancy)
+        output = self.model(anchor_masks, batch["direction_ids"], name_ids, occupancy)
         target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
         strata = [
             {
@@ -456,6 +583,14 @@ def load_model(path: Path | str, device="cpu") -> nn.Module:
     model = {"StageA": StageA, "StageB": StageB}[payload["kind"]](**payload["model"])
     model.load_state_dict(payload["state_dict"])
     return model.to(device).eval()
+
+
+def load_stage_a(path: Path | str, device="cpu") -> StageA:
+    """Load a Stage A checkpoint; anything else is an error."""
+    model = load_model(path, device)
+    if not isinstance(model, StageA):
+        raise TypeError(f"expected a Stage A checkpoint, got {type(model).__name__} from {path}")
+    return model
 
 
 class Trainer:

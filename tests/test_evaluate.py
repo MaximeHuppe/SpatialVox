@@ -82,7 +82,7 @@ def test_every_probe_actually_reaches_the_model(corpus, batch):
         encoder_channels=(4, 8, 8, 8), token_dim=16, num_heads=2,
     ).eval()
     torch.nn.init.normal_(model.head.weight, std=0.05)  # the head starts at a constant
-    task = StageBTask(model, corpus.vocab)
+    task = StageBTask(model, corpus.vocab, mode="oracle")
     with torch.no_grad():
         baseline = task(batch).logits
         for kind in evaluate.PROBES:

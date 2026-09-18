@@ -2,9 +2,11 @@
 """Train Stage A or Stage B.
 
     scripts/train.py a                                   # the structure segmenter
-    scripts/train.py b                                   # the relational model, oracle anchors
-    scripts/train.py b --segmenter runs/stage_a/best.pt  # end to end, predicted anchors
-    scripts/train.py b --overfit 1 --set train.stage_b.epochs=200
+    scripts/train.py b                                   # the relational model, predicted anchors (needs Stage A)
+    scripts/train.py b --segmenter runs/stage_a/best.pt  # same, CLI override of phase_a_checkpoint
+    scripts/train.py b --set train.stage_b.mode=oracle   # ground-truth anchors; no Stage A checkpoint
+    scripts/train.py b --set train.stage_b.occupancy_mode=anchors-only
+    scripts/train.py b --overfit 1 --set train.stage_b.epochs=200 --set train.stage_b.mode=oracle
 
 ``--overfit N`` restricts training and validation to the first N scenes, and turns
 augmentation off: it is the bug catcher, and memorising one scene while its pose
@@ -23,7 +25,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.config import load_config, parse_overrides
 from src.data import Corpus, ExampleDataset, SceneDataset, loader
-from src.engine import StageATask, StageBTask, Trainer, format_table, load_model
+from src.engine import (
+    StageATask, StageBTask, Trainer, format_table, load_model, load_stage_a,
+    resolve_phase_a_checkpoint, resolve_stage_b_mode,
+)
 from src.models import StageA, StageB
 
 
@@ -35,7 +40,7 @@ def loss_weights(cfg) -> dict[str, float]:
     return {"lambda_dice": float(loss["lambda_dice"]), "lambda_bce": float(loss["lambda_bce"])}
 
 
-def build(stage: str, cfg, corpus: Corpus, overfit: int | None):
+def build(stage: str, cfg, corpus: Corpus, overfit: int | None, segmenter=None):
     """Datasets, model and task for one stage."""
     resolution = min(corpus.shape)
     common = dict(
@@ -87,7 +92,12 @@ def build(stage: str, cfg, corpus: Corpus, overfit: int | None):
         intersection_hidden=cfg.model.intersection_hidden, **common,
     )
     task = StageBTask(
-        model, corpus.vocab, threshold=cfg.train.threshold, loss_weights=loss_weights(cfg)
+        model, corpus.vocab,
+        mode=resolve_stage_b_mode(stage_cfg),
+        segmenter=segmenter,
+        threshold=cfg.train.threshold,
+        loss_weights=loss_weights(cfg),
+        occupancy_mode=str(stage_cfg.occupancy_mode),
     )
     return datasets, model, task
 
@@ -95,7 +105,10 @@ def build(stage: str, cfg, corpus: Corpus, overfit: int | None):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", choices=["a", "b"])
-    parser.add_argument("--segmenter", type=Path, help="Stage A checkpoint; makes Stage B use predicted anchors")
+    parser.add_argument(
+        "--segmenter", type=Path,
+        help="Stage A checkpoint (overrides train.stage_b.phase_a_checkpoint). Required when mode is predicted; rejected when mode is oracle.",
+    )
     parser.add_argument("--overfit", type=int, metavar="N", help="train on the first N scenes only")
     parser.add_argument("--out", type=Path, help="run directory (default runs/stage_<stage>)")
     parser.add_argument("--set", dest="overrides", action="append", metavar="KEY=VALUE")
@@ -107,11 +120,12 @@ def main() -> int:
     cfg = load_config(overrides=parse_overrides(args.overrides))
     corpus = Corpus.load(cfg.data.root)
     stage_cfg = cfg.train[f"stage_{args.stage}"]
-    datasets, model, task = build(args.stage, cfg, corpus, args.overfit)
-    if args.segmenter is not None:
-        task.segmenter = load_model(args.segmenter)
+    segmenter_path = resolve_phase_a_checkpoint(cfg.train.stage_b, args.segmenter) if args.stage == "b" else None
+    segmenter = load_stage_a(segmenter_path) if segmenter_path else None
+    datasets, model, task = build(args.stage, cfg, corpus, args.overfit, segmenter=segmenter)
 
-    out_dir = args.out or Path("runs") / f"stage_{args.stage}{'_predicted' if args.segmenter else ''}"
+    suffix = "_oracle" if args.stage == "b" and task.mode == "oracle" else ""
+    out_dir = args.out or Path("runs") / f"stage_{args.stage}{suffix}"
     train_cfg = {
         key: value
         for key, value in cfg.train.to_dict().items()
@@ -129,11 +143,14 @@ def main() -> int:
         logging=cfg.logging.to_dict(),
         spacing=corpus.spacing,
     )
-    if args.segmenter is not None:
-        task.segmenter.to(trainer.device).eval()
+    if segmenter is not None:
+        task.segmenter.to(trainer.device)
 
     print(f"corpus {corpus.root} | {len(corpus.vocab)} structures at {corpus.shape}")
     print(f"train {len(datasets['train'])} | val {len(datasets['val'])} -> {out_dir}")
+    if args.stage == "b":
+        source = "segmenter" if task.segmenter is not None else "gt"
+        print(f"mode {task.mode} | occupancy {task.occupancy_mode} from {source}")
     trainer.fit()
 
     task.model = trainer.model = load_model(out_dir / "best.pt", trainer.device)

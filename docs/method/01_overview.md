@@ -32,14 +32,15 @@ lateral to the ventricle" — rather than by a name the model was trained on.
 
 The split is not decoration. Stage B consumes *masks*, not images, and measures
 every geometric feature from the masks it is handed. So the same trained Stage B
-runs two ways with no code change:
+runs two ways with no code change, switched by `train.stage_b.mode`:
 
-- **ground-truth anchors** — isolates the relational architecture. This is the
-  primary measurement: if it fails here, no amount of segmentation quality helps.
-- **predicted anchors** — Stage A segments the three named structures from the
-  image and hands them over. The gap between the two is attributable segmentation
-  error, and the anchors' own Dice is reported next to the result so you can see
-  it rather than guess.
+- **predicted** (default) — Stage A segments the three named structures from the
+  image and hands them over. A pretrained checkpoint is required.
+- **oracle** — ground-truth anchors, which isolates the relational architecture.
+  This is the only way to skip the Stage A checkpoint.
+
+The gap between the two is attributable segmentation error, and the anchors' own
+Dice is reported next to the result so you can see it rather than guess.
 
 It also means the interesting half of the project survives the move to MRI. Real
 anatomy segmenters exist; relational grounding is what has to be built.

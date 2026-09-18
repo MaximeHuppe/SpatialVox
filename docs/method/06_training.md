@@ -151,7 +151,7 @@ which structures it confuses.
 **2 — Overfit Stage B on one scene.**
 
 ```bash
-scripts/train.py b --overfit 1 --set train.stage_b.epochs=200
+scripts/train.py b --overfit 1 --set train.stage_b.epochs=200 --set train.stage_b.mode=oracle
 ```
 
 The bug catcher, and the only phase whose *failure* is informative. Training Dice
@@ -163,23 +163,26 @@ uninterpretable. It proves nothing about generalisation; that is not its job.
 **3 — Stage B with ground-truth anchors.**
 
 ```bash
-scripts/train.py b
+scripts/train.py b --set train.stage_b.mode=oracle
 ```
 
-The primary measurement. Validation targets are structures never supervised as
-targets, so the selection metric is itself a transfer metric.
+The primary measurement of the relational architecture on its own. Validation
+targets are structures never supervised as targets, so the selection metric is
+itself a transfer metric. `mode: oracle` is the only way to skip the Stage A
+checkpoint that predicted mode requires.
 
 **4 — Stage B with predicted anchors.**
 
 ```bash
-scripts/evaluate.py runs/stage_b/best.pt --segmenter runs/stage_a/best.pt
+scripts/train.py b
+scripts/evaluate.py runs/stage_b/best.pt
 ```
 
-Same weights, same prompts, anchors from Stage A instead of the label volume. The
-anchors' own Dice is reported next to the result, so a drop is attributable
-rather than mysterious. Passing `--segmenter` to `train.py` instead trains
-against predicted anchors, which is worth doing only once the oracle number is
-established.
+This is the default: `train.stage_b.mode` is `predicted`, so a pretrained Stage A
+checkpoint (`train.stage_b.phase_a_checkpoint`, or `--segmenter` to override the
+path) is required. Same Stage B weights, same prompts, anchors from Stage A
+instead of the label volume. The anchors' own Dice is reported next to the
+result, so a drop is attributable rather than mysterious.
 
 ## Reproducibility
 

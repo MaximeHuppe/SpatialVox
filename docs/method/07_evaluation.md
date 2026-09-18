@@ -4,7 +4,8 @@
 
 ```bash
 scripts/evaluate.py runs/stage_b/best.pt
-scripts/evaluate.py runs/stage_b/best.pt --segmenter runs/stage_a/best.pt
+scripts/evaluate.py runs/stage_b/best.pt --segmenter runs/stage_a/best.pt  # override the Stage A path
+scripts/evaluate.py runs/stage_b/best.pt --set train.stage_b.mode=oracle
 scripts/evaluate.py runs/stage_b/best.pt --split val --save-masks
 ```
 
@@ -43,9 +44,10 @@ masks match perfectly; one empty mask is undefined and returned as `nan` so it i
 counted rather than silently averaged in. Dice and IoU use the same convention:
 two empty masks score 1.0, one empty against one non-empty scores 0.0.
 
-With `--segmenter`, the predicted anchors' own Dice against the ground-truth
-masks is reported beside the result. Without it you can see that a run got worse;
-with it you can see whether the relational model or the segmenter is responsible.
+By default (`train.stage_b.mode: predicted`) the predicted anchors' own Dice
+against the ground-truth masks is reported beside the result. `mode: oracle`
+isolates the relational model; predicted mode shows whether a drop is the
+relational model or the segmenter.
 
 ## The counterfactuals are the actual result
 

@@ -3,14 +3,17 @@
 
     scripts/evaluate.py runs/stage_b/best.pt
     scripts/evaluate.py runs/stage_b/best.pt --segmenter runs/stage_a/best.pt
+    scripts/evaluate.py runs/stage_b/best.pt --set train.stage_b.mode=oracle
+    scripts/evaluate.py runs/stage_b/best.pt --set train.stage_b.occupancy_mode=anchors-only
     scripts/evaluate.py runs/stage_b/best.pt --split val --save-masks
 
 Two things are reported, and the second is the one that matters.
 
 **Metrics** - Dice, IoU and 95th-percentile Hausdorff, overall and stratified by
-target structure, anchor structure, direction and clause slot. With
-``--segmenter`` the anchors come from Stage A instead of the ground truth, and
-the anchors' own Dice is reported next to the result so a drop can be attributed.
+target structure, anchor structure, direction and clause slot. The default
+(``train.stage_b.mode: predicted``) takes anchors from Stage A; ``mode: oracle``
+uses the ground truth instead. The anchors' own Dice is reported next to the
+result so a drop can be attributed.
 
 **Counterfactuals** - a high Dice proves nothing on its own. A model that ignores
 the prompt and segments "the nearest thing that is not an anchor" can score well.
@@ -32,7 +35,10 @@ import torch
 
 from src.config import load_config, parse_overrides
 from src.data import Corpus, ExampleDataset, loader, save_nifti
-from src.engine import Metrics, StageBTask, dice_iou, format_table, load_model, resolve_device
+from src.engine import (
+    Metrics, StageBTask, dice_iou, format_table, load_model, load_stage_a,
+    resolve_device, resolve_phase_a_checkpoint, resolve_stage_b_mode,
+)
 from src.geometry import DIRECTIONS, OPPOSITE
 
 
@@ -107,7 +113,10 @@ def run(task: StageBTask, batches, device, spacing, evaluation, *, threshold=0.5
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("checkpoint", type=Path, help="a Stage B checkpoint")
-    parser.add_argument("--segmenter", type=Path, help="Stage A checkpoint; use predicted anchors")
+    parser.add_argument(
+        "--segmenter", type=Path,
+        help="Stage A checkpoint (overrides train.stage_b.phase_a_checkpoint). Required when mode is predicted; rejected when mode is oracle.",
+    )
     parser.add_argument("--split", default="test")
     parser.add_argument("--out", type=Path, help="report directory (default next to the checkpoint)")
     parser.add_argument("--save-masks", action="store_true", help="also write every predicted mask")
@@ -118,16 +127,21 @@ def main() -> int:
     corpus = Corpus.load(cfg.data.root)
     device = resolve_device(cfg.train.device)
     model = load_model(args.checkpoint, device)
-    segmenter = load_model(args.segmenter, device) if args.segmenter else None
+    segmenter_path = resolve_phase_a_checkpoint(cfg.train.stage_b, args.segmenter)
+    segmenter = load_stage_a(segmenter_path, device) if segmenter_path else None
     task = StageBTask(
-        model, corpus.vocab, segmenter=segmenter, threshold=cfg.train.threshold,
+        model, corpus.vocab,
+        mode=resolve_stage_b_mode(cfg.train.stage_b),
+        segmenter=segmenter,
+        threshold=cfg.train.threshold,
+        occupancy_mode=str(cfg.train.stage_b.occupancy_mode),
         loss_weights={"lambda_dice": float(cfg.train.loss["lambda_dice"]),
                       "lambda_bce": float(cfg.train.loss["lambda_bce"])},
     )
 
     dataset = ExampleDataset(corpus, args.split, normalize_mode=cfg.data.normalize)
     batches = loader(dataset, batch_size=cfg.train.batch_size, shuffle=False, workers=cfg.train.workers)
-    out_dir = args.out or args.checkpoint.parent / f"eval_{args.split}{'_predicted' if segmenter else ''}"
+    out_dir = args.out or args.checkpoint.parent / f"eval_{args.split}{'_oracle' if task.mode == 'oracle' else ''}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summary, probes, rows = run(
@@ -137,7 +151,11 @@ def main() -> int:
     if task.anchor_scores:
         summary["anchor_dice"] = sum(task.anchor_scores) / len(task.anchor_scores)
 
-    print(format_table(summary, f"{args.split} ({'predicted' if segmenter else 'oracle'} anchors)"))
+    source = "segmenter" if segmenter else "gt"
+    print(format_table(summary, f"{args.split} ({source} anchors, occupancy={task.occupancy_mode})"))
+    if segmenter and task.occupancy_mode == "all":
+        print("  note: occupancy_mode=all unions Stage A's prediction for every name, including the"
+              " target - a ceiling, not a deployable setting. Use anchors-only or none for that.")
     if "anchor_dice" in summary:
         print(f"\n  anchors from Stage A scored Dice {summary['anchor_dice']:.4f}")
     print("\n  counterfactual                       dice     drop")
@@ -147,7 +165,10 @@ def main() -> int:
 
     report = {
         "checkpoint": str(args.checkpoint),
-        "segmenter": str(args.segmenter) if args.segmenter else None,
+        "mode": resolve_stage_b_mode(cfg.train.stage_b),
+        "phase_a_checkpoint": str(segmenter_path) if segmenter_path else None,
+        "occupancy_source": source,
+        "occupancy_mode": task.occupancy_mode,
         "split": args.split,
         "metrics": summary,
         "counterfactuals": probes,

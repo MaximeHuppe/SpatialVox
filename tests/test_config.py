@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 from torch import nn
 
 from src.config import load_config, parse_overrides
-from src.engine import EarlyStopping, build_optimizer, build_scheduler, _logger
+from src.engine import EarlyStopping, build_optimizer, build_scheduler, _logger, resolve_phase_a_checkpoint
 from src.models import StageA, StageB
 
 
@@ -40,6 +42,11 @@ def test_every_block_the_code_reads_is_present(cfg):
         assert {"epochs", "optimizer", "scheduler", "augment"} <= set(cfg.train[stage]), stage
         assert {"name", "lr", "weight_decay"} == set(cfg.train[stage]["optimizer"])
         assert {"name", "warmup_epochs"} == set(cfg.train[stage]["scheduler"])
+    assert {"mode", "occupancy_mode", "phase_a_checkpoint"} <= set(cfg.train.stage_b)
+    assert cfg.train.stage_b.mode == "predicted"
+    assert cfg.train.stage_b.occupancy_mode == "anchors-only"
+    assert cfg.train.stage_b.phase_a_checkpoint == "runs/stage_a_aug/best.pt"
+    assert resolve_phase_a_checkpoint(cfg.train.stage_b) == Path("runs/stage_a_aug/best.pt")
     assert {"name", "lambda_dice", "lambda_bce"} == set(cfg.train.loss)
     assert {"patience", "min_delta"} == set(cfg.train.early_stopping)
 
@@ -48,6 +55,11 @@ def test_overrides_reach_a_nested_leaf():
     cfg = load_config(overrides=parse_overrides(["train.stage_b.optimizer.lr=1e-4"]))
     assert cfg.train.stage_b.optimizer.lr == 1e-4
     assert cfg.train.stage_a.optimizer.lr == 0.001  # untouched
+    cfg = load_config(overrides=parse_overrides(["train.stage_b.occupancy_mode=anchors-only"]))
+    assert cfg.train.stage_b.occupancy_mode == "anchors-only"
+    cfg = load_config(overrides=parse_overrides(["train.stage_b.mode=oracle"]))
+    assert cfg.train.stage_b.mode == "oracle"
+    assert resolve_phase_a_checkpoint(cfg.train.stage_b) is None
 
 
 # -- the factories reject what they cannot do --------------------------------
