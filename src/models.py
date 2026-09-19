@@ -267,13 +267,18 @@ class FiLM(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Upsample, concatenate the skip, optionally inject occupancy and context.
+    """Upsample, concatenate the skip, optionally inject guidance and context.
 
     Returns every stage's features, coarse to fine, so Stage A can supervise all
     of them. Conditioning is FiLM rather than attention: at half resolution a
     64^3 volume already has 32,768 query tokens, sixty-four times the bottleneck
     budget. FiLM is applied at every stage except the finest, which is where the
     reference architecture puts it (16^3 and 32^3 of 64^3).
+
+    *Guidance* is the volumetric side input, resampled to each scale and mixed in
+    by a 1x1 convolution: the binary ``occupancy`` map, the intensity ``image``,
+    or both, in that order. The projection is still called ``occupancy`` because
+    that is the name its weights carry in every checkpoint written so far.
     """
 
     def __init__(
@@ -285,6 +290,7 @@ class Decoder(nn.Module):
         refine: bool = False,
         context_dim: int = 0,
         occupancy: bool = False,
+        image: bool = False,
     ) -> None:
         super().__init__()
         widths = list(widths)
@@ -292,11 +298,15 @@ class Decoder(nn.Module):
         inputs = widths[:0:-1]  # w_D ... w_1
         extra = COORDS if coords else 0
         self.coords = bool(coords)
+        self.image = bool(image)
         self.fuse = nn.ModuleList(ConvBlock(i + extra + s, s, act) for i, s in zip(inputs, outputs))
         self.refine = nn.ModuleList(ConvBlock(w, w, act) for w in outputs) if refine else None
+        planes = int(bool(occupancy)) + int(self.image)
         self.occupancy = (
-            nn.ModuleList(nn.Conv3d(w + 1, w, 1) for w in outputs) if occupancy else None
+            nn.ModuleList(nn.Conv3d(w + planes, w, 1) for w in outputs) if occupancy else None
         )
+        if self.image and not occupancy:
+            raise ValueError("image guidance rides on the occupancy projection; enable occupancy too")
         # Every stage but the finest, which keeps the reference's 16^3/32^3 at
         # 64^3 and generalises to any resolution.
         self.film = (
@@ -311,7 +321,10 @@ class Decoder(nn.Module):
         *,
         context: Tensor | None = None,
         occupancy: Tensor | None = None,
+        image: Tensor | None = None,
     ) -> list[Tensor]:
+        if self.image and image is None:
+            raise ValueError("this decoder was built with image guidance; pass `image`")
         x, full = features[-1], features[0].shape[2:]
         stages = []
         for level, skip in enumerate(features[-2::-1]):
@@ -321,7 +334,14 @@ class Decoder(nn.Module):
             x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=True)
             x = self.fuse[level](torch.cat([x, skip], dim=1))
             if self.occupancy is not None and occupancy is not None:
-                x = self.occupancy[level](torch.cat([x, pool_to(occupancy, x.shape[2:])], dim=1))
+                # `max` keeps a thin structure present in the mask; the image
+                # wants `avg`, whose area filter is the anti-aliased downsample.
+                # `max` on intensities would return the brightest voxel per block
+                # and saturate into "structure everywhere".
+                guidance = [pool_to(occupancy, x.shape[2:], "max")]
+                if self.image:
+                    guidance.append(pool_to(image, x.shape[2:], "avg"))
+                x = self.occupancy[level](torch.cat([x, *guidance], dim=1))
             if self.film is not None and context is not None and str(level) in self.film:
                 x = self.film[str(level)](x, context)
             if self.refine is not None:
@@ -666,17 +686,25 @@ class StageBOutput:
 class StageB(nn.Module):
     """Segment the structure described only by its relations to named anchors.
 
-    Inputs are the ordered anchor masks, the clause indices, and the binary
-    occupancy of the scene. It never receives the label volume, the target mask,
-    the target name or the target's position - the point of the experiment is
-    that it has to derive them.
+    Inputs are the ordered anchor masks, the clause indices, the binary
+    occupancy of the scene, and - when ``image`` is on - the intensity volume it
+    came from. It never receives the label volume, the target mask, the target
+    name or the target's position - the point of the experiment is that it has
+    to derive them.
 
-    Occupancy enters on the decoder side only. It says *what* there is (some
-    structure is here), and the encoder must not see it: grounding queries that
-    could look at the target's own voxels would let the model ignore the prompt
-    and pick "a blob that is not an anchor". The anchors are subtracted from it
-    for the same reason the prompt names them - they are the given, not the
-    answer.
+    Occupancy and the image enter on the decoder side only. They say *what* is
+    there, and the encoder must not see them: grounding queries that could look
+    at the target's own voxels would let the model ignore the prompt and pick "a
+    blob that is not an anchor". The anchors are subtracted from occupancy for
+    the same reason the prompt names them - they are the given, not the answer.
+
+    ``image`` is what makes the occupancy ablation honest. With it off, an empty
+    occupancy leaves the network no way to see that any structure exists, so
+    ``anchors-only`` and ``none`` can only guess a region; and an ``all``
+    occupancy built from ground-truth labels hands over the answer's silhouette,
+    which is oracle information no deployment has. The intensity volume is the
+    input that is always available, so it carries "what is there" while the
+    relations carry "which one" - see ``notebooks/occupancy_ablation.py``.
     """
 
     def __init__(
@@ -691,15 +719,18 @@ class StageB(nn.Module):
         intersection_hidden: int | None = None,
         bottleneck: int | None = None,
         prior_foreground: float = 0.0016,
+        image: bool = False,
     ) -> None:
         super().__init__()
         widths = [int(w) for w in encoder_channels]
         grid = bottleneck_for(resolution, widths, bottleneck)
         hidden = int(intersection_hidden or token_dim)
+        self.image = bool(image)
         self.config = dict(
             vocab_size=vocab_size, resolution=resolution, n_anchors=n_anchors,
             encoder_channels=tuple(widths), token_dim=token_dim, num_heads=num_heads,
             intersection_hidden=hidden, bottleneck=grid, prior_foreground=prior_foreground,
+            image=self.image,
         )
         self.n_anchors = n_anchors
         self.encoder = Encoder(n_anchors, widths, "leaky_relu", coords=True)
@@ -712,16 +743,27 @@ class StageB(nn.Module):
         self.intersection = Intersection(widths[-1], n_anchors, hidden, "leaky_relu")
         self.decoder = Decoder(
             widths, "leaky_relu", coords=True, refine=True,
-            context_dim=n_anchors * token_dim, occupancy=True,
+            context_dim=n_anchors * token_dim, occupancy=True, image=self.image,
         )
         self.head = nn.Conv3d(widths[0], 1, 1)
         nn.init.zeros_(self.head.weight)
         nn.init.constant_(self.head.bias, prior_bias(prior_foreground))
 
-    def forward(self, anchors: Tensor, direction_ids: Tensor, name_ids: Tensor, occupancy: Tensor) -> StageBOutput:
+    def forward(
+        self,
+        anchors: Tensor,
+        direction_ids: Tensor,
+        name_ids: Tensor,
+        occupancy: Tensor,
+        image: Tensor | None = None,
+    ) -> StageBOutput:
         """``[B, A, D, H, W]`` anchors + ``[B, A]`` clause ids + occupancy -> logits."""
         if anchors.shape[1] != self.n_anchors:
             raise ValueError(f"expected {self.n_anchors} anchor channels, got {anchors.shape[1]}")
+        if self.image and image is None:
+            raise ValueError("this model was built with image=True; pass the intensity volume")
+        if image is not None and not self.image:
+            raise ValueError("this model was built with image=False; it has no channel for one")
         anchors = anchors.to(torch.float32)
         occupancy = occupancy.to(torch.float32) * (1 - anchors.amax(dim=1, keepdim=True))
 
@@ -735,5 +777,8 @@ class StageB(nn.Module):
             maps.append(evidence)
             clauses.append(clause)
         features[-1] = features[-1] + self.intersection(maps)
-        stages = self.decoder(features, context=torch.cat(clauses, dim=-1), occupancy=occupancy)
+        stages = self.decoder(
+            features, context=torch.cat(clauses, dim=-1), occupancy=occupancy,
+            image=None if image is None else image.to(torch.float32),
+        )
         return StageBOutput(logits=self.head(stages[-1]), evidence=maps)

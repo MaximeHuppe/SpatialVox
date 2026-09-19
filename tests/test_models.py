@@ -169,8 +169,8 @@ def test_stage_b_sees_the_anchors_and_an_anonymous_occupancy_and_nothing_else(co
     monkeypatch.setattr(
         model.decoder,
         "forward",
-        lambda features, *, context=None, occupancy=None: (
-            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
+        lambda features, *, context=None, occupancy=None, image=None: (
+            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy, image=image)
         ),
     )
     prediction = StageBTask(model, corpus.vocab, mode="oracle")(batch)
@@ -190,6 +190,94 @@ def test_stage_b_sees_the_anchors_and_an_anonymous_occupancy_and_nothing_else(co
     assert prediction.groups == [[n] for n in batch["target_name"]]
 
 
+def test_stage_b_image_widens_the_guidance_projection_and_nothing_else(corpus):
+    """The scene enters at the decoder, so the encoder stays anchors-only.
+
+    Turning it on must not touch the encoder, the prompt tables or the head:
+    only the 1x1 convolutions that mix the volumetric guidance in gain a plane.
+    A checkpoint written before the flag existed therefore still rebuilds, which
+    is why the projection keeps the name ``occupancy``.
+    """
+    small = dict(encoder_channels=(4, 8, 8, 8), token_dim=16, num_heads=2)
+    blind = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **small)
+    seeing = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, image=True, **small)
+
+    assert blind.config["image"] is False and seeing.config["image"] is True
+    assert set(blind.state_dict()) == set(seeing.state_dict())
+    widened = {
+        key for key in blind.state_dict()
+        if blind.state_dict()[key].shape != seeing.state_dict()[key].shape
+    }
+    assert widened == {f"decoder.occupancy.{level}.weight" for level in range(len(widened))}
+    assert all(key.startswith("decoder.occupancy.") for key in widened)
+    for before, after in zip(blind.decoder.occupancy, seeing.decoder.occupancy):
+        assert after.in_channels == before.in_channels + 1
+    assert (seeing.encoder.stages[0][0][0].in_channels
+            == blind.encoder.stages[0][0][0].in_channels)
+
+
+def test_stage_b_image_reaches_the_decoder_but_never_the_encoder(corpus, monkeypatch):
+    """The leak check again, with the scene switched on.
+
+    The image says *what* is there; the relations say *which one*. So it may
+    reach the decoder, where shape is reconstructed, and must not reach the
+    encoder, whose features are what the grounding attention queries.
+    """
+    from src.data import ExampleDataset, collate
+
+    dataset = ExampleDataset(corpus, "train")
+    batch = collate([dataset[0], dataset[1]])
+    model = StageB(
+        len(corpus.vocab), min(corpus.shape), corpus.n_anchors, image=True,
+        encoder_channels=(4, 8, 8, 8), token_dim=16, num_heads=2,
+    )
+    seen: dict[str, torch.Tensor] = {}
+    model.encoder.register_forward_pre_hook(lambda _, args: seen.update(encoder=args[0]))
+    decode = model.decoder.forward
+    monkeypatch.setattr(
+        model.decoder,
+        "forward",
+        lambda features, *, context=None, occupancy=None, image=None: (
+            seen.update(image=image) or decode(features, context=context, occupancy=occupancy, image=image)
+        ),
+    )
+    prediction = StageBTask(model, corpus.vocab, mode="oracle", occupancy_mode="none")(batch)
+
+    anchors = masks_from(batch["labels"], batch["anchors"])
+    assert torch.equal(seen["encoder"], anchors)          # encoder: anchors, still
+    assert torch.equal(seen["image"], batch["image"])     # decoder: the volume, unaltered
+    assert prediction.logits.shape == (2, 1, *batch["labels"].shape[1:])
+
+
+def test_stage_b_image_is_the_acquired_volume_not_a_label_derivative(corpus):
+    """Whatever else it is, the image must not be a function of the labels."""
+    from src.data import ExampleDataset, collate
+
+    batch = collate([ExampleDataset(corpus, "train")[0]])
+    labels, image = batch["labels"], batch["image"]
+    assert image.dtype.is_floating_point
+    assert image.shape == (1, 1, *labels.shape[1:])
+    # Background is noisy, so the volume is nowhere near a binary occupancy map.
+    assert float(image[(labels == 0).unsqueeze(1)].std()) > 0
+    assert len(torch.unique(image)) > 2
+
+
+def test_the_image_is_area_pooled_not_max_pooled(corpus):
+    """`max` on intensities returns the brightest voxel per block and saturates.
+
+    Occupancy wants `max` - a thin structure must survive the downsample. An
+    intensity volume wants the anti-aliased average, or every coarse voxel
+    reports the brightest thing near it and the guidance says "structure
+    everywhere".
+    """
+    from src.models import pool_to
+
+    volume = torch.zeros(1, 1, 8, 8, 8)
+    volume[0, 0, 0, 0, 0] = 1.0                  # one bright voxel in the first block
+    assert float(pool_to(volume, (4, 4, 4), "max")[0, 0, 0, 0, 0]) == 1.0
+    assert float(pool_to(volume, (4, 4, 4), "avg")[0, 0, 0, 0, 0]) == pytest.approx(1 / 8)
+
+
 def test_stage_b_anchors_only_occupancy_vanishes_after_subtract(corpus, monkeypatch):
     """The decoder never sees the anchors twice: they are the given, not occupancy."""
     from src.data import ExampleDataset, collate
@@ -205,8 +293,8 @@ def test_stage_b_anchors_only_occupancy_vanishes_after_subtract(corpus, monkeypa
     monkeypatch.setattr(
         model.decoder,
         "forward",
-        lambda features, *, context=None, occupancy=None: (
-            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
+        lambda features, *, context=None, occupancy=None, image=None: (
+            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy, image=image)
         ),
     )
     StageBTask(model, corpus.vocab, mode="oracle", occupancy_mode="anchors-only")(batch)
@@ -227,8 +315,8 @@ def test_stage_b_none_occupancy_is_an_empty_channel(corpus, monkeypatch):
     monkeypatch.setattr(
         model.decoder,
         "forward",
-        lambda features, *, context=None, occupancy=None: (
-            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
+        lambda features, *, context=None, occupancy=None, image=None: (
+            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy, image=image)
         ),
     )
     StageBTask(model, corpus.vocab, mode="oracle", occupancy_mode="none")(batch)

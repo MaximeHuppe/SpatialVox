@@ -13,8 +13,11 @@ out one region. The target is never an input.
 
 Two networks. **Stage A** segments named structures from an intensity volume — on
 real MRI this is an anatomy segmenter. **Stage B** takes three of those masks in
-the order the prompt names them, plus the prompt, plus a binary map of where
-*any* structure is, and outputs the target. Because Stage B consumes masks and
+the order the prompt names them, plus the prompt, plus the intensity volume
+itself, and outputs the target. The volume enters at the decoder only, so the
+relations decide *which* structure and the image supplies *what is there*; an
+optional binary occupancy map (`train.stage_b.occupancy_mode`) can be unioned in
+alongside it. Because Stage B consumes masks and
 measures its own geometry from them, the same trained model runs on ground-truth
 anchors (which isolates the relational architecture) or on Stage A's predictions
 (the end-to-end setting), and the difference is attributable segmentation error.
@@ -24,7 +27,12 @@ anchors (which isolates the relational architecture) or on Stage A's predictions
 The networks are the ones from `exp/realistic-appearance`, parameter for
 parameter — `tests/test_reference_parity.py` ports a checkpoint from that branch
 into these classes and checks every output tensor is bit-identical, so results
-stay comparable across the rewrite.
+stay comparable across the rewrite. That parity is with `model.stage_b_image:
+false`; the shipped default is `true`, which adds one input plane to Stage B's
+three decoder guidance convolutions and nothing else. With it off, Stage B is
+bit-for-bit the reference architecture. (The parity test skips when the
+reference branch is absent, as in a shallow clone — check that it *ran* before
+reading a green suite as a parity guarantee.)
 
 ## Setup
 
@@ -84,7 +92,7 @@ src/engine.py         losses, metrics, one training loop for both stages
 scripts/              generate_data.py, train.py, evaluate.py
 tests/                geometry, data, model contracts, training, counterfactuals,
                       config, parity with exp/realistic-appearance
-notebooks/            one example end to end, with a 3D view
+notebooks/            one example end to end with a 3D view; the occupancy ablation
 docs/method/          how the model works, and why
 ```
 

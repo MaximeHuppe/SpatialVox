@@ -89,7 +89,8 @@ def build(stage: str, cfg, corpus: Corpus, overfit: int | None, segmenter=None):
         )
     model = StageB(
         len(corpus.vocab), resolution, corpus.n_anchors,
-        intersection_hidden=cfg.model.intersection_hidden, **common,
+        intersection_hidden=cfg.model.intersection_hidden,
+        image=bool(cfg.model.stage_b_image), **common,
     )
     task = StageBTask(
         model, corpus.vocab,

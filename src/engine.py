@@ -257,7 +257,7 @@ def masks_from(labels: Tensor, ids: Tensor) -> Tensor:
     return (labels.unsqueeze(1) == ids[..., None, None, None]).float()
 
 
-OCCUPANCY_MODES = ("all", "anchors-only", "none")
+OCCUPANCY_MODES = ("all", "distractors-only", "anchors-only", "none")
 STAGE_B_MODES = ("predicted", "oracle")
 
 
@@ -283,11 +283,18 @@ def occupancy_from(
 
     * ``all`` - every shape the source can name. Ceiling: ground truth includes
       the target, and a segmenter trained on the target's name will paint it too.
+    * ``distractors-only`` - ``all`` with the target's own voxels removed: the
+      candidate blobs without the answer's silhouette. This is the only mode
+      that reads ``batch["target"]``, which makes it a **diagnostic, not a
+      deployable setting** - inference cannot exclude a target it has not found
+      yet. :class:`StageBTask` allows it under ``mode: oracle`` only.
     * ``anchors-only`` - the union of the prompt's three anchors. After
       :meth:`StageB.forward` subtracts those same channels, the decoder
-      occupancy is empty.
+      occupancy is empty, so this is bit-for-bit ``none`` at the decoder. Kept
+      as a named arm because it is the natural thing to reach for; see
+      ``notebooks/occupancy_ablation.py`` for the proof.
     * ``none`` - an empty channel; Stage B has to localise from the relations
-      alone.
+      alone, and from the intensity volume if the model takes one.
     """
     if mode not in OCCUPANCY_MODES:
         raise ValueError(f"occupancy_mode must be one of {OCCUPANCY_MODES}, got {mode!r}")
@@ -300,7 +307,10 @@ def occupancy_from(
         if anchors is None:
             anchors = masks_from(labels, batch["anchors"])
         return anchors.amax(dim=1, keepdim=True)
-    return full if full is not None else (labels > 0).float().unsqueeze(1)
+    union = full if full is not None else (labels > 0).float().unsqueeze(1)
+    if mode == "distractors-only":
+        return (union - masks_from(labels, batch["target"].unsqueeze(1))).clamp(0, 1)
+    return union
 
 
 def resolve_stage_b_mode(stage_cfg: Mapping[str, Any]) -> str:
@@ -409,6 +419,11 @@ class StageBTask:
                 f"occupancy_mode must be one of {OCCUPANCY_MODES}, got {self.occupancy_mode!r}"
             )
         self.mode = resolve_stage_b_mode({"mode": self.mode})
+        if self.occupancy_mode == "distractors-only" and self.mode != "oracle":
+            raise ValueError(
+                "occupancy_mode 'distractors-only' removes the target's own voxels, which needs "
+                "ground truth: it is a diagnostic and runs under mode 'oracle' only"
+            )
         if self.mode == "oracle":
             if self.segmenter is not None:
                 raise ValueError("Stage B mode is 'oracle'; do not pass a segmenter")
@@ -430,13 +445,14 @@ class StageBTask:
 
     def source(self, batch: Mapping[str, Any]) -> tuple[Tensor, Tensor | None]:
         """Anchor channels and, when needed, the full occupancy union. One source."""
+        needs_union = self.occupancy_mode in ("all", "distractors-only")
         oracle = masks_from(batch["labels"], batch["anchors"])
         if self.mode == "oracle":
-            full = (batch["labels"] > 0).float().unsqueeze(1) if self.occupancy_mode == "all" else None
+            full = (batch["labels"] > 0).float().unsqueeze(1) if needs_union else None
             return oracle, full
         image = batch["image"]
         name_ids = batch["anchors"] - 1
-        if self.occupancy_mode == "all":
+        if needs_union:
             vocab_ids = torch.arange(len(self.vocab), device=image.device).unsqueeze(0).expand(image.shape[0], -1)
             all_masks = self.segmenter.masks_for(image, vocab_ids, self.threshold)
             predicted = _take_channels(all_masks, name_ids)
@@ -455,7 +471,11 @@ class StageBTask:
         # The anchor names the prompt uses default to the ones the channels hold.
         # A counterfactual overrides `name_ids` to break exactly that link.
         name_ids = batch.get("name_ids", batch["anchors"] - 1)
-        output = self.model(anchor_masks, batch["direction_ids"], name_ids, occupancy)
+        # The intensity volume, when the model was built to take one. It is the
+        # scene as acquired - never the labels, and never anything derived from
+        # the target - so it says what is there without saying which one.
+        image = batch["image"] if self.model.config.get("image") else None
+        output = self.model(anchor_masks, batch["direction_ids"], name_ids, occupancy, image)
         target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
         strata = [
             {

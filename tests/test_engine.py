@@ -125,6 +125,43 @@ def test_occupancy_anchors_only_is_the_union_of_the_anchors(corpus):
     assert torch.equal(occupancy_from(batch, "anchors-only", anchors=fake), fake.amax(1, keepdim=True))
 
 
+def test_occupancy_distractors_only_removes_exactly_the_target(corpus):
+    """The honest middle: the candidate blobs, without the answer's silhouette."""
+    batch = _stage_b_batch(corpus)
+    occupancy = occupancy_from(batch, "distractors-only")
+    target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
+    union = (batch["labels"] > 0).float().unsqueeze(1)
+    assert not (occupancy * target).any()              # the target is gone
+    assert torch.equal(occupancy, (union - target).clamp(0, 1))  # and nothing else is
+    assert occupancy.sum() == union.sum() - target.sum()
+    assert occupancy.sum() > 0                          # the distractors remain
+
+
+def test_only_distractors_only_consults_the_target(corpus):
+    """The target may reach a model input through exactly one named mode.
+
+    `distractors-only` is an oracle diagnostic and says so. The guarantee worth
+    pinning is the negative one: no other mode can start reading the answer.
+    """
+    batch = dict(_stage_b_batch(corpus))
+    poisoned = dict(batch)
+    poisoned.pop("target")
+    for mode in ("all", "anchors-only", "none"):
+        occupancy_from(poisoned, mode)                  # no KeyError: target unread
+    with pytest.raises(KeyError):
+        occupancy_from(poisoned, "distractors-only")
+
+
+def test_distractors_only_refuses_a_predicted_source(corpus):
+    """Excluding a target you have not found yet is not something inference can do."""
+    model = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **SMALL)
+    segmenter = StageA(len(corpus.vocab), min(corpus.shape), **SMALL)
+    with pytest.raises(ValueError, match="oracle"):
+        StageBTask(model, corpus.vocab, mode="predicted", segmenter=segmenter,
+                   occupancy_mode="distractors-only")
+    StageBTask(model, corpus.vocab, mode="oracle", occupancy_mode="distractors-only")
+
+
 def test_occupancy_none_is_empty(corpus):
     batch = _stage_b_batch(corpus)
     occupancy = occupancy_from(batch, "none")
@@ -175,8 +212,8 @@ def test_predicted_all_from_a_perfect_segmenter_still_contains_the_target(corpus
     monkeypatch.setattr(
         model.decoder,
         "forward",
-        lambda features, *, context=None, occupancy=None: (
-            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy)
+        lambda features, *, context=None, occupancy=None, image=None: (
+            seen.update(occupancy=occupancy) or decode(features, context=context, occupancy=occupancy, image=image)
         ),
     )
     StageBTask(model, corpus.vocab, segmenter=segmenter, occupancy_mode="all")(batch)

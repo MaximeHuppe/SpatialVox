@@ -44,7 +44,11 @@ def test_every_block_the_code_reads_is_present(cfg):
         assert {"name", "warmup_epochs"} == set(cfg.train[stage]["scheduler"])
     assert {"mode", "occupancy_mode", "phase_a_checkpoint"} <= set(cfg.train.stage_b)
     assert cfg.train.stage_b.mode == "predicted"
-    assert cfg.train.stage_b.occupancy_mode == "anchors-only"
+    # `none` is the shipped default now that `model.stage_b_image` supplies the
+    # scene: an occupancy union built from ground-truth labels is oracle
+    # information, and `anchors-only` is bit-for-bit `none` at the decoder.
+    assert cfg.train.stage_b.occupancy_mode == "none"
+    assert cfg.model.stage_b_image is True
     assert cfg.train.stage_b.phase_a_checkpoint == "runs/stage_a_aug/best.pt"
     assert resolve_phase_a_checkpoint(cfg.train.stage_b) == Path("runs/stage_a_aug/best.pt")
     assert {"name", "lambda_dice", "lambda_bce"} == set(cfg.train.loss)

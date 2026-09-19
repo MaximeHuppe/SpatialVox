@@ -2,9 +2,10 @@
 
 `src/models.py: StageB` · [`05_stage_b.drawio`](flowcharts/05_stage_b.drawio) (open in diagrams.net or the VS Code Draw.io extension)
 
-Three ordered anchor masks, three clause tokens and one anonymous occupancy map
-in; the target mask out. It never receives the label volume, the target mask, the
-target's name or the target's position — inferring them is the task.
+Three ordered anchor masks, three clause tokens, the intensity volume and one
+anonymous occupancy map in; the target mask out. It never receives the label
+volume, the target mask, the target's name or the target's position — inferring
+them is the task.
 
 ```
 anchors [B, 3, V, V, V] ──► Encoder (+ world x,y,z at every scale) ──► features
@@ -17,7 +18,8 @@ anchors [B, 3, V, V, V] ──► Encoder (+ world x,y,z at every scale) ──�
                                                   │
      Intersection([H_1, H_2, H_3, H_1·H_2·H_3]) ──┤
                                                   ▼
- occupancy (same source as anchors, then anchors removed) ──► Decoder (skips, FiLM) ──► logits [B,1,V,V,V]
+ occupancy (same source as anchors, then anchors removed) ──┐
+ image [B, 1, V, V, V] (as acquired, area-pooled per scale) ─┴► Decoder (skips, FiLM) ──► logits [B,1,V,V,V]
 ```
 
 ## What goes in, and what deliberately does not
@@ -27,9 +29,10 @@ anchors [B, 3, V, V, V] ──► Encoder (+ world x,y,z at every scale) ──�
 | anchor masks, ordered | encoder | the WHERE signal: the only geometry the prompt refers to |
 | clause tokens | grounding branches, decoder FiLM | the relations themselves |
 | occupancy from the same source as the anchors, then anchors subtracted | decoder only | the WHAT signal: "some structure is here" |
+| the intensity volume (`model.stage_b_image`) | decoder only | the WHAT signal as *acquired*, owing nothing to ground truth |
 | label volume, target mask, target name, target centroid | **nothing** | they are the answer |
 
-Two placements carry most of the design.
+Three placements carry most of the design.
 
 **Occupancy never reaches the encoder.** If grounding queries could see the
 target's own voxels, the model could ignore the prompt entirely and learn "the
@@ -37,6 +40,37 @@ blob that is not an anchor" — and on a corpus where that heuristic usually wor
 it would score well. Keeping occupancy on the decoder side means the *where* is
 decided from the relations, and occupancy only sharpens the boundary of a region
 already chosen.
+
+**The image is the WHAT signal that survives deployment.** Occupancy built from
+ground-truth labels is oracle information, and the ablation in
+[`notebooks/occupancy_ablation.py`](../../notebooks/occupancy_ablation.py) shows
+what that bought: with `all`, Stage B learned `output ⊆ occupancy` and scored
+0.99 Dice by copying the silhouette it was handed — remove the target's voxels
+from that channel and it predicts *nothing*. With `anchors-only` or `none` the
+decoder got an empty channel, leaving the network no way to see that any
+structure exists at all, and it plateaued at 0.22. The intensity volume is the
+input that is always there. It enters where occupancy enters, resampled to each
+scale, so the relations still decide *which one* while the image supplies *what
+is there*. Turning it on takes the same `none` arm from 0.22 to 0.89.
+
+**Read the synthetic numbers with this caveat.** `synthetic.appearance` puts
+background at `[0.12, 0.04]` and structures at `[0.45, 0.75]`, which do not
+overlap: pooled over ten val scenes, background p99.9 is 0.260 and structure
+p0.1 is 0.275, so a single threshold recovers `labels > 0` at IoU 0.9998. On
+*this corpus* the intensity volume is therefore nearly as informative as
+`occupancy_mode: all` — it is the same candidate set, just un-thresholded. What
+the image changes is where that information legitimately comes from (an acquired
+volume, available at inference) rather than from ground-truth labels. It does
+not make the synthetic task harder, and 0.89 should be read as approaching the
+`all` ceiling of 0.99, not as beating it. Per-class means span 0.488-0.586 with
+standard deviations near 0.07, so intensity identifies *foreground*, never a
+class. On real MRI no threshold separates structures at all — that is what Stage
+A is for, and why `mode: predicted` is the setting that actually tests this.
+
+The pooling differs by what the plane means: occupancy is max-pooled, because a
+thin structure must survive the downsample; the image is area-pooled, because
+max on intensities returns the brightest voxel per block and saturates into
+"structure everywhere".
 
 **The anchors are subtracted from occupancy.** They are the given, not the
 answer; leaving them in would hand the decoder a free copy of the conditioning it
@@ -50,10 +84,15 @@ here", never "this one".
   `phase_a_checkpoint` or `--segmenter`.
 - **oracle** — ground-truth labels. The only way to skip the checkpoint.
 
-`occupancy_mode` then chooses which of that source's masks are unioned: `all`
-(the ceiling: the target is included if the source can name it),
-`anchors-only` (the shipped default), or `none`. After `StageB.forward`
-subtracts the anchors, `anchors-only` is empty at the decoder.
+`occupancy_mode` then chooses which of that source's masks are unioned, *on top
+of* the image:
+
+| mode | at the decoder | what it is |
+|---|---|---|
+| `all` | target + every non-anchor structure | the ceiling, and a silhouette leak: the answer's outline is an input |
+| `distractors-only` | every non-anchor structure **except** the target | the honest middle. Reads `batch["target"]`, so it is an oracle **diagnostic** and `StageBTask` refuses it under `mode: predicted` |
+| `anchors-only` | empty | bit-for-bit identical to `none`: `StageB.forward` subtracts exactly the channels this mode unions |
+| `none` | empty | the shipped default. With the image on, this is the deployment-realistic arm |
 
 ## Structure tokens: geometry read off the masks
 
@@ -126,8 +165,8 @@ features that have been *conditioned* rather than replaced.
 ## Decoder
 
 Per stage: concatenate the world coordinates for that scale, trilinear upsample,
-concatenate the encoder skip, concatenate the max-pooled occupancy through a 1×1
-convolution, apply FiLM from the concatenated clause tokens, refine. FiLM goes on
+concatenate the encoder skip, concatenate the max-pooled occupancy and the
+area-pooled image through a 1×1 convolution, apply FiLM from the concatenated clause tokens, refine. FiLM goes on
 every stage except the finest — at 64³ that is 16³ and 32³, which is where the
 reference architecture puts it. FiLM is
 `y = (1 + γ(context))·x + β(context)` with both projections zero-initialised, so

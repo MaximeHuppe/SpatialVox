@@ -44,6 +44,9 @@ model:
   token_dim: 256                               # dimension of the token embeddings (textual and spatial)
   num_heads: 4                                 # number of attention heads (heads = token_dim / head_dim)
   intersection_hidden: 256                     # width inside Stage B's intersection block
+  stage_b_image: true                          # Stage B sees the intensity volume at its decoder,
+                                               # resampled per scale. Off = the pre-image architecture,
+                                               # where an empty occupancy left it unable to see the scene.
   prior_foreground: 0.0016                     # expected foreground fraction; initialises the head bias
   deep_supervision: [0.1, 0.3, 0.6]            # Stage A loss weights per decoder scale, coarse to fine
 
@@ -76,14 +79,17 @@ train:
     augment: true
     mode: predicted                    # predicted | oracle. predicted requires phase_a_checkpoint; oracle uses ground-truth anchors and occupancy.
     phase_a_checkpoint: runs/stage_a_aug/best.pt   # Stage A weights. Required when mode is predicted; ignored when mode is oracle.
-    occupancy_mode: anchors-only        # all | anchors-only | none. Which masks of that source are unioned into occupancy.
+    occupancy_mode: none                # all | distractors-only | anchors-only | none. Which masks of that
+                                        # source are unioned into occupancy, on top of model.stage_b_image.
+                                        # all leaks the target's silhouette; distractors-only is an oracle
+                                        # diagnostic; anchors-only is bit-for-bit none at the decoder.
                              
 
 logging:
-  backend: none              # wandb | none
+  backend: wandb              # wandb | none
   wandb:
-    project: relational-3d-vlm
-    tags: [relational-3d-vlm, augmentation, occupancy-volume, dataset-custom]
+    project: spatial-vox
+    tags: [synthetic]
 
 
 
