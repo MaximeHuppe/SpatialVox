@@ -304,7 +304,15 @@ def test_stage_b_can_take_its_anchors_from_stage_a(corpus, tmp_path):
 
 
 def test_stage_b_overfits_a_single_example(corpus, tmp_path):
-    """The bug catcher: if this fails, channels, coordinates or indices are wrong."""
+    """The bug catcher: if this fails, channels, coordinates or indices are wrong.
+
+    Seeded here, not just in `Trainer`: the model is built before the trainer
+    seeds, so without this its initialisation is whatever the preceding tests
+    left in the global RNG, and a 150-step budget on one example is tight enough
+    for that to decide the outcome. It used to pass or fail depending on which
+    tests ran first.
+    """
+    torch.manual_seed(0)
     model = StageB(
         len(corpus.vocab), min(corpus.shape), corpus.n_anchors,
         encoder_channels=(8, 16, 32, 32), token_dim=32, num_heads=2,

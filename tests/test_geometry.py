@@ -119,17 +119,45 @@ def test_select_anchors_returns_none_when_no_feasible_set_exists():
     assert select_anchors(3, centroids, [1, 2, 3], CENTER, n_anchors=3) is None
 
 
-def test_anchor_order_is_ascending_distance(scene, vocab):
+def test_a_manifest_clause_always_describes_its_own_mask_channel(scene, vocab):
+    """Clause ``i`` names ``anchors[i]`` with ``directions[i]``, in the prompt too.
+
+    Anchor order is randomised, but it is randomised *once* and then shared:
+    the mask channels are built from ``anchors`` in order and the prompt is
+    rendered from the same list, so channel ``i`` is the structure clause ``i``
+    talks about. Breaking that is what the ``permute_channels`` counterfactual
+    is designed to detect, so it must hold by construction here.
+    """
     from src.data import build_examples
 
     _, labels = scene
+    centroids = centroids_world(labels, len(vocab), (1.0, 1.0, 1.0))
+    center = volume_center_world(labels.shape, (1.0, 1.0, 1.0))
     for example in build_examples("s", labels, vocab, (1.0, 1.0, 1.0), 3):
-        centroids = centroids_world(labels, len(vocab), (1.0, 1.0, 1.0))
+        clauses = vocab.parse(example["prompt"])
+        assert len(clauses) == len(example["anchors"])
+        for clause, anchor, direction in zip(clauses, example["anchors"], example["directions"]):
+            assert clause["anchor"] == vocab.name(anchor)
+            assert clause["direction"] == direction
+            # and the relation is the true one for that pair, not a relabelling
+            assert classify(centroids[example["target"]], centroids[anchor], center) == direction
+
+
+def test_a_manifest_anchor_order_is_not_sorted_by_distance(scene, vocab):
+    """The stored order must not rank the anchors by proximity - see the leak."""
+    from src.data import build_examples
+
+    _, labels = scene
+    centroids = centroids_world(labels, len(vocab), (1.0, 1.0, 1.0))
+    ordered = 0
+    examples = build_examples("s", labels, vocab, (1.0, 1.0, 1.0), 3)
+    for example in examples:
         distances = [
             float(np.linalg.norm(centroids[anchor] - centroids[example["target"]]))
             for anchor in example["anchors"]
         ]
-        assert distances == sorted(distances)
+        ordered += distances == sorted(distances)
+    assert ordered < len(examples), "every example is still stored nearest-first"
 
 
 def test_prompt_round_trips(vocab):
@@ -175,3 +203,79 @@ def test_the_vocabulary_scales_to_anatomical_names():
     ]
     assert vocab.parse(vocab.render(clauses)) == clauses
     assert vocab.name(vocab.label("Left-Putamen")) == "Left-Putamen"
+
+
+# ---------------------------------------------------------------------------
+# Anchor ordering and the sampling pool
+# ---------------------------------------------------------------------------
+def _ring(n_structures=9):
+    """A target at the origin with `n_structures` neighbours at growing radii."""
+    centroids = [np.array([np.nan] * 3), np.array([0.0, 0.0, 0.0])]
+    for i in range(n_structures):
+        offset = np.zeros(3)
+        offset[i % 3] = (1.0 + i) * (1 if (i // 3) % 2 == 0 else -1)
+        centroids.append(offset * 4.0 + np.array([0.3, 0.2, 0.1]) * i)
+    return np.stack(centroids), list(range(1, n_structures + 2))
+
+
+def test_anchors_never_share_a_direction():
+    """Two clauses naming the same side would not narrow the conjunction."""
+    centroids, present = _ring()
+    center = np.array([0.0, 0.0, 0.0])
+    for seed in range(40):
+        chosen = select_anchors(
+            1, centroids, present, center, 3, pool=5, rng=np.random.default_rng(seed)
+        )
+        assert chosen is not None
+        directions = [d for _, d in chosen]
+        assert len(set(directions)) == len(directions), directions
+        assert len({label for label, _ in chosen}) == 3  # and no anchor twice
+
+
+def test_anchor_order_is_randomised_and_carries_no_distance_rank():
+    """Slot order must not be a proxy for proximity.
+
+    Ranking by distance to choose the anchors and then *storing* that ranking
+    made slot 1 the target's nearest structure in 100% of examples - a leak a
+    model can read without parsing a single direction word.
+    """
+    centroids, present = _ring()
+    center = np.array([0.0, 0.0, 0.0])
+    orders = set()
+    sorted_by_distance = 0
+    for seed in range(60):
+        chosen = select_anchors(
+            1, centroids, present, center, 3, rng=np.random.default_rng(seed)
+        )
+        orders.add(tuple(label for label, _ in chosen))
+        distances = [float(np.linalg.norm(centroids[label] - centroids[1])) for label, _ in chosen]
+        sorted_by_distance += distances == sorted(distances)
+    assert len(orders) > 1, "the stored order is still deterministic"
+    assert sorted_by_distance < 40, "slot order still tracks distance"  # chance is 1/6
+
+
+def test_the_pool_widens_the_choice_but_never_feasibility():
+    """A wider pool must not drop a target a narrower one would have kept."""
+    centroids, present = _ring()
+    center = np.array([0.0, 0.0, 0.0])
+    narrow = select_anchors(1, centroids, present, center, 3, pool=3, rng=np.random.default_rng(0))
+    assert narrow is not None
+    picked = set()
+    for seed in range(60):
+        wide = select_anchors(1, centroids, present, center, 3, pool=6, rng=np.random.default_rng(seed))
+        assert wide is not None, "a wider pool dropped a feasible target"
+        picked |= {label for label, _ in wide}
+    # The wider window must actually reach structures the narrow one never picks.
+    assert picked > {label for label, _ in narrow}
+
+
+def test_pool_defaults_to_the_deterministic_nearest_feasible_set():
+    """`pool=None` and `pool=n_anchors` are the pre-existing selection."""
+    centroids, present = _ring()
+    center = np.array([0.0, 0.0, 0.0])
+    reference = select_anchors(1, centroids, present, center, 3)
+    assert reference is not None
+    assert select_anchors(1, centroids, present, center, 3, pool=3) == reference
+    # With an rng the *set* is unchanged; only the order moves.
+    shuffled = select_anchors(1, centroids, present, center, 3, pool=3, rng=np.random.default_rng(1))
+    assert sorted(shuffled) == sorted(reference)

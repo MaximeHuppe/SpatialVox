@@ -10,6 +10,7 @@ data:
   resolution: 64             # cube side; must match the corpus and model.bottleneck
   spacing: [1.0, 1.0, 1.0]   # world units per voxel, ordered (x, y, z)
   n_anchors: 3               # relations per prompt, and anchor mask channels
+  anchor_pool: 3             # number of nearest candidates to draw from for anchors
   margin: 2                  # voxels every structure must keep from the border
   normalize: none            # reference: none. Use `zscore` for real MRI.
 

@@ -557,3 +557,88 @@ figure.show()
 #
 # And per §3: with non-determinism alone moving Dice by up to 0.03, no arm here
 # is readable without the ≥3 seeds that `docs/experiments_plan.md` §4 asks for.
+
+# %% [markdown]
+# ## 9. The prompt-blind baseline — what any Dice here has to beat
+#
+# `select_anchors` ranks candidates by centroid distance, so a prompt's three
+# anchors are the *nearest* structures to its target. That hands a model a
+# shortcut that needs no prompt at all: "of the seven non-anchor structures, take
+# the one closest to the anchors". Everything below is prompt-blind except the
+# last row.
+#
+# This is the number `CLAUDE.md` §5 requires alongside any reported Dice. It is
+# cheap, it needs no checkpoint, and it is what makes 0.89 readable.
+
+# %%
+from src.geometry import AmbiguousDirection, classify, centroids_world, volume_center_world
+from src.data import load_nifti
+
+
+def overlap(a, b):
+    a, b = a > 0, b > 0
+    return 2 * (a & b).sum() / max(a.sum() + b.sum(), 1)
+
+
+def baselines(split):
+    """Prompt-blind proximity, and the oracle that does read the relations."""
+    records = ExampleDataset(corpus, split).records
+    nearest, oracle, unique, near_miss = [], [], [], []
+    for record in records:
+        labels = load_nifti(corpus.root / "scenes" / record["scene"] / "labels.nii.gz", np.int16)
+        centroids = centroids_world(labels, len(corpus.vocab), corpus.spacing)
+        middle = volume_center_world(labels.shape, corpus.spacing)
+        target, anchors_ = record["target"], list(record["anchors"])
+        candidates = [int(v) for v in np.unique(labels) if v and int(v) not in anchors_]
+
+        centre = np.mean([centroids[a] for a in anchors_], axis=0)
+        pick = min(candidates, key=lambda l: np.linalg.norm(centroids[l] - centre))
+        nearest.append(overlap(labels == pick, labels == target))
+
+        def satisfied(label):
+            total = 0
+            for anchor, direction in zip(anchors_, record["directions"]):
+                try:
+                    total += classify(centroids[label], centroids[anchor], middle) == direction
+                except AmbiguousDirection:
+                    pass
+            return total
+
+        scores = [satisfied(l) for l in candidates]
+        solutions = [l for l, s in zip(candidates, scores) if s == 3]
+        unique.append(len(solutions) == 1)
+        near_miss.append(sum(1 for s in scores if s == 2))
+        oracle.append(overlap(labels == solutions[0], labels == target) if len(solutions) == 1 else np.nan)
+    return dict(n=len(records), nearest=np.mean(nearest), oracle=np.nanmean(oracle),
+                unique=np.mean(unique), near_miss=np.mean(near_miss))
+
+
+for split in ("val", "test"):
+    b = baselines(split)
+    print(f"{split} (n={b['n']}, 7 candidates per example)")
+    print(f"  prompt-blind: nearest candidate to the anchor centroid   {b['nearest']:.4f}")
+    print(f"  oracle: the one satisfying all three stated relations    {b['oracle']:.4f}")
+    print(f"  conjunction unique in {100 * b['unique']:.1f}% of examples; "
+          f"{b['near_miss']:.2f} near-misses (2 of 3) on average\n")
+
+# %% [markdown]
+# So the readable range is **0.674 → 1.000**, not 0 → 1. Against it:
+#
+# | | val | test (held-out class) |
+# |---|---|---|
+# | prompt-blind proximity | 0.674 | 0.674 |
+# | Stage B, image, `occupancy: none` | 0.891 | 0.836 |
+# | oracle relational solver | 1.000 | 1.000 |
+#
+# The task is well posed — the conjunction picks out exactly one structure in
+# 97.8% of examples — and the model is clearly above the shortcut. But two things
+# stop that gap from being called relational reasoning:
+#
+# 1. **`permute_both` drops ~0.22 on every checkpoint**, old and new. It
+#    preserves every relation and must not move. Until it doesn't, an unknown
+#    fraction of the gap up to ~0.22 Dice is slot position, not relation content.
+# 2. **The gap is smaller on the held-out class** (0.836 vs 0.891) — exactly
+#    where relational reasoning has to carry the most weight.
+#
+# Fixing the control is the highest-value next step: without it, no arm in this
+# ablation can be attributed to the thing the project is about.

@@ -141,11 +141,59 @@ A is for, and why `mode: predicted` is the setting that actually tests this.
 
 `occupancy_mode` survives as an independent axis on top of the image, now
 four-valued: `all` | `distractors-only` | `anchors-only` | `none` (default
-`none`). `distractors-only` is new — every non-anchor structure except the
-target — and is an oracle **diagnostic**: it reads `batch["target"]`, so
-`StageBTask` refuses it under `mode: predicted`. Excluding a target you have not
-found is not something inference can do; the deployable version of that question
-is §3.4.
+`none`). **Only `all` and `none` are arms.** The other two are controls:
+
+- `anchors-only` is bit-for-bit `none` at the decoder (§3.1 above).
+- `distractors-only` was proposed here as "the honest middle ground". **That was
+  wrong once the image became a permanent input.** Occupancy is every non-anchor
+  structure except the target, and the image gives the foreground, so
+  `target == foreground - occupancy - anchors` exactly. Measured on
+  `runs/occ_img_oracle_distractors-only`: Dice **1.0000**, Hausdorff **0.0**,
+  and all four counterfactuals **1.0000** — the prompt is not used at all. It is
+  a *negative* control: useful once, to confirm the leak behaves as predicted,
+  and never comparable with the real arms.
+
+### The ordering leak (found 2026-09-19, fixed)
+
+`select_anchors` returned candidates ranked by distance and the manifest stored
+that order, so the slot index was a perfect proxy for proximity: **slot 1 was
+the target's nearest structure in 100% of examples**, readable without parsing a
+direction word. Fixed by shuffling the returned order (`src/geometry.py`), in
+`build_examples` and in `ExampleDataset._augment`; `scripts/rebuild_manifests.py`
+rewrites the manifests in ~3 s without re-rendering volumes. Stored order is now
+sorted-by-distance in ~17% of examples, which is chance for 3! = 6.
+
+Priced on `runs/occ_img_oracle_none` (val), by re-scoring one checkpoint:
+
+| scored on | Dice | `permute_both` drop |
+|---|---|---|
+| pre-fix corpus | 0.9860 | 0.22 |
+| shuffled corpus | **0.8753** | **0.0152** |
+
+Two things this settles. The 0.11 Dice gap is what the leak was worth. And the
+`permute_both` control — which had dropped ~0.22 on *every* checkpoint and
+looked like an architectural permutation-invariance defect — was measuring the
+leak: once order carries no information, it behaves. **No symmetry refactor is
+needed.** `flip_direction` still costs 0.574, so the relational sensitivity is
+real.
+
+### The three real modes, re-scored on the clean corpus
+
+`mode: oracle`, val, checkpoints trained pre-fix and re-scored post-fix (so
+these understate a cleanly-trained model). Prompt-blind baseline: **0.674**.
+
+| occupancy | Dice | flip_direction | permute_channels | permute_clauses | **permute_both** (control) |
+|---|---|---|---|---|---|
+| `all` | 0.9206 | **-0.693** | -0.496 | -0.469 | -0.036 |
+| `anchors-only` | 0.8816 | **-0.568** | -0.097 | -0.170 | -0.013 |
+| `none` | 0.8753 | **-0.574** | -0.162 | -0.181 | -0.015 |
+
+Reading: the control no longer moves, so the battery is trustworthy again, and
+flipping **one** clause's direction costs 0.57-0.69 Dice. **The prompt is
+load-bearing in all three modes** — the earlier "the model ignores the prompt"
+result was specific to `distractors-only`, which is not one of them. `all`
+buys about +0.045 over `none`, and `anchors-only` sits within noise of `none`
+exactly as the subtraction predicts.
 
 **Still open.**
 
@@ -252,3 +300,91 @@ seed-to-seed spread, which is why §4's ≥3 seeds is not optional.
   *correspondence* per example, for free, on every existing checkpoint. It is
   not a substitute for §3.1 (occupancy) or §3.3 (n_anchors), which test
   capacity under training conditions the battery never perturbs.
+
+## 5. Making the data harder — what each knob buys (NOT applied)
+
+Written 2026-09-19 as an explanation, not a change. Every measurement in §3.1
+says the same thing: the corpus is too easy in three independent ways, and each
+has its own fix. Ranked by information gained per unit of work.
+
+### 5.1 Break the proximity shortcut — **implemented, one config line**
+
+`data.anchor_pool` (default 3) draws the anchors from the *k* nearest feasible
+candidates instead of taking the nearest ones deterministically. Already in the
+code; applying it is `--set data.anchor_pool=5` plus
+`scripts/rebuild_manifests.py` (~3 s, no volumes re-rendered).
+
+| | prompt-blind baseline |
+|---|---|
+| `anchor_pool: 3` | 0.674 |
+| `anchor_pool: 5` | **0.478** |
+
+Same example counts, same feasibility, zero duplicate directions. The cost is
+realism: a reader does name *nearby* landmarks, so a very wide pool describes a
+task nobody would pose. 5 is a reasonable compromise; report the baseline
+whichever value is used.
+
+### 5.2 Make segmentation non-trivial — **the one that revives two dead axes**
+
+`synthetic.appearance` puts background at `[0.12, 0.04]` and structures at
+`[0.45, 0.75]`. Measured over ten val scenes: background p99.9 = 0.260,
+structure p0.1 = 0.275. **They do not overlap**, so one threshold recovers
+`labels > 0` at IoU 0.9998. Three consequences, all bad for the experiment:
+
+- Stage A scores 0.998, so `mode: predicted` ≈ `mode: oracle` (0.8913 vs
+  0.8905) and the source axis measures nothing.
+- The image is as informative as `occupancy_mode: all`, so the occupancy axis
+  measures nothing either.
+- "Segmentation" is free, so Stage B's Dice is almost entirely a selection
+  score — which flatters it relative to any real deployment.
+
+The fix is to overlap the distributions: raise `background` mean/std toward the
+structure range, widen `noise`, and increase `blur` so partial-volume edges are
+genuinely ambiguous. Start by targeting a Stage A Dice around 0.90-0.95 rather
+than 0.998 — that is the regime where an occupancy prior from Stage A can
+actually help the decoder, and where `predicted` vs `oracle` becomes a real
+comparison. **This is the highest-value change after 5.1**, because without it
+neither the occupancy ablation nor the end-to-end claim can produce a number.
+
+### 5.3 Make the conjunction load-bearing
+
+Today a scene holds exactly one instance of all ten primitives (`pack_scene`),
+so the model chooses 1 of 7 non-anchor candidates, and on average only **0.50**
+of them satisfy 2 of the 3 stated relations. A prompt where no distractor is a
+near-miss does not need all three clauses. Options, in increasing difficulty:
+
+- Place structures so more candidates are near-misses — reject a scene whose
+  best distractor satisfies fewer than 2 relations. Pure generator change, and
+  it directly raises the floor that §3.3's `n_anchors` sweep is supposed to test.
+- Allow several instances of one shape per scene. This is the realistic case
+  (two kidneys, many gyri) but it breaks the prompt language: "the cube" stops
+  being a unique referent, so `src/vocab.py` would need instance
+  disambiguation. Scope it properly before starting.
+- Raise the structure count so 1-of-7 becomes 1-of-15.
+
+### 5.4 Truly unseen structures
+
+Needed for the "never seen" claim in `CLAUDE.md` §4, which does not hold today —
+the held-out target class is still an anchor 811 times in training and Stage A
+sees all ten classes. `src/synthetic.py: SHAPES` is a literal dict with no
+allow-list, and label ids must stay consistent across splits. See §3.4.
+
+### 5.5 Lower-value, but worth listing
+
+- **Non-axis-aligned poses.** Augmentation uses the octahedral group, and
+  structures are placed axis-aligned, so `superior`/`anterior` land on voxel
+  axes. Arbitrary rotations would stop the direction rule coinciding with the
+  grid.
+- **Anisotropic spacing.** Supported everywhere (`data.spacing`) and never
+  exercised; real MRI is rarely isotropic.
+- **Size and shape variation**, so the target's extent is not predictable from
+  its class — currently `draw_params` samples from a narrow per-shape range.
+
+### 5.6 What none of this replaces
+
+Hardening the corpus does not make real MRI unnecessary — it makes the move
+*interpretable*. Real anatomy is more positionally stereotyped than these
+scenes, so every shortcut above gets stronger there, not weaker: a model can
+memorise the atlas and never read the prompt. Before moving, build the MRI
+analogue of the prompt-blind baseline ("predict the class-average location") and
+carry the §4 reporting rules with it.

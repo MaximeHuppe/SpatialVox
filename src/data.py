@@ -28,6 +28,7 @@ re-derived rather than relabelled.
 from __future__ import annotations
 
 import json
+import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -93,18 +94,28 @@ def build_examples(
     vocab: Vocabulary,
     spacing: Sequence[float],
     n_anchors: int = 3,
+    *,
+    pool: int | None = None,
 ) -> list[dict[str, Any]]:
     """Every relational example a scene supports: one per structure, as target.
 
     A target is dropped - not repaired - when no set of ``n_anchors`` structures
     with pairwise-distinct directions exists for it.
+
+    Anchor order is randomised, from a generator seeded by ``(scene_id, target)``
+    so the manifest stays reproducible from the scene alone. Order must carry no
+    information: the anchors are ranked by distance to choose them, and storing
+    that ranking would make the slot index a proxy for proximity. The randomised
+    order is then shared by the prompt clauses and the mask channels - clause
+    ``i`` always describes channel ``i``.
     """
     present = [int(v) for v in np.unique(labels) if v != 0]
     centroids = centroids_world(labels, len(vocab), tuple(spacing))
     center = volume_center_world(labels.shape, tuple(spacing))
     examples = []
     for target in present:
-        chosen = select_anchors(target, centroids, present, center, n_anchors)
+        rng = np.random.default_rng([zlib.crc32(scene_id.encode("utf-8")), target])
+        chosen = select_anchors(target, centroids, present, center, n_anchors, pool=pool, rng=rng)
         if chosen is None:
             continue
         clauses = [{"direction": d, "anchor": vocab.name(label)} for label, d in chosen]
@@ -150,6 +161,7 @@ def write_corpus(
     spacing: Sequence[float],
     n_anchors: int,
     targets: Mapping[str, Sequence[str]],
+    anchor_pool: int | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write ``vocab.json``, ``meta.json`` and one JSONL manifest per split."""
@@ -167,6 +179,7 @@ def write_corpus(
         "shape": [int(v) for v in shape],
         "spacing": [float(v) for v in spacing],
         "n_anchors": int(n_anchors),
+        "anchor_pool": int(n_anchors if anchor_pool is None else anchor_pool),
         "targets": {split: list(names) for split, names in targets.items()},
         "examples": counts,
         **dict(extra or {}),
@@ -261,6 +274,16 @@ class Corpus:
     @property
     def n_anchors(self) -> int:
         return int(self.meta["n_anchors"])
+
+    @property
+    def anchor_pool(self) -> int:
+        """How many nearest candidates anchors were drawn from.
+
+        Stored so augmentation, which re-derives the clauses every epoch, samples
+        the same way the manifest was built. Absent in corpora written before the
+        knob existed, where it was the deterministic nearest-feasible set.
+        """
+        return int(self.meta.get("anchor_pool", self.n_anchors))
 
     def records(self, split: str, targets: Sequence[str] | None = None) -> list[dict[str, Any]]:
         """Manifest rows of a split, filtered to the target classes it supervises."""
@@ -445,6 +468,8 @@ class ExampleDataset(Dataset):
             present,
             volume_center_world(rotated_labels.shape, spacing),
             self.corpus.n_anchors,
+            pool=self.corpus.anchor_pool,
+            rng=rng,
         )
         if chosen is None:  # no feasible anchor set in this pose: keep the stored one
             return image, labels, record

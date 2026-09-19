@@ -50,7 +50,9 @@ def main() -> int:
             )
             check_scene(labels, len(vocab), cfg.data.margin)
             write_scene(root, scene_id, image, labels, spacing)
-            manifests[split] += build_examples(scene_id, labels, vocab, spacing, cfg.data.n_anchors)
+            manifests[split] += build_examples(
+                scene_id, labels, vocab, spacing, cfg.data.n_anchors, pool=cfg.data.anchor_pool
+            )
             print(f"\r{split}: {index + 1}/{count} scenes", end="", flush=True)
         print()
 
@@ -62,6 +64,7 @@ def main() -> int:
         spacing=spacing,
         n_anchors=cfg.data.n_anchors,
         targets=cfg.targets.to_dict(),
+        anchor_pool=cfg.data.anchor_pool,
         extra={"source": "synthetic", "config": cfg.to_dict()},
     )
     for split, records in manifests.items():

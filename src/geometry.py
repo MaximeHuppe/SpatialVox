@@ -22,6 +22,8 @@ ties raise :class:`AmbiguousDirection`, and the caller drops that pair.
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import numpy as np
 
 #: The closed direction vocabulary. No synonyms, no ordinals.
@@ -145,35 +147,17 @@ def classify(target: np.ndarray, anchor: np.ndarray, center: np.ndarray) -> str:
     return "lateral" if target_offset > anchor_offset else "medial"
 
 
-def select_anchors(
-    target: int,
-    centroids: np.ndarray,
-    present: list[int],
-    center: np.ndarray,
-    n_anchors: int = 3,
+def _distinct_directions(
+    candidates: Sequence[tuple[int, str]], n_anchors: int
 ) -> list[tuple[int, str]] | None:
-    """Nearest-feasible anchor selection for one target.
+    """Take candidates in the order given, keeping each new direction.
 
-    Candidates are ranked by centroid distance (label id as tie-break) and taken
-    in order, keeping a candidate only when its direction has not been used yet.
-    The result is the nearest *feasible* set - not necessarily the nearest
-    structures - and its order is shared by the prompt clauses and the mask
-    channels.
-
-    Returns ``None`` when no set of ``n_anchors`` distinct directions exists, in
-    which case the caller drops this target.
+    No two anchors may share a direction: two clauses naming the same side would
+    not narrow the conjunction, and the prompt would under-determine the target.
     """
-    ranked = sorted(
-        (label for label in present if label != target),
-        key=lambda label: (float(np.linalg.norm(centroids[label] - centroids[target])), label),
-    )
     chosen: list[tuple[int, str]] = []
     used: set[str] = set()
-    for label in ranked:
-        try:
-            direction = classify(centroids[target], centroids[label], center)
-        except AmbiguousDirection:
-            continue
+    for label, direction in candidates:
         if direction in used:
             continue
         used.add(direction)
@@ -181,3 +165,60 @@ def select_anchors(
         if len(chosen) == n_anchors:
             return chosen
     return None
+
+
+def select_anchors(
+    target: int,
+    centroids: np.ndarray,
+    present: list[int],
+    center: np.ndarray,
+    n_anchors: int = 3,
+    *,
+    pool: int | None = None,
+    rng: np.random.Generator | None = None,
+) -> list[tuple[int, str]] | None:
+    """Anchor selection for one target, with pairwise-distinct directions.
+
+    Candidates are ranked by centroid distance (label id as tie-break). ``pool``
+    is how many of those nearest candidates are eligible; ``n_anchors`` are then
+    drawn from that window. ``pool <= n_anchors`` (the default) reproduces the
+    deterministic nearest-feasible set. A wider pool trades realism - a reader
+    names *nearby* landmarks - for a target that is no longer simply "the
+    structure closest to its anchors", which is the shortcut a prompt-blind
+    baseline exploits.
+
+    **The returned order is randomised whenever ``rng`` is given**, and it is the
+    order the prompt clauses and the anchor mask channels both take. Ranking by
+    distance and then storing that ranking made the slot index a perfect proxy
+    for "how close is this anchor" - a leak the model can read without parsing a
+    single direction word. Order must carry no information.
+
+    Feasibility never depends on ``pool``: if the window holds no set of
+    ``n_anchors`` distinct directions, the scan falls back to the full ranking,
+    so widening the pool never drops a target that a narrower one would keep.
+
+    Returns ``None`` when no such set exists anywhere, in which case the caller
+    drops this target.
+    """
+    ranked = sorted(
+        (label for label in present if label != target),
+        key=lambda label: (float(np.linalg.norm(centroids[label] - centroids[target])), label),
+    )
+    candidates: list[tuple[int, str]] = []
+    for label in ranked:
+        try:
+            candidates.append((label, classify(centroids[target], centroids[label], center)))
+        except AmbiguousDirection:  # never invent a direction; drop the pair
+            continue
+
+    width = max(int(n_anchors if pool is None else pool), int(n_anchors))
+    chosen = None
+    if rng is not None and width > n_anchors:
+        window = list(candidates[:width])
+        rng.shuffle(window)  # which of the k nearest, not just the nearest
+        chosen = _distinct_directions(window, n_anchors)
+    if chosen is None:
+        chosen = _distinct_directions(candidates, n_anchors)
+    if chosen is not None and rng is not None:
+        rng.shuffle(chosen)  # slot order must not encode distance rank
+    return chosen
