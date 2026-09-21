@@ -677,10 +677,54 @@ class Intersection(nn.Module):
         return self.refine(self.fuse(torch.cat([*maps, product], dim=1)))
 
 
+class SelectionHead(nn.Module):
+    """Score each candidate structure mask against the relational target map.
+
+    The dense head has to *synthesise* the target's silhouette. That is learned
+    per class, so it memorises the training classes instead of generalising:
+    measured on the val split, localisation is 100% correct on trained classes
+    (0.9 voxels of centroid error) and 31.2% on unseen ones, where the most
+    common failure is emitting a blob on one of the anchors.
+
+    Selection cannot memorise a class, because it has no per-class parameters at
+    all. It reads one number per candidate - how much of that candidate lies
+    where the relations say the target is - and the same computation applies to a
+    structure never seen as a target. That is the class-agnostic pathway the
+    architecture was missing, and it supervises *localisation* directly, which is
+    the ability that failed to transfer.
+
+    Candidates come from Stage A's own segmentation of the whole vocabulary, so
+    nothing here reveals which one is the target; Stage B still has to choose.
+    Anchors are masked out, exactly as they are subtracted from occupancy.
+    """
+
+    def __init__(self, channels: int, hidden: int) -> None:
+        super().__init__()
+        self.score = nn.Sequential(
+            nn.Linear(2, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, 1)
+        )
+        self.project = nn.Conv3d(channels, 1, 1)
+
+    def forward(self, features: Tensor, candidates: Tensor) -> Tensor:
+        """``[B,C,d,h,w]`` target map + ``[B,K,D,H,W]`` masks -> ``[B,K]`` logits."""
+        target_map = torch.sigmoid(self.project(features))
+        target_map = pool_to(target_map, candidates.shape[2:], "area")
+        masks = candidates.to(target_map.dtype)
+        area = masks.flatten(2).sum(-1)                       # [B, K]
+        inside = (masks * target_map).flatten(2).sum(-1)      # [B, K]
+        # Coverage: what fraction of the candidate sits in the target region.
+        # Share: what fraction of the target region this candidate accounts for.
+        coverage = inside / area.clamp(min=1.0)
+        share = inside / inside.sum(-1, keepdim=True).clamp(min=1e-6)
+        logits = self.score(torch.stack([coverage, share], dim=-1)).squeeze(-1)
+        return logits.masked_fill(area <= 0, float("-inf"))
+
+
 @dataclass
 class StageBOutput:
     logits: Tensor
     evidence: list[Tensor]
+    selection: Tensor | None = None
 
 
 class StageB(nn.Module):
@@ -704,7 +748,7 @@ class StageB(nn.Module):
     occupancy built from ground-truth labels hands over the answer's silhouette,
     which is oracle information no deployment has. The intensity volume is the
     input that is always available, so it carries "what is there" while the
-    relations carry "which one" - see ``notebooks/occupancy_ablation.py``.
+    relations carry "which one" - see ``docs/phase_b_mri_investigation.md``.
     """
 
     def __init__(
@@ -720,17 +764,19 @@ class StageB(nn.Module):
         bottleneck: int | None = None,
         prior_foreground: float = 0.0016,
         image: bool = False,
+        selection: bool = False,
     ) -> None:
         super().__init__()
         widths = [int(w) for w in encoder_channels]
         grid = bottleneck_for(resolution, widths, bottleneck)
         hidden = int(intersection_hidden or token_dim)
         self.image = bool(image)
+        self.selection = bool(selection)
         self.config = dict(
             vocab_size=vocab_size, resolution=resolution, n_anchors=n_anchors,
             encoder_channels=tuple(widths), token_dim=token_dim, num_heads=num_heads,
             intersection_hidden=hidden, bottleneck=grid, prior_foreground=prior_foreground,
-            image=self.image,
+            image=self.image, selection=self.selection,
         )
         self.n_anchors = n_anchors
         self.encoder = Encoder(n_anchors, widths, "leaky_relu", coords=True)
@@ -748,6 +794,7 @@ class StageB(nn.Module):
         self.head = nn.Conv3d(widths[0], 1, 1)
         nn.init.zeros_(self.head.weight)
         nn.init.constant_(self.head.bias, prior_bias(prior_foreground))
+        self.selector = SelectionHead(widths[0], hidden) if self.selection else None
 
     def forward(
         self,
@@ -756,6 +803,7 @@ class StageB(nn.Module):
         name_ids: Tensor,
         occupancy: Tensor,
         image: Tensor | None = None,
+        candidates: Tensor | None = None,
     ) -> StageBOutput:
         """``[B, A, D, H, W]`` anchors + ``[B, A]`` clause ids + occupancy -> logits."""
         if anchors.shape[1] != self.n_anchors:
@@ -781,4 +829,7 @@ class StageB(nn.Module):
             features, context=torch.cat(clauses, dim=-1), occupancy=occupancy,
             image=None if image is None else image.to(torch.float32),
         )
-        return StageBOutput(logits=self.head(stages[-1]), evidence=maps)
+        scores = None
+        if self.selector is not None and candidates is not None:
+            scores = self.selector(stages[-1], candidates)
+        return StageBOutput(logits=self.head(stages[-1]), evidence=maps, selection=scores)

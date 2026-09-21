@@ -26,6 +26,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from src.models import StageA, StageB
 
@@ -292,7 +293,7 @@ def occupancy_from(
       :meth:`StageB.forward` subtracts those same channels, the decoder
       occupancy is empty, so this is bit-for-bit ``none`` at the decoder. Kept
       as a named arm because it is the natural thing to reach for; see
-      ``notebooks/occupancy_ablation.py`` for the proof.
+      ``docs/phase_b_mri_investigation.md`` for the proof.
     * ``none`` - an empty channel; Stage B has to localise from the relations
       alone, and from the intensity volume if the model takes one.
     """
@@ -366,6 +367,8 @@ class Prediction:
     groups: list[list[str]]
     strata: list[dict[str, list[str]]] | None = None
     scales: list[Tensor] | None = None  # deep-supervision maps, coarse to fine
+    selection: Tensor | None = None  # [B, K] candidate logits, when the head is on
+    selection_target: Tensor | None = None  # [B] index of the true structure
 
 
 @dataclass
@@ -410,6 +413,7 @@ class StageBTask:
     segmenter: StageA | None = None
     threshold: float = 0.5
     occupancy_mode: str = "all"
+    selection_weight: float = 0.5
     loss_weights: Mapping[str, float] = field(default_factory=dict)
     anchor_scores: list[float] = field(default_factory=list)
 
@@ -461,7 +465,33 @@ class StageBTask:
             predicted = self.segmenter.masks_for(image, name_ids, self.threshold)
             full = None
         self.anchor_scores += dice_iou(predicted, oracle)[0].flatten().tolist()
+        self._candidates = all_masks if needs_union else None
         return predicted, full
+
+    def candidates(self, batch: Mapping[str, Any], anchors: Tensor) -> Tensor | None:
+        """Stage A's per-structure masks, with the anchors zeroed.
+
+        ``source`` already segments the whole vocabulary whenever occupancy needs
+        a union, then collapses it with ``amax``; that discards exactly the
+        candidate identities the selection head needs, so it is kept instead of
+        recomputed. Under ``mode: oracle`` the candidates come from the labels,
+        which makes the head's ceiling measurable separately from Stage A's error.
+        """
+        if getattr(self.model, "selection", False) is not True:
+            return None
+        if self.mode == "oracle":
+            labels = batch["labels"]
+            ids = torch.arange(1, len(self.vocab) + 1, device=labels.device)
+            masks = (labels.unsqueeze(1) == ids.view(1, -1, *([1] * (labels.dim() - 1)))).float()
+        elif getattr(self, "_candidates", None) is not None:
+            masks = self._candidates
+        else:
+            image = batch["image"]
+            vocab_ids = torch.arange(len(self.vocab), device=image.device).unsqueeze(0).expand(image.shape[0], -1)
+            masks = self.segmenter.masks_for(image, vocab_ids, self.threshold)
+        # The anchors are the given, not the answer - the same reason they are
+        # subtracted from occupancy. Leaving them in lets the head "choose" one.
+        return (masks * (1 - anchors.amax(dim=1, keepdim=True))).clamp(0, 1)
 
     def __call__(self, batch: Mapping[str, Any]) -> Prediction:
         anchor_masks, full = self.source(batch)
@@ -475,7 +505,10 @@ class StageBTask:
         # scene as acquired - never the labels, and never anything derived from
         # the target - so it says what is there without saying which one.
         image = batch["image"] if self.model.config.get("image") else None
-        output = self.model(anchor_masks, batch["direction_ids"], name_ids, occupancy, image)
+        candidates = self.candidates(batch, anchor_masks)
+        output = self.model(
+            anchor_masks, batch["direction_ids"], name_ids, occupancy, image, candidates
+        )
         target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
         strata = [
             {
@@ -489,10 +522,26 @@ class StageBTask:
         return Prediction(
             logits=output.logits, target=target,
             groups=[[name] for name in batch["target_name"]], strata=strata,
+            selection=output.selection,
+            selection_target=batch["target"] - 1 if output.selection is not None else None,
         )
 
     def loss(self, prediction: Prediction) -> Tensor:
-        return segmentation_loss(prediction.logits, prediction.target, **dict(self.loss_weights))
+        loss = segmentation_loss(prediction.logits, prediction.target, **dict(self.loss_weights))
+        if prediction.selection is None or prediction.selection_target is None:
+            return loss
+        # Cross-entropy over Stage A's candidates. This is the class-agnostic
+        # half of the objective: it supervises *which structure*, using a
+        # computation with no per-class parameters, so it is the part that can
+        # transfer to a target the decoder was never trained to draw.
+        scores = prediction.selection.float()
+        valid = torch.isfinite(scores).any(dim=-1)
+        if not bool(valid.any()):
+            return loss
+        picked = F.cross_entropy(
+            scores[valid].nan_to_num(neginf=-1e4), prediction.selection_target[valid]
+        )
+        return loss + float(self.selection_weight) * picked
 
 
 # ---------------------------------------------------------------------------

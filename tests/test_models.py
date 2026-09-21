@@ -359,3 +359,93 @@ def test_a_checkpoint_rebuilds_the_same_architecture(tmp_path):
     restored = load_model(tmp_path / "m.pt")
     assert restored.config == model.config
     assert all(torch.equal(a, b) for a, b in zip(restored.state_dict().values(), model.state_dict().values()))
+
+
+# ---------------------------------------------------------------------------
+# The selection head: the class-agnostic pathway
+# ---------------------------------------------------------------------------
+#: Deliberately unlike any width below, so "sized by the vocabulary" is testable.
+SELECT_VOCAB = 23
+
+
+def _stage_b_selecting(resolution=32):
+    return StageB(
+        SELECT_VOCAB, resolution, 3, encoder_channels=(8, 16, 32), bottleneck=8,
+        token_dim=32, num_heads=2, image=True, selection=True,
+    )
+
+
+def _selection_inputs(model, batch=2, resolution=32, candidates=8):
+    torch.manual_seed(0)
+    shape = (batch, 1, resolution, resolution, resolution)
+    return dict(
+        anchors=torch.rand(batch, 3, resolution, resolution, resolution).round(),
+        direction_ids=torch.zeros(batch, 3, dtype=torch.long),
+        name_ids=torch.zeros(batch, 3, dtype=torch.long),
+        occupancy=torch.rand(*shape).round(),
+        image=torch.randn(*shape),
+        candidates=torch.rand(batch, candidates, resolution, resolution, resolution).round(),
+    )
+
+
+def test_the_selection_head_has_no_per_class_parameters():
+    """This is the whole reason it transfers.
+
+    The dense head has to synthesise a silhouette, which is learned per class -
+    measured on the val split, localisation is 100% on trained classes and 31.2%
+    on unseen ones. Selection reads the same two numbers off every candidate, so
+    a structure never seen as a target is scored by exactly the same weights.
+    Any parameter whose size tracks the vocabulary would break that.
+    """
+    head = _stage_b_selecting().selector
+    for name, parameter in head.named_parameters():
+        assert SELECT_VOCAB not in parameter.shape, (
+            f"{name} is sized by the vocabulary: {tuple(parameter.shape)}"
+        )
+    # And it must accept a candidate count it was never built for.
+    model = _stage_b_selecting().eval()
+    with torch.no_grad():
+        scores = model(**_selection_inputs(model, candidates=5)).selection
+    assert scores.shape[-1] == 5
+
+
+def test_selection_scores_follow_the_candidates_not_their_position():
+    """Reordering the candidates must reorder the scores, nothing else.
+
+    A head that leaned on candidate index rather than candidate content would
+    look fine on the training classes and be meaningless on any other ordering.
+    """
+    model = _stage_b_selecting().eval()
+    inputs = _selection_inputs(model)
+    with torch.no_grad():
+        base = model(**inputs).selection
+        permutation = torch.tensor([3, 1, 0, 2, 5, 4, 7, 6])
+        shuffled = model(**{**inputs, "candidates": inputs["candidates"][:, permutation]}).selection
+    torch.testing.assert_close(shuffled, base[:, permutation], rtol=1e-4, atol=1e-5)
+
+
+def test_an_empty_candidate_can_never_be_selected():
+    """Stage A scores 0.000 on two of 23 classes, so empty masks do occur."""
+    model = _stage_b_selecting().eval()
+    inputs = _selection_inputs(model)
+    inputs["candidates"][:, 2] = 0.0
+    with torch.no_grad():
+        scores = model(**inputs).selection
+    assert torch.isinf(scores[:, 2]).all() and (scores[:, 2] < 0).all()
+    assert scores.argmax(dim=-1).ne(2).all()
+
+
+def test_selection_is_off_by_default_and_recorded_in_the_config():
+    """`load_model` rebuilds from `config`, so a new knob must live there."""
+    assert StageB(SELECT_VOCAB, 32, 3, encoder_channels=(8, 16, 32), bottleneck=8).selector is None
+    assert _stage_b_selecting().config["selection"] is True
+
+
+def test_stage_b_without_candidates_still_returns_logits():
+    """Evaluation paths that pass no candidates must not crash."""
+    model = _stage_b_selecting().eval()
+    inputs = _selection_inputs(model)
+    inputs.pop("candidates")
+    with torch.no_grad():
+        output = model(**inputs)
+    assert output.selection is None and output.logits.shape[1] == 1
