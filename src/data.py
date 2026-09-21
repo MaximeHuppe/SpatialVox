@@ -85,7 +85,21 @@ def normalize(image: np.ndarray, mode: str = "none") -> np.ndarray:
         return image
     if mode == "zscore":
         return (image - image.mean()) / (image.std() + 1e-6)
-    raise ValueError(f"normalize must be 'none' or 'zscore', got {mode!r}")
+    if mode == "zscore-brain":
+        # `zscore` takes whole-volume statistics. With `mri.apply_brainmask`,
+        # 66.5% of an HCP volume is exact zero, which drags the mean to +1.35
+        # sigma and squeezes every real tissue contrast into ~0.52 sigma - and
+        # the offset moves per subject with head size and brainmask tightness.
+        # Measuring over the brain instead puts tissue at mean 0, std 1 for
+        # every subject. NOTE: `!= 0` is a proxy for "inside the brain" that
+        # holds only while the corpus was written with `apply_brainmask: true`.
+        brain = image[image != 0]
+        if brain.size == 0:
+            return image
+        return (image - brain.mean()) / (brain.std() + 1e-6)
+    raise ValueError(
+        f"normalize must be 'none', 'zscore' or 'zscore-brain', got {mode!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

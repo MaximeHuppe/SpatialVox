@@ -17,6 +17,7 @@ from src.data import (
     load_nifti,
     rotate,
     save_nifti,
+    normalize,
 )
 from src.geometry import centroids_world, classify, volume_center_world
 from src.synthetic import SHAPE_NAMES, half_extent, draw_params, voxelize
@@ -224,3 +225,35 @@ def test_importing_real_volumes_produces_the_same_corpus_shape(tmp_path):
     assert corpus.vocab.parse(item["prompt"]) == [
         {"direction": d, "anchor": a} for d, a in zip(item["directions"], item["anchor_names"])
     ]
+
+
+# ---------------------------------------------------------------------------
+# Brain-masked normalisation
+# ---------------------------------------------------------------------------
+def test_zscore_brain_ignores_the_masked_out_background():
+    """`zscore` measures over the whole volume, and `mri.apply_brainmask` makes
+    66.5% of an HCP volume exact zero. Measured on data/mri, that puts tissue at
+    +1.35 sigma compressed into a 0.52 spread, with an offset that drifts per
+    subject with head size. `zscore-brain` restores mean 0, std 1 on tissue.
+    """
+    rng = np.random.default_rng(0)
+    volume = np.zeros((16, 16, 16), dtype=np.float32)
+    brain = (slice(4, 12),) * 3
+    volume[brain] = rng.normal(800.0, 50.0, size=(8, 8, 8))
+
+    whole = normalize(volume, "zscore")
+    masked = normalize(volume, "zscore-brain")
+    assert abs(float(masked[brain].mean())) < 0.05
+    assert abs(float(masked[brain].std()) - 1.0) < 0.05
+    # The old mode leaves tissue far from 0 and compresses its spread.
+    assert float(whole[brain].mean()) > 0.5
+    assert float(whole[brain].std()) < float(masked[brain].std())
+
+
+def test_zscore_brain_survives_an_all_background_volume():
+    assert not np.isnan(normalize(np.zeros((4, 4, 4), np.float32), "zscore-brain")).any()
+
+
+def test_an_unknown_normalize_mode_names_the_ones_that_exist():
+    with pytest.raises(ValueError, match="zscore-brain"):
+        normalize(np.zeros((2, 2, 2), np.float32), "quantile")
