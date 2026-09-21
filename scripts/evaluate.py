@@ -1,11 +1,11 @@
 #!/usr/bin/env python
 """Score a trained Stage B model on a split, and probe what it actually uses.
 
-    scripts/evaluate.py runs/stage_b/best.pt
-    scripts/evaluate.py runs/stage_b/best.pt --segmenter runs/stage_a/best.pt
-    scripts/evaluate.py runs/stage_b/best.pt --set train.stage_b.mode=oracle
-    scripts/evaluate.py runs/stage_b/best.pt --set train.stage_b.occupancy_mode=anchors-only
-    scripts/evaluate.py runs/stage_b/best.pt --split val --save-masks
+    scripts/evaluate.py runs/phase-b/seed1/best.pt
+    scripts/evaluate.py runs/phase-b/seed1/best.pt --segmenter runs/phase-a/current/best.pt
+    scripts/evaluate.py runs/phase-b/seed1/best.pt --set train.stage_b.mode=oracle
+    scripts/evaluate.py runs/phase-b/seed1/best.pt --set train.stage_b.occupancy_mode=anchors-only
+    scripts/evaluate.py runs/phase-b/seed1/best.pt --split val --save-masks
 
 Two things are reported, and the second is the one that matters.
 

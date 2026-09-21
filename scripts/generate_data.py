@@ -24,6 +24,24 @@ from src.synthetic import SHAPE_NAMES, generate_scene
 from src.vocab import Vocabulary
 
 SMOKE = {"synthetic.scenes": {"train": 8, "val": 2, "test": 2}, "data.root": "data/smoke"}
+SYNTHETIC_TARGETS = {
+    "train": list(SHAPE_NAMES[:7]),
+    "val": list(SHAPE_NAMES[7:9]),
+    "test": [SHAPE_NAMES[9]],
+}
+
+
+def _targets(cfg) -> dict[str, list[str]]:
+    """Honour ``targets`` when it names primitives; otherwise the 7/2/1 split.
+
+    ``configs/config.yaml: targets`` is the MRI class split. Generating synthetic
+    data with those names would write an empty manifest, so this falls back.
+    """
+    targets = {split: list(names) for split, names in cfg.targets.to_dict().items()}
+    listed = {name for names in targets.values() for name in names}
+    if listed <= set(SHAPE_NAMES):
+        return targets
+    return SYNTHETIC_TARGETS
 
 
 def main() -> int:
@@ -56,6 +74,7 @@ def main() -> int:
             print(f"\r{split}: {index + 1}/{count} scenes", end="", flush=True)
         print()
 
+    targets = _targets(cfg)
     write_corpus(
         root,
         vocab,
@@ -63,12 +82,12 @@ def main() -> int:
         shape=shape,
         spacing=spacing,
         n_anchors=cfg.data.n_anchors,
-        targets=cfg.targets.to_dict(),
+        targets=targets,
         anchor_pool=cfg.data.anchor_pool,
         extra={"source": "synthetic", "config": cfg.to_dict()},
     )
     for split, records in manifests.items():
-        kept = [row for row in records if vocab.name(row["target"]) in cfg.targets[split]]
+        kept = [row for row in records if vocab.name(row["target"]) in targets[split]]
         print(f"{split}: {len(records)} examples, {len(kept)} on the split's target classes")
     print(f"corpus written to {root}")
     return 0

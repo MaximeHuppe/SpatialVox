@@ -26,8 +26,8 @@ from src.engine import (
 )
 from src.geometry import DIRECTIONS
 
-CORPUS = "data/processed"          # a corpus directory
-STAGE_B = "runs/stage_b/best.pt"   # segments the target from the relations
+CORPUS = "data/mri"                    # a corpus directory
+STAGE_B = "runs/phase-b/current/best.pt"  # segments the target from the relations
 # Stage A path and oracle-vs-predicted follow configs/config.yaml
 # (train.stage_b.mode / phase_a_checkpoint). Override with --set there.
 SCENE = None                       # a scene id, or None for the first test scene
