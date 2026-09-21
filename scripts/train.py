@@ -3,7 +3,7 @@
 
     scripts/train.py a                                   # the structure segmenter
     scripts/train.py b                                   # the relational model, predicted anchors (needs Stage A)
-    scripts/train.py b --segmenter runs/stage_a/best.pt  # same, CLI override of phase_a_checkpoint
+    scripts/train.py b --segmenter runs/phase-a/current/best.pt  # same, CLI override of phase_a_checkpoint
     scripts/train.py b --set train.stage_b.mode=oracle   # ground-truth anchors; no Stage A checkpoint
     scripts/train.py b --set train.stage_b.occupancy_mode=anchors-only
     scripts/train.py b --overfit 1 --set train.stage_b.epochs=200 --set train.stage_b.mode=oracle
@@ -75,14 +75,33 @@ def build(stage: str, cfg, corpus: Corpus, overfit: int | None, segmenter=None):
         return datasets, model, StageATask(model, corpus.vocab, loss_weights=loss_weights(cfg))
 
     scenes = {split: corpus.scene_ids(split)[:overfit] if overfit else None for split in ("train", "val")}
+    val_examples = cfg.train.get("val_examples") if hasattr(cfg.train, "get") else None
+    val_examples = None if val_examples in (None, 0) else int(val_examples)
     datasets = {
         split: ExampleDataset(
             corpus, split, scenes=scenes[split],
             augment=augment and split == "train",
+            sample=None if split == "train" else val_examples,
+            seed=int(cfg.train.seed),
             normalize_mode=cfg.data.normalize,
         )
         for split in ("train", "val")
     }
+    # `val` is filtered to `targets.val`, which is DISJOINT from `targets.train`:
+    # it measures transfer to structure classes Stage B is never supervised to
+    # produce, not held-out performance. Selecting checkpoints on it picked an
+    # epoch-2 model scoring 0.470 on trained classes where the final epoch
+    # scored 0.760. So build a second curve on the same held-out subjects but the
+    # trained classes - that one answers "is it learning", and `val` is left to
+    # answer "does it transfer", reported and never selected on.
+    try:
+        datasets["val_id"] = ExampleDataset(
+            corpus, "val", scenes=scenes["val"], targets=list(cfg.targets.train),
+            sample=val_examples, seed=int(cfg.train.seed),
+            normalize_mode=cfg.data.normalize,
+        )
+    except ValueError:  # no in-distribution examples in the val split
+        pass
     if overfit:  # validate on what we are trying to memorise
         datasets["val"] = ExampleDataset(
             corpus, "train", scenes=scenes["train"], normalize_mode=cfg.data.normalize
@@ -90,7 +109,9 @@ def build(stage: str, cfg, corpus: Corpus, overfit: int | None, segmenter=None):
     model = StageB(
         len(corpus.vocab), resolution, corpus.n_anchors,
         intersection_hidden=cfg.model.intersection_hidden,
-        image=bool(cfg.model.stage_b_image), **common,
+        image=bool(cfg.model.stage_b_image),
+        selection=bool(cfg.model.get("stage_b_selection", False)),
+        **common,
     )
     task = StageBTask(
         model, corpus.vocab,
@@ -99,6 +120,7 @@ def build(stage: str, cfg, corpus: Corpus, overfit: int | None, segmenter=None):
         threshold=cfg.train.threshold,
         loss_weights=loss_weights(cfg),
         occupancy_mode=str(stage_cfg.occupancy_mode),
+        selection_weight=float(cfg.train.get("selection_weight", 0.5) or 0.0),
     )
     return datasets, model, task
 
@@ -125,6 +147,9 @@ def main() -> int:
     segmenter = load_stage_a(segmenter_path) if segmenter_path else None
     datasets, model, task = build(args.stage, cfg, corpus, args.overfit, segmenter=segmenter)
 
+    # Select on the in-distribution curve when there is one (Stage B); Stage A
+    # has no target-class split, so its `val` is already in-distribution.
+    select_on = "val_id" if "val_id" in datasets else "val"
     suffix = "_oracle" if args.stage == "b" and task.mode == "oracle" else ""
     out_dir = args.out or Path("runs") / f"stage_{args.stage}{suffix}"
     train_cfg = {
@@ -136,7 +161,7 @@ def main() -> int:
         task,
         loader(datasets["train"], batch_size=cfg.train.batch_size, shuffle=True,
                workers=cfg.train.workers, seed=cfg.train.seed),
-        loader(datasets["val"], batch_size=cfg.train.batch_size, shuffle=False, workers=cfg.train.workers),
+        loader(datasets[select_on], batch_size=cfg.train.batch_size, shuffle=False, workers=cfg.train.workers),
         train_cfg,
         out_dir,
         stage=stage_cfg.to_dict(),
@@ -147,8 +172,20 @@ def main() -> int:
     if segmenter is not None:
         task.segmenter.to(trainer.device)
 
+    if "val_id" in datasets:
+        trainer.transfer_loader = loader(
+            datasets["val"], batch_size=cfg.train.batch_size, shuffle=False,
+            workers=cfg.train.workers,
+        )
+
     print(f"corpus {corpus.root} | {len(corpus.vocab)} structures at {corpus.shape}")
-    print(f"train {len(datasets['train'])} | val {len(datasets['val'])} -> {out_dir}")
+    print(f"  selection={corpus.selection} anchors from a pool of {corpus.anchor_pool}"
+          f" | clause order {'shuffled' if corpus.shuffle_clauses else 'STORED (leak!)'}")
+    print(f"train {len(datasets['train'])} | val[{select_on}] {len(datasets[select_on])}"
+          + (f" | transfer {len(datasets['val'])}" if "val_id" in datasets else "")
+          + f" -> {out_dir}")
+    if "val_id" in datasets:
+        print("  selecting on val_id (trained classes); val is the transfer curve, never selected on")
     if args.stage == "b":
         source = "segmenter" if task.segmenter is not None else "gt"
         print(f"mode {task.mode} | occupancy {task.occupancy_mode} from {source}")

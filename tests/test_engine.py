@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import tempfile
+
+import math
+
 import json
 from pathlib import Path
 
@@ -340,3 +344,89 @@ def test_early_stopping_halts_a_run_that_stops_improving(corpus, tmp_path):
         verbose=False,
     )
     assert len(trainer.fit()) < 20  # a zero learning rate cannot improve
+
+
+# ---------------------------------------------------------------------------
+# The selection head, end to end through the task
+# ---------------------------------------------------------------------------
+def _selecting_task(corpus, mode="oracle", occupancy_mode="all"):
+    model = StageB(
+        len(corpus.vocab), min(corpus.shape), corpus.n_anchors, selection=True, **SMALL
+    )
+    segmenter = (
+        StageA(len(corpus.vocab), min(corpus.shape), **SMALL) if mode == "predicted" else None
+    )
+    return StageBTask(
+        model, corpus.vocab, mode=mode, segmenter=segmenter,
+        occupancy_mode=occupancy_mode, selection_weight=0.5,
+    )
+
+
+def test_the_task_scores_one_candidate_per_vocabulary_entry(corpus):
+    task = _selecting_task(corpus)
+    prediction = task(_stage_b_batch(corpus))
+    assert prediction.selection is not None
+    assert prediction.selection.shape == (1, len(corpus.vocab))
+    assert prediction.selection_target is not None
+    # The label is the target's row, which is `target - 1` (labels store index+1).
+    assert int(prediction.selection_target[0]) == int(_stage_b_batch(corpus)["target"][0]) - 1
+
+
+def test_the_anchors_are_never_selectable_candidates(corpus):
+    """The anchors are the given, not the answer - the same reason occupancy
+    subtracts them. Leaving them in would let the head 'choose' one, which is
+    exactly the failure the val probe found (37.5% of unseen-class predictions
+    landed on an anchor)."""
+    task = _selecting_task(corpus)
+    batch = _stage_b_batch(corpus)
+    prediction = task(batch)
+    for anchor in batch["anchors"][0].tolist():
+        assert torch.isinf(prediction.selection[0, anchor - 1])
+
+
+def test_the_selection_loss_is_added_and_is_differentiable(corpus):
+    task = _selecting_task(corpus)
+    prediction = task(_stage_b_batch(corpus))
+    loss = task.loss(prediction)
+    assert torch.isfinite(loss)
+    loss.backward()
+    grads = [p.grad for p in task.model.selector.parameters() if p.grad is not None]
+    assert grads and any(float(g.abs().sum()) > 0 for g in grads)
+
+
+def test_a_model_without_the_head_keeps_the_old_loss(corpus):
+    """Off by default: the objective must be unchanged for old checkpoints."""
+    model = StageB(len(corpus.vocab), min(corpus.shape), corpus.n_anchors, **SMALL)
+    task = StageBTask(model, corpus.vocab, mode="oracle", occupancy_mode="all")
+    prediction = task(_stage_b_batch(corpus))
+    assert prediction.selection is None
+    assert torch.isfinite(task.loss(prediction))
+
+
+def test_selection_accuracy_is_reported_next_to_dice(corpus):
+    """Dice fuses localisation and delineation; they transfer differently."""
+    task = _selecting_task(corpus)
+    trainer = Trainer(
+        task,
+        loader(ExampleDataset(corpus, "train"), batch_size=1, shuffle=False),
+        loader(ExampleDataset(corpus, "val"), batch_size=1, shuffle=False),
+        CFG, Path(tempfile.mkdtemp()), stage=STAGE, evaluation={"metrics": ["dice"]},
+    )
+    summary = trainer.evaluate(with_hausdorff=False)
+    assert "selection_accuracy" in summary
+    assert 0.0 <= summary["selection_accuracy"] <= 1.0
+
+
+def test_prompt_dependence_reports_the_flip_and_the_control(corpus):
+    """Nothing in the training loop ever ran these probes, though the config has
+    listed them from the start."""
+    task = _selecting_task(corpus)
+    trainer = Trainer(
+        task,
+        loader(ExampleDataset(corpus, "train"), batch_size=1, shuffle=False),
+        loader(ExampleDataset(corpus, "val"), batch_size=1, shuffle=False),
+        CFG, Path(tempfile.mkdtemp()), stage=STAGE, evaluation={"metrics": ["dice"]},
+    )
+    probes = trainer.prompt_dependence()
+    assert set(probes) == {"flip_direction_drop", "permute_both_drop"}
+    assert all(math.isfinite(v) for v in probes.values())

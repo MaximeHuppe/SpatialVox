@@ -723,13 +723,21 @@ class Trainer:
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp, enabled=self.amp is not None)
 
+    def _progress(self, iterable, *, desc: str):
+        """Batch bar for a live run; silent when ``verbose`` is off (tests, scripts)."""
+        if not self.verbose:
+            return iterable
+        # Forced on even under ``tee``: tqdm would otherwise see a pipe and hide.
+        return tqdm(iterable, desc=desc, leave=False, dynamic_ncols=True, mininterval=1.0, unit="batch")
+
     def train_epoch(self, epoch: int) -> dict[str, float]:
         self.model.train()
         getattr(self.train_loader.dataset, "set_epoch", lambda _: None)(epoch)
         accumulation = max(int(self.cfg["accum"]), 1)
         self.optimizer.zero_grad(set_to_none=True)
         total_loss, total_dice, steps = 0.0, 0.0, 0
-        for index, raw in enumerate(self.train_loader):
+        batches = self._progress(self.train_loader, desc=f"epoch {epoch} train")
+        for index, raw in enumerate(batches):
             batch = self.to_device(raw)
             with self._autocast():
                 prediction = self.task(batch)
@@ -745,6 +753,8 @@ class Trainer:
                 )
             total_loss += float(loss.detach())
             steps += 1
+            if hasattr(batches, "set_postfix"):
+                batches.set_postfix(loss=f"{total_loss / steps:.3f}", dice=f"{total_dice / steps:.3f}", refresh=False)
         if steps % accumulation:  # flush a partial window rather than dropping it
             self.scaler.step(self.optimizer)
             self.scaler.update()
@@ -752,7 +762,13 @@ class Trainer:
         return {"loss": total_loss / max(steps, 1), "dice": total_dice / max(steps, 1)}
 
     @torch.no_grad()
-    def evaluate(self, loader: DataLoader | None = None, *, with_hausdorff: bool | None = None) -> dict[str, Any]:
+    def evaluate(
+        self,
+        loader: DataLoader | None = None,
+        *,
+        with_hausdorff: bool | None = None,
+        desc: str = "eval",
+    ) -> dict[str, Any]:
         loader = loader or self.val_loader
         if loader is None:
             return {}
@@ -763,12 +779,17 @@ class Trainer:
             self.task.anchor_scores.clear()
         metrics, total_loss, steps = Metrics(), 0.0, 0
         percentile = float(self.evaluation.get("hausdorff_percentile", 95.0))
-        for raw in loader:
+        picked = correct = 0
+        for raw in self._progress(loader, desc=desc):
             batch = self.to_device(raw)
             with self._autocast():
                 prediction = self.task(batch)
             total_loss += float(self.task.loss(prediction))
             steps += 1
+            if prediction.selection is not None and prediction.selection_target is not None:
+                choice = prediction.selection.float().nan_to_num(neginf=-1e4).argmax(dim=-1)
+                correct += int((choice == prediction.selection_target).sum())
+                picked += int(choice.numel())
             metrics.update(
                 prediction.logits, prediction.target, prediction.groups,
                 strata=prediction.strata, threshold=float(self.cfg.get("threshold", 0.5)),
@@ -779,7 +800,68 @@ class Trainer:
         scores = getattr(self.task, "anchor_scores", [])
         if scores:
             summary["anchor_dice"] = sum(scores) / len(scores)
+        if picked:
+            # Localisation, reported apart from Dice. Dice fuses "did it point at
+            # the right structure" with "did it outline it"; those transfer
+            # differently, and conflating them is what made the val curve
+            # unreadable - 0.07 Dice was 31% localisation, not bad delineation.
+            summary["selection_accuracy"] = correct / picked
         return summary
+
+    @torch.no_grad()
+    def prompt_dependence(self, loader: DataLoader | None = None) -> dict[str, float]:
+        """How far Dice falls when one clause asks for the opposite side.
+
+        The only signal that separates the two ways val Dice can rise. A model
+        reading the prompt must lose Dice here; one that has found a shortcut -
+        anchor identity, proximity - will not move. `configs/config.yaml` has
+        listed these probes since the beginning, but nothing in the training loop
+        ever ran them, so a run could climb for thirty epochs on a shortcut and
+        report nothing unusual.
+
+        `permute_both` is the control: it preserves every relation, so it must
+        not move. If it ever does, something has put information back into slot
+        order (check `select_anchors` and `ExampleDataset._augment`).
+        """
+        loader = loader or self.val_loader
+        if loader is None or not isinstance(self.task, StageBTask):
+            return {}
+        from src.geometry import DIRECTIONS, OPPOSITE
+
+        self.model.eval()
+        opposites = torch.tensor([DIRECTIONS.index(OPPOSITE[d]) for d in DIRECTIONS])
+        base, flipped, control = [], [], []
+        for raw in self._progress(loader, desc="probes"):
+            batch = self.to_device(raw)
+            with self._autocast():
+                reference = self.task(batch)
+                target = reference.target
+                base += dice_iou(torch.sigmoid(reference.logits.float()), target)[0].flatten().tolist()
+
+                directions = batch["direction_ids"]
+                turned = directions.clone()
+                turned[:, 0] = opposites.to(directions.device)[turned[:, 0]]
+                probe = {**batch, "direction_ids": turned}
+                flipped += dice_iou(
+                    torch.sigmoid(self.task(probe).logits.float()), target
+                )[0].flatten().tolist()
+
+                rolled = {
+                    **batch,
+                    "anchors": batch["anchors"].roll(1, dims=1),
+                    "name_ids": (batch["anchors"] - 1).roll(1, dims=1),
+                    "direction_ids": directions.roll(1, dims=1),
+                }
+                control += dice_iou(
+                    torch.sigmoid(self.task(rolled).logits.float()), target
+                )[0].flatten().tolist()
+        if not base:
+            return {}
+        mean = lambda xs: sum(xs) / len(xs)
+        return {
+            "flip_direction_drop": mean(base) - mean(flipped),
+            "permute_both_drop": mean(base) - mean(control),
+        }
 
     def fit(self) -> list[dict[str, Any]]:
         seed_all(int(self.cfg["seed"]))
@@ -793,7 +875,7 @@ class Trainer:
                 started = time.perf_counter()
                 train = self.train_epoch(epoch)
                 self.schedule.step()
-                val = self.evaluate()
+                val = self.evaluate(desc="val")
                 record = {
                     "epoch": epoch,
                     "train": train,
@@ -801,6 +883,13 @@ class Trainer:
                     "lr": self.optimizer.param_groups[0]["lr"],
                     "seconds": round(time.perf_counter() - started, 2),
                 }
+                record["val"].update(self.prompt_dependence())
+                transfer = getattr(self, "transfer_loader", None)
+                if transfer is not None:
+                    scored = self.evaluate(transfer, with_hausdorff=False, desc="transfer")
+                    record["transfer"] = {
+                        k: v for k, v in scored.items() if k not in ("by_name", "strata")
+                    }
                 self.history.append({**record, "val_full": val})
                 log.write(json.dumps(record) + "\n")
                 log.flush()
@@ -809,7 +898,13 @@ class Trainer:
                 if self.verbose:
                     print(
                         f"  epoch {epoch:>3}  loss {train['loss']:.4f}  train dice {train['dice']:.4f}"
-                        f"  val dice {val.get('dice', 0.0):.4f}  ({record['seconds']}s)"
+                        f"  val dice {val.get('dice', 0.0):.4f}"
+                        + (f"  sel {val['selection_accuracy']:.3f}" if "selection_accuracy" in val else "")
+                        + (f"  flip {record['val']['flip_direction_drop']:+.3f}"
+                           if "flip_direction_drop" in record["val"] else "")
+                        + (f"  transfer {record['transfer'].get('dice', 0.0):.4f}"
+                           if "transfer" in record else "")
+                        + f"  ({record['seconds']}s)"
                     )
                 dice = val.get("dice", 0.0)
                 # Checkpointing and early stopping use different notions of
