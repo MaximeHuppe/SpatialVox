@@ -1,11 +1,13 @@
 numpy>=1.26
 nibabel>=5.2
+scipy>=1.11
 pyyaml>=6.0
 pytest>=8.0
 
 # Install the torch build that matches the hardware: the default wheel ships MPS
 # support on Apple Silicon; on an NVIDIA card install the matching CUDA build.
 torch>=2.4
+tqdm>=4.66
 
 # Optional: set logging.backend to wandb in configs/config.yaml to mirror the
 # metrics that already go to runs/<name>/metrics.jsonl.
