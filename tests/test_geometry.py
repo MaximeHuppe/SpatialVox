@@ -7,6 +7,8 @@ import pytest
 
 from src.geometry import (
     AmbiguousDirection,
+    anchor_first_examples,
+    solutions_for,
     DIRECTIONS,
     OPPOSITE,
     bbox_extent_world,
@@ -279,3 +281,86 @@ def test_pool_defaults_to_the_deterministic_nearest_feasible_set():
     # With an rng the *set* is unchanged; only the order moves.
     shuffled = select_anchors(1, centroids, present, center, 3, pool=3, rng=np.random.default_rng(1))
     assert sorted(shuffled) == sorted(reference)
+
+
+# ---------------------------------------------------------------------------
+# Anchor-first generation
+# ---------------------------------------------------------------------------
+def _scatter(rng, n=12, size=64.0):
+    """A scene of well-separated structures, as centroids."""
+    centroids = np.full((n + 1, 3), np.nan)
+    centroids[1:] = rng.uniform(4, size - 4, size=(n, 3))
+    return centroids, list(range(1, n + 1)), np.array([size / 2] * 3)
+
+
+def test_anchor_first_only_emits_prompts_that_describe_one_structure():
+    """Well-posedness by construction, not by luck.
+
+    The target-first generator emitted examples whose three clauses matched more
+    than one structure (5.5% of them, and 29% at anchor_pool 8). Supervising on
+    those teaches the model to prefer one defensible reading over another.
+    """
+    rng = np.random.default_rng(0)
+    centroids, present, center = _scatter(rng)
+    found = anchor_first_examples(
+        centroids, present, center, 3, triples=200, locality=12, rng=rng
+    )
+    assert found, "expected this scene to support some prompts"
+    for anchors, directions, target in found:
+        assert solutions_for(anchors, directions, centroids, present, center) == [target]
+
+
+def test_anchor_first_stops_the_anchor_set_from_naming_the_target():
+    """The reason for the change: identities must not be a lookup key.
+
+    Target-first draws the anchors nearest the target, so on fixed anatomy the
+    unordered anchor set recovers the target 98.9% of the time on `data/mri`,
+    and reading the prompt is strictly worse than ignoring it. Anchor-first
+    makes one triple serve several targets.
+    """
+    rng = np.random.default_rng(1)
+    centroids, present, center = _scatter(rng)
+    found = anchor_first_examples(
+        centroids, present, center, 3, triples=400, locality=12, rng=rng
+    )
+    by_set: dict[frozenset, set[int]] = {}
+    for anchors, _, target in found:
+        by_set.setdefault(frozenset(anchors), set()).add(target)
+    shared = [targets for targets in by_set.values() if len(targets) > 1]
+    assert shared, "no anchor set served more than one target; directions stay decorative"
+
+
+def test_anchor_first_clauses_stay_aligned_with_their_anchors():
+    """Clause i must describe anchor i even after the order is shuffled."""
+    rng = np.random.default_rng(2)
+    centroids, present, center = _scatter(rng)
+    for anchors, directions, target in anchor_first_examples(
+        centroids, present, center, 3, triples=100, locality=12, rng=rng
+    ):
+        for anchor, direction in zip(anchors, directions):
+            assert classify(centroids[target], centroids[anchor], center) == direction
+
+
+def test_anchor_first_directions_are_pairwise_distinct():
+    rng = np.random.default_rng(3)
+    centroids, present, center = _scatter(rng)
+    for _, directions, _ in anchor_first_examples(
+        centroids, present, center, 3, triples=200, locality=12, rng=rng
+    ):
+        assert len(set(directions)) == len(directions)
+
+
+def test_shuffle_clauses_false_keeps_the_distance_ranking():
+    """The knob exists only to reproduce the pre-dbc1e0c leak; it must be real."""
+    rng = np.random.default_rng(4)
+    centroids, present, center = _scatter(rng)
+    target = present[0]
+    # pool=None is the deterministic nearest-feasible path, so with the final
+    # shuffle off the stored order IS the distance ranking - which is precisely
+    # the leak dbc1e0c removed, worth ~0.11 Dice. The knob must reproduce it.
+    ordered = select_anchors(
+        target, centroids, present, center, 3,
+        rng=np.random.default_rng(5), shuffle=False,
+    )
+    distances = [float(np.linalg.norm(centroids[a] - centroids[target])) for a, _ in ordered]
+    assert distances == sorted(distances)

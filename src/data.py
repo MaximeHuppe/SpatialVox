@@ -38,7 +38,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from src.geometry import DIRECTIONS, centroids_world, select_anchors, volume_center_world
+from src.geometry import (
+    DIRECTIONS, anchor_first_examples, centroids_world, directions_for,
+    select_anchors, solutions_for, volume_center_world,
+)
 from src.vocab import Vocabulary
 
 # ---------------------------------------------------------------------------
@@ -96,6 +99,12 @@ def build_examples(
     n_anchors: int = 3,
     *,
     pool: int | None = None,
+    shuffle_clauses: bool = True,
+    selection: str = "target-first",
+    triples: int = 300,
+    locality: int = 8,
+    unique_only: bool = True,
+    stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
     """Every relational example a scene supports: one per structure, as target.
 
@@ -112,23 +121,62 @@ def build_examples(
     present = [int(v) for v in np.unique(labels) if v != 0]
     centroids = centroids_world(labels, len(vocab), tuple(spacing))
     center = volume_center_world(labels.shape, tuple(spacing))
+    seed = zlib.crc32(scene_id.encode("utf-8"))
+
+    def record(index: int, target: int, anchors: Sequence[int], directions: Sequence[str]):
+        clauses = [{"direction": d, "anchor": vocab.name(a)} for a, d in zip(anchors, directions)]
+        return {
+            "scene": scene_id,
+            "id": f"{scene_id}__{vocab.name(target)}__{index}",
+            "target": int(target),
+            "anchors": [int(a) for a in anchors],
+            "directions": list(directions),
+            "prompt": vocab.render(clauses),
+        }
+
+    if selection == "anchor-first":
+        rng = np.random.default_rng([seed, 0])
+        found = anchor_first_examples(
+            centroids, present, center, n_anchors,
+            triples=triples, locality=locality, rng=rng, shuffle=shuffle_clauses,
+        )
+        counter: dict[int, int] = {}
+        examples = []
+        for anchors, directions, target in found:
+            counter[target] = counter.get(target, 0) + 1
+            examples.append(record(counter[target] - 1, target, anchors, directions))
+        if stats is not None:
+            stats["examples"] = stats.get("examples", 0) + len(examples)
+        return examples
+
+    if selection != "target-first":
+        raise ValueError(f"selection must be 'target-first' or 'anchor-first', got {selection!r}")
+
+    fallbacks: list[int] = []
     examples = []
     for target in present:
-        rng = np.random.default_rng([zlib.crc32(scene_id.encode("utf-8")), target])
-        chosen = select_anchors(target, centroids, present, center, n_anchors, pool=pool, rng=rng)
+        rng = np.random.default_rng([seed, target])
+        chosen = select_anchors(
+            target, centroids, present, center, n_anchors,
+            pool=pool, rng=rng, shuffle=shuffle_clauses, fallbacks=fallbacks,
+        )
         if chosen is None:
             continue
-        clauses = [{"direction": d, "anchor": vocab.name(label)} for label, d in chosen]
-        examples.append(
-            {
-                "scene": scene_id,
-                "id": f"{scene_id}__{vocab.name(target)}",
-                "target": target,
-                "anchors": [label for label, _ in chosen],
-                "directions": [d for _, d in chosen],
-                "prompt": vocab.render(clauses),
-            }
-        )
+        anchors = [label for label, _ in chosen]
+        directions = [d for _, d in chosen]
+        # A prompt that describes more than one structure teaches the model to
+        # prefer one defensible reading over another. Drop it rather than
+        # supervise on it - well-posedness by construction, not by luck.
+        if unique_only and len(
+            solutions_for(anchors, directions, centroids, present, center)
+        ) != 1:
+            if stats is not None:
+                stats["dropped_ambiguous"] = stats.get("dropped_ambiguous", 0) + 1
+            continue
+        examples.append(record(0, target, anchors, directions))
+    if stats is not None:
+        stats["examples"] = stats.get("examples", 0) + len(examples)
+        stats["pool_fallbacks"] = stats.get("pool_fallbacks", 0) + len(fallbacks)
     return examples
 
 
@@ -162,6 +210,8 @@ def write_corpus(
     n_anchors: int,
     targets: Mapping[str, Sequence[str]],
     anchor_pool: int | None = None,
+    selection: str = "target-first",
+    shuffle_clauses: bool = True,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write ``vocab.json``, ``meta.json`` and one JSONL manifest per split."""
@@ -180,6 +230,8 @@ def write_corpus(
         "spacing": [float(v) for v in spacing],
         "n_anchors": int(n_anchors),
         "anchor_pool": int(n_anchors if anchor_pool is None else anchor_pool),
+        "selection": str(selection),
+        "shuffle_clauses": bool(shuffle_clauses),
         "targets": {split: list(names) for split, names in targets.items()},
         "examples": counts,
         **dict(extra or {}),
@@ -196,7 +248,9 @@ def import_corpus(
     *,
     spacing: Sequence[float] = (1.0, 1.0, 1.0),
     n_anchors: int = 3,
+    anchor_pool: int | None = None,
     targets: Mapping[str, Sequence[str]] | None = None,
+    extra: Mapping[str, Any] | None = None,
 ) -> Path:
     """Turn real volumes into a corpus of this project's shape.
 
@@ -211,7 +265,7 @@ def import_corpus(
             defaults to every name in every split.
 
     This is the only entry point real MRI needs - see
-    ``docs/method/08_scaling.md``.
+    ``docs/method/08_scaling.md``. ``scripts/import_mri.py`` is the HCP path.
     """
     vocab = Vocabulary(tuple(label_names.values()))
     remap = np.zeros(max(label_names) + 1, dtype=np.uint16)
@@ -224,10 +278,16 @@ def import_corpus(
         manifests[split] = []
         for scene_id in scene_ids:
             image, labels = scenes[scene_id]
-            labels = remap[np.clip(labels.astype(np.int64), 0, len(remap) - 1)]
+            source = labels.astype(np.int64, copy=False)
+            mapped = np.zeros(source.shape, dtype=np.uint16)
+            valid = (source >= 0) & (source < len(remap))
+            mapped[valid] = remap[source[valid]]
+            labels = mapped
             shape = shape or labels.shape
             write_scene(root, scene_id, image, labels, spacing)
-            manifests[split] += build_examples(scene_id, labels, vocab, spacing, n_anchors)
+            manifests[split] += build_examples(
+                scene_id, labels, vocab, spacing, n_anchors, pool=anchor_pool
+            )
     if shape is None:
         raise ValueError("no scenes to import")
     return write_corpus(
@@ -238,6 +298,8 @@ def import_corpus(
         spacing=spacing,
         n_anchors=n_anchors,
         targets=targets or {split: list(vocab.names) for split in splits},
+        anchor_pool=anchor_pool,
+        extra=extra,
     )
 
 
@@ -274,6 +336,20 @@ class Corpus:
     @property
     def n_anchors(self) -> int:
         return int(self.meta["n_anchors"])
+
+    @property
+    def selection(self) -> str:
+        """``target-first`` (anchors nearest the target) or ``anchor-first``.
+
+        Absent in corpora written before anchor-first existed, where it was
+        always target-first.
+        """
+        return str(self.meta.get("selection", "target-first"))
+
+    @property
+    def shuffle_clauses(self) -> bool:
+        """Whether slot order was randomised when the manifest was written."""
+        return bool(self.meta.get("shuffle_clauses", True))
 
     @property
     def anchor_pool(self) -> int:
@@ -431,6 +507,8 @@ class ExampleDataset(Dataset):
         scenes: Sequence[str] | None = None,
         augment: bool = False,
         limit: int | None = None,
+        sample: int | None = None,
+        seed: int = 0,
         cache: bool = True,
         normalize_mode: str = "none",
     ) -> None:
@@ -438,6 +516,15 @@ class ExampleDataset(Dataset):
         records = corpus.records(split, targets)
         if scenes is not None:
             records = [row for row in records if row["scene"] in set(scenes)]
+        if sample is not None and 0 < sample < len(records):
+            # Anchor-first generation emits hundreds of prompts per scene, which
+            # would make validation cost more than training. Take a fixed random
+            # subset rather than a prefix: `limit` would slice by manifest order,
+            # which is scene order, so it would silently validate on the first
+            # few subjects only. The seed is fixed, so the curve stays comparable
+            # across epochs and runs.
+            picked = np.random.default_rng(seed).permutation(len(records))[:sample]
+            records = [records[int(i)] for i in sorted(picked)]
         self.records = records[: limit or None]
         self.augment = augment
         self.epoch = torch.zeros((), dtype=torch.long).share_memory_()
@@ -462,15 +549,28 @@ class ExampleDataset(Dataset):
         rotated_labels = rotate(labels, sequence)
         vocab, spacing = self.corpus.vocab, self.corpus.spacing
         present = [int(v) for v in np.unique(rotated_labels) if v != 0]
-        chosen = select_anchors(
-            record["target"],
-            centroids_world(rotated_labels, len(vocab), spacing),
-            present,
-            volume_center_world(rotated_labels.shape, spacing),
-            self.corpus.n_anchors,
-            pool=self.corpus.anchor_pool,
-            rng=rng,
-        )
+        centroids = centroids_world(rotated_labels, len(vocab), spacing)
+        center = volume_center_world(rotated_labels.shape, spacing)
+        if self.corpus.selection == "anchor-first":
+            # Keep the stored anchors and target; only re-derive the directions,
+            # which is all the rotation changed. Re-*selecting* here would draw a
+            # fresh triple nearest the target and quietly turn an anchor-first
+            # corpus back into a target-first one, one epoch at a time.
+            anchors = [int(a) for a in record["anchors"]]
+            if any(a not in present for a in anchors):
+                return image, labels, record
+            directions = directions_for(record["target"], anchors, centroids, center)
+            if directions is None:
+                return image, labels, record
+            if len(solutions_for(anchors, directions, centroids, present, center)) != 1:
+                return image, labels, record  # the rotation broke uniqueness
+            chosen = list(zip(anchors, directions))
+        else:
+            chosen = select_anchors(
+                record["target"], centroids, present, center,
+                self.corpus.n_anchors, pool=self.corpus.anchor_pool, rng=rng,
+                shuffle=self.corpus.shuffle_clauses,
+            )
         if chosen is None:  # no feasible anchor set in this pose: keep the stored one
             return image, labels, record
         clauses = [{"direction": d, "anchor": vocab.name(label)} for label, d in chosen]

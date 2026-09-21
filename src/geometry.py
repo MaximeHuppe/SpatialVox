@@ -176,6 +176,8 @@ def select_anchors(
     *,
     pool: int | None = None,
     rng: np.random.Generator | None = None,
+    shuffle: bool = True,
+    fallbacks: list[int] | None = None,
 ) -> list[tuple[int, str]] | None:
     """Anchor selection for one target, with pairwise-distinct directions.
 
@@ -218,7 +220,168 @@ def select_anchors(
         rng.shuffle(window)  # which of the k nearest, not just the nearest
         chosen = _distinct_directions(window, n_anchors)
     if chosen is None:
+        # The pool window held no feasible triple, so this example silently
+        # reverts to the deterministic nearest set. Counted, because a corpus
+        # that is part-deterministic without saying so is a leak in waiting.
+        if fallbacks is not None and width > n_anchors:
+            fallbacks.append(1)
         chosen = _distinct_directions(candidates, n_anchors)
-    if chosen is not None and rng is not None:
+    if chosen is not None and rng is not None and shuffle:
         rng.shuffle(chosen)  # slot order must not encode distance rank
     return chosen
+
+
+def directions_for(
+    target: int,
+    anchors: Sequence[int],
+    centroids: np.ndarray,
+    center: np.ndarray,
+) -> list[str] | None:
+    """The clause directions describing ``target`` against each of ``anchors``.
+
+    ``None`` when any pair is undecidable, or when two clauses would name the
+    same side - two identical directions do not narrow the conjunction, which is
+    the ``_distinct_directions`` rule applied to a triple that is already fixed.
+    """
+    directions: list[str] = []
+    for anchor in anchors:
+        try:
+            directions.append(classify(centroids[target], centroids[anchor], center))
+        except AmbiguousDirection:
+            return None
+    return directions if len(set(directions)) == len(directions) else None
+
+
+def solutions_for(
+    anchors: Sequence[int],
+    directions: Sequence[str],
+    centroids: np.ndarray,
+    present: Sequence[int],
+    center: np.ndarray,
+) -> list[int]:
+    """Every present non-anchor structure that satisfies *all* the clauses.
+
+    This is the relational conjunction read literally. A prompt is well posed
+    exactly when this returns one label; anything else and the sentence
+    describes more than one structure, or none.
+    """
+    solutions = []
+    for label in present:
+        if label in anchors:
+            continue
+        for anchor, direction in zip(anchors, directions):
+            try:
+                if classify(centroids[label], centroids[anchor], center) != direction:
+                    break
+            except AmbiguousDirection:
+                break
+        else:
+            solutions.append(int(label))
+    return solutions
+
+
+def direction_matrix(
+    centroids: np.ndarray, present: Sequence[int], center: np.ndarray
+) -> tuple[np.ndarray, dict[int, int]]:
+    """Direction code of every ordered (target, anchor) pair among ``present``.
+
+    ``classify`` is pure Python, and anchor-first generation asks the same
+    question about the same pairs thousands of times per scene. Answering each
+    pair once turns ~360k calls per scene into ~500, which is the difference
+    between a manifest rebuild taking minutes and taking hours.
+
+    Returns ``(codes, index)`` where ``codes[i, j]`` is the index into
+    :data:`DIRECTIONS` describing ``present[i]`` relative to ``present[j]``, or
+    ``-1`` when the pair is undecidable, and ``index`` maps a label to its row.
+    """
+    labels = [int(l) for l in present]
+    index = {label: i for i, label in enumerate(labels)}
+    codes = np.full((len(labels), len(labels)), -1, dtype=np.int8)
+    for i, target in enumerate(labels):
+        for j, anchor in enumerate(labels):
+            if i == j:
+                continue
+            try:
+                codes[i, j] = DIRECTIONS.index(
+                    classify(centroids[target], centroids[anchor], center)
+                )
+            except AmbiguousDirection:
+                continue
+    return codes, index
+
+
+def anchor_first_examples(
+    centroids: np.ndarray,
+    present: Sequence[int],
+    center: np.ndarray,
+    n_anchors: int,
+    *,
+    triples: int,
+    locality: int,
+    rng: np.random.Generator,
+    shuffle: bool = True,
+) -> list[tuple[list[int], list[str], int]]:
+    """Anchor-first generation: fix a landmark set, then ask what it determines.
+
+    The target-first generator picks the anchors *nearest the target*, which
+    makes the anchor identities a near-perfect name tag for the target - on fixed
+    anatomy the three nearest neighbours of a structure are the same in every
+    subject. Measured on ``data/mri``: the unordered anchor set alone recovers
+    the target in 98.9% of examples, while solving the conjunction is right 94.5%
+    of the time, so ignoring the prompt strictly beats reading it. No pool width
+    inverts that; the selection rule itself is the leak.
+
+    Here the triple comes first and the targets follow, so one anchor set serves
+    several targets and only the direction words tell them apart. Examples whose
+    conjunction is *not* unique are dropped, which makes well-posedness hold by
+    construction rather than by luck. Measured: P(target | anchors) falls from
+    98.9% to 42.3%, and the prompt-blind floor from 0.800 to 0.205.
+
+    ``locality`` keeps the prompts sayable: the triple is drawn from the
+    ``locality`` structures nearest a randomly chosen seed, not from the whole
+    volume, so clauses name landmarks a reader would actually name together.
+
+    Returns ``(anchors, directions, target)``. Anchor order is shuffled when
+    ``shuffle`` - slot order must carry no information (see
+    :func:`select_anchors`).
+    """
+    labels = [int(l) for l in present]
+    if len(labels) <= n_anchors:
+        return []
+    codes, index = direction_matrix(centroids, labels, center)
+    positions = np.array([centroids[l] for l in labels], dtype=float)
+
+    out: list[tuple[list[int], list[str], int]] = []
+    seen: set[tuple[int, ...]] = set()
+    for _ in range(int(triples)):
+        seed = int(rng.integers(len(labels)))
+        order = np.argsort(np.linalg.norm(positions - positions[seed], axis=1))
+        window = order[: max(int(locality), n_anchors)]
+        if len(window) < n_anchors:
+            continue
+        columns = np.sort(rng.choice(window, n_anchors, replace=False))
+        key = tuple(int(c) for c in columns)
+        if key in seen:
+            continue
+        seen.add(key)
+        # [K, n_anchors]: how every structure sits relative to this triple.
+        relative = codes[:, columns]
+        for row in range(len(labels)):
+            if row in columns:
+                continue
+            wanted = relative[row]
+            if (wanted < 0).any() or len(set(wanted.tolist())) != n_anchors:
+                continue  # undecidable pair, or two clauses naming the same side
+            matches = (relative == wanted).all(axis=1)
+            matches[columns] = False
+            if int(matches.sum()) != 1:
+                continue  # the sentence does not pick out exactly one structure
+            clauses = [
+                (labels[int(c)], DIRECTIONS[int(d)]) for c, d in zip(columns, wanted)
+            ]
+            if shuffle:
+                rng.shuffle(clauses)
+            out.append(
+                ([a for a, _ in clauses], [d for _, d in clauses], labels[row])
+            )
+    return out
