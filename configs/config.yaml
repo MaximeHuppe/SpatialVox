@@ -6,13 +6,33 @@
 # and changing it makes a new experiment rather than a rerun.
 
 data:
-  root: data/synthetic       # corpus directory: images, labels, manifests, vocabulary
-  resolution: 64             # cube side; must match the corpus and model.bottleneck
+  root: data/mri            # corpus directory: images, labels, manifests, vocabulary
+  resolution: 128            # cube side; must match the corpus and model.bottleneck
   spacing: [1.0, 1.0, 1.0]   # world units per voxel, ordered (x, y, z)
   n_anchors: 3               # relations per prompt, and anchor mask channels
   anchor_pool: 3             # number of nearest candidates to draw from for anchors
   margin: 2                  # voxels every structure must keep from the border
-  normalize: none            # reference: none. Use `zscore` for real MRI.
+  normalize: zscore-brain    # none | zscore | zscore-brain. `zscore` uses whole-volume
+                             # statistics; with mri.apply_brainmask 66.5% of the volume is
+                             # exact zero, which puts tissue at +1.35 sigma with a 0.52 spread
+                             # that drifts per subject. `zscore-brain` measures over the brain.
+
+  # How a prompt's anchors are chosen. `target-first` takes the `anchor_pool`
+  # nearest structures to the target and draws `n_anchors` of them - which makes
+  # the anchor identities a name tag for the target: on fixed anatomy the
+  # unordered anchor set alone recovers the target 98.9% of the time, while
+  # solving the conjunction is right 94.5% of the time, so ignoring the prompt
+  # strictly beats reading it. No pool width inverts that.
+  # `anchor-first` fixes the triple first and keeps the targets it determines
+  # uniquely: P(target|anchors) drops to 42.3%, the conjunction is unique by
+  # construction, and the prompt-blind floor falls from 0.800 to 0.205.
+  selection: anchor-first    # target-first | anchor-first
+  triples: 60               # anchor-first: candidate triples drawn per scene
+  locality: 8                # anchor-first: draw the triple from the k nearest a seed,
+                             # so clauses name landmarks a reader would name together
+  unique_only: true          # drop examples whose clauses describe more than one structure
+  shuffle_clauses: true      # randomise slot order. false reproduces the pre-dbc1e0c
+                             # ordering leak, which was worth ~0.11 Dice - never for a real run.
 
 
 synthetic:
@@ -32,24 +52,81 @@ synthetic:
     blur: 0.6                  # voxels; makes edges partial-volume
 
 
+# Stage B target-class split. Every name stays in the vocabulary (and may be an
+# anchor) in every split; only supervision-as-target is restricted.
+# MRI: compact grey-matter nuclei, mirror-closed by type, size-extremes in train
+# (accumbens, thalamus). Ventricles and the brainstem are vocab-only landmarks.
+# Synthetic generation ignores this block when the names are not primitives.
 targets:
-  train: [cube, sphere, cylinder, cone, pyramid, torus, capsule]
-  val: [cuboid, ellipsoid]
-  test: [triangular_prism]
+  train: [Left-Thalamus, Right-Thalamus, Left-Pallidum, Right-Pallidum,
+          Left-Amygdala, Right-Amygdala, Left-Accumbens, Right-Accumbens]
+  val:   [Left-Caudate, Right-Caudate, Left-Putamen, Right-Putamen]
+  test:  [Left-Hippocampus, Right-Hippocampus]
+
+
+# Real MRI — the corpus this project trains on. `scripts/import_mri.py` writes
+# `scenes/<id>/{image,labels}.nii.gz`, the manifests and the vocabulary, honouring
+# every prompt knob in the `data:` block above. Unlisted FreeSurfer / dense ids
+# become background. To change a prompt knob afterwards use
+# `scripts/rebuild_manifests.py` — seconds, no volumes rewritten.
+mri:
+  source: /home/imag2/Documents/IMAG2/HCP
+  output: data/mri
+  n_subjects: 200
+  split_seed: 20260919
+  subject_fractions: {train: 0.8, val: 0.1, test: 0.1}
+  apply_brainmask: true
+  aws:
+    uri: s3://hcp-openaccess/HCP_1200
+    profile: null
+  volumes:
+    image: [T1w_acpc_dc_restore_1.25.nii.gz, t1.nii.gz]
+    labels: [wmparc.nii.gz, mask.nii.gz, aseg.nii.gz]
+    brainmask: [brainmask_fs.nii.gz]
+  structures:
+    Left-Lateral-Ventricle:  {fs: 4,  dense: 3}
+    Left-Inf-Lat-Vent:       {fs: 5,  dense: 4}
+    Left-Thalamus:           {fs: 10, dense: 7}
+    Left-Caudate:            {fs: 11, dense: 8}
+    Left-Putamen:            {fs: 12, dense: 9}
+    Left-Pallidum:           {fs: 13, dense: 10}
+    3rd-Ventricle:           {fs: 14, dense: 11}
+    4th-Ventricle:           {fs: 15, dense: 12}
+    Brain-Stem:              {fs: 16, dense: 13}
+    Left-Hippocampus:        {fs: 17, dense: 14}
+    Left-Amygdala:           {fs: 18, dense: 15}
+    Left-Accumbens:          {fs: 26, dense: 17}
+    Left-VentralDC:          {fs: 28, dense: 18}
+    Right-Lateral-Ventricle: {fs: 43, dense: 21}
+    Right-Inf-Lat-Vent:      {fs: 44, dense: 22}
+    Right-Thalamus:          {fs: 49, dense: 25}
+    Right-Caudate:           {fs: 50, dense: 26}
+    Right-Putamen:           {fs: 51, dense: 27}
+    Right-Pallidum:          {fs: 52, dense: 28}
+    Right-Hippocampus:       {fs: 53, dense: 29}
+    Right-Amygdala:          {fs: 54, dense: 30}
+    Right-Accumbens:         {fs: 58, dense: 31}
+    Right-VentralDC:         {fs: 60, dense: 32}
 
 
 
 model:
-  encoder_channels: [32, 64, 128, 256]         # channels of the encoder (widths of the encoder blocks)
-  bottleneck: 8                                # bottleneck dimension of the encoder
+  encoder_channels: [32, 64, 128, 256]    # one width per scale; 128³ needs the extra 256 so the bottleneck stays 8³
+  bottleneck: 16                                # bottleneck dimension of the encoder
   token_dim: 256                               # dimension of the token embeddings (textual and spatial)
   num_heads: 4                                 # number of attention heads (heads = token_dim / head_dim)
   intersection_hidden: 256                     # width inside Stage B's intersection block
   stage_b_image: true                          # Stage B sees the intensity volume at its decoder,
                                                # resampled per scale. Off = the pre-image architecture,
                                                # where an empty occupancy left it unable to see the scene.
+  stage_b_selection: true                      # Stage B also scores Stage A's candidate masks and is
+                                               # supervised on which one the prompt describes. The dense
+                                               # head learns a silhouette per class, which is why
+                                               # localisation is 100% on trained classes and 31% on unseen
+                                               # ones; selection has no per-class parameters, so it is the
+                                               # half of the objective that can transfer.
   prior_foreground: 0.0016                     # expected foreground fraction; initialises the head bias
-  deep_supervision: [0.1, 0.3, 0.6]            # Stage A loss weights per decoder scale, coarse to fine
+  deep_supervision: [0.1, 0.3, 0.6]     # Stage A loss weights per decoder scale, coarse to fine (4 scales at 128³)
 
 
 
@@ -57,19 +134,24 @@ train:
   seed: 20260915
   device: auto                                                    # auto -> cuda, then mps, then cpu
   precision: bf16                                                 # fp32 | bf16 | fp16 (fp16 adds a gradient scaler)
-  batch_size: 16                                                  # number of samples per batch
+  batch_size: 4                                                   # 128³ is 8× the voxels of 64³; keep the effective batch via accum
   accum: 1                                                        # optimiser step every `accum` batches
-  workers: 8                                                      # number of workers for data loading
+  workers: 4                                                      # number of workers for data loading
   threshold: 0.5                                                  # probability cut for a binary mask
   loss: {name: dice_bce, lambda_dice: 1.0, lambda_bce: 1.0}       # loss function and weights
   early_stopping: {patience: 0, min_delta: 0.005}                 # early stopping parameters
+  selection_weight: 0.5                                           # weight of the candidate cross-entropy
+  val_examples: 600                                               # fixed random subset per val curve
+                                                                  # (null = all). Anchor-first emits
+                                                                  # ~380 prompts/scene, so unsubsampled
+                                                                  # validation costs more than training.
 
 
   stage_a:
     epochs: 50
     optimizer: {name: adamw, lr: 0.001, weight_decay: 0.00001}
     scheduler: {name: cosine, warmup_epochs: 2}
-    augment: false           
+    augment: true           
     prompts_per_item: null                                         # sample this many structure names per scene; null = all
 
 
@@ -79,8 +161,11 @@ train:
     scheduler: {name: cosine, warmup_epochs: 5}
     augment: true
     mode: predicted                    # predicted | oracle. predicted requires phase_a_checkpoint; oracle uses ground-truth anchors and occupancy.
-    phase_a_checkpoint: runs/stage_a_aug/best.pt   # Stage A weights. Required when mode is predicted; ignored when mode is oracle.
-    occupancy_mode: none                # all | distractors-only | anchors-only | none. Which masks of that
+    phase_a_checkpoint: runs/phase-a/current/best.pt   # Stage A weights. Required when mode is predicted;
+                                        # ignored when mode is oracle. Prefer passing --segmenter explicitly:
+                                        # two Phase B runs once recorded this same path while consuming
+                                        # different weights, because Phase A was re-run and overwrote it.
+    occupancy_mode: all                 # all | distractors-only | anchors-only | none. Which masks of that
                                         # source are unioned into occupancy, on top of model.stage_b_image.
                                         # all leaks the target's silhouette; distractors-only is an oracle
                                         # diagnostic; anchors-only is bit-for-bit none at the decoder.
@@ -89,8 +174,8 @@ train:
 logging:
   backend: wandb              # wandb | none
   wandb:
-    project: spatial-vox
-    tags: [synthetic]
+    project: spatial-vox-mri
+    tags: [mri, stage-b, augment, anchors-only, zscore]
 
 
 
