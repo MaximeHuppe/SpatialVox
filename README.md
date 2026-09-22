@@ -1,45 +1,54 @@
 # Relational3D
 
-Segment a 3D structure that the prompt never names — only locates, by its
-relations to three structures that *are* named.
+Segment a structure the prompt never names — only locates, by its relations to
+three structures that *are* named.
 
 ```text
-segment the structure that is superior to the cube, medial to the torus,
-and anterior to the sphere.
+segment the structure that is superior to the Left-Thalamus,
+medial to the Right-Putamen, and anterior to the Brain-Stem.
 ```
 
-No single relation identifies anything; only the intersection of all three picks
-out one region. The target is never an input.
+No single relation identifies anything; only the conjunction of all three picks
+out one region. The target is never an input, and the mask is **painted from the
+MRI** rather than chosen from a list of proposals — so the output need not be a
+structure the segmenter already knows how to draw.
 
-Two networks. **Stage A** segments named structures from an intensity volume — on
-real MRI this is an anatomy segmenter. **Stage B** takes three of those masks in
-the order the prompt names them, plus the prompt, plus the intensity volume
-itself, and outputs the target. The volume enters at the decoder only, so the
-relations decide *which* structure and the image supplies *what is there*; an
-optional binary occupancy map (`train.stage_b.occupancy_mode`) can be unioned in
-alongside it. Because Stage B consumes masks and
-measures its own geometry from them, the same trained model runs on ground-truth
-anchors (which isolates the relational architecture) or on Stage A's predictions
-(the end-to-end setting), and the difference is attributable segmentation error.
+```text
+image   [B, 1, 128, 128, 128]     z-scored over the brain
+clauses [B, 3] × {direction, name}
+        →  target logits [B, 1, 128, 128, 128]
+        →  null logit               one number: the clauses name nothing
+        →  centroid [B, 3]          from a heatmap, not from the mask
+```
 
-**[docs/method/](docs/method/) explains how and why.**
+**Names stop at Stage A.** They buy three soft anchor masks and are then gone:
+no name, pair or slot embedding exists anywhere downstream. The direction words
+are consumed by a parameter-free geometric mapper and by nothing else.
 
-The networks are the ones from `exp/realistic-appearance`, parameter for
-parameter — `tests/test_reference_parity.py` ports a checkpoint from that branch
-into these classes and checks every output tensor is bit-identical, so results
-stay comparable across the rewrite. That parity is with `model.stage_b_image:
-false`; the shipped default is `true`, which adds one input plane to Stage B's
-three decoder guidance convolutions and nothing else. With it off, Stage B is
-bit-for-bit the reference architecture. (The parity test skips when the
-reference branch is absent, as in a shallow clone — check that it *ran* before
-reading a green suite as a parity guarantee.)
+The architecture is [`docs/proposal/relational_architecture.md`](docs/proposal/relational_architecture.md);
+every place the implementation departs from it is recorded, with the measurement
+that justified it, in [`docs/proposal/deviations.md`](docs/proposal/deviations.md).
+`CLAUDE.md` is the short version: the invariants that make the claim mean
+something.
+
+## The four pieces
+
+| | what it sees | what it is |
+|---|---|---|
+| **Stage A** | the image, three anchor names | a promptable segmenter, trained beforehand on every name that may be an anchor, then **frozen** |
+| **`PositionalMapper3D`** | detached soft anchor masks, three direction ids | `classify` written as a soft 45° pyramid. No parameters, no image, no names. `where_raw = F₀·F₁·F₂`, never divided by its own maximum |
+| **`B(I)`** | the MRI | generic boundary features, pretrained without class ids. Stage A's pyramid is not a substitute — those features were trained to light up *named* structures |
+| **carver** | `B(I)`, the three masks, the three fields, `where_raw` and its mass | two 16-channel blocks. It never receives a name, a direction id, or a coordinate grid |
+
+A separate null head reads four scalars — the field's mass and the three anchor
+masses — and no pixels, so it cannot decide "empty" by looking at tissue.
 
 ## Setup
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-.venv/bin/python -m pytest          # ~15 s
+.venv/bin/python -m pytest          # ~3 min
 ```
 
 Install the torch build that matches the hardware (CUDA, or MPS on Apple
@@ -48,68 +57,80 @@ Silicon).
 ## Run it
 
 ```bash
-.venv/bin/python scripts/generate_data.py --smoke   # 12 scenes, ~20 s
-.venv/bin/python scripts/generate_data.py           # 500 scenes
+# 1. the corpus: HCP subjects -> scenes, manifests, vocabulary
+.venv/bin/python scripts/import_mri.py
+.venv/bin/python scripts/corpus_report.py            # the prompt-blind floor a Dice is read against
 
-.venv/bin/python scripts/train.py a                 # Stage A
-.venv/bin/python scripts/train.py b --overfit 1 --set train.stage_b.epochs=200 --set train.stage_b.mode=oracle
-.venv/bin/python scripts/train.py b                 # Stage B, predicted anchors (needs Stage A)
-.venv/bin/python scripts/train.py b --set train.stage_b.mode=oracle  # Stage B, ground-truth anchors
+# 2. the gate. §2 makes this a precondition, not a diagnostic.
+.venv/bin/python scripts/gate_mapper.py --segmenter runs/phase-a/current/best.pt
 
-.venv/bin/python scripts/evaluate.py runs/stage_b/best.pt
-.venv/bin/python scripts/evaluate.py runs/stage_b/best.pt --set train.stage_b.mode=oracle
+# 3. Stage A, then frozen
+.venv/bin/python scripts/train.py a
+.venv/bin/python scripts/cache_anchors.py --segmenter runs/phase-a/current/best.pt
+
+# 4. the relational model
+.venv/bin/python scripts/train.py b --overfit 1 --set train.stage_b.epochs=120   # wiring test
+.venv/bin/python scripts/train.py boundary                                       # optional: pretrain B(I)
+.venv/bin/python scripts/train.py b
+.venv/bin/python scripts/train.py b --prompt-only    # the mandatory ablation: B(I) removed
+
+# 5. the report
+.venv/bin/python scripts/evaluate.py runs/stage_b/best.pt --split val --classes val
 ```
 
-Every tunable lives in `configs/config.yaml`; any leaf can be overridden from the
-command line:
+Every tunable lives in `configs/config.yaml`; any leaf can be overridden from
+the command line:
 
 ```bash
-.venv/bin/python scripts/train.py b --set train.stage_b.epochs=5 --set model.base_channels=8
+.venv/bin/python scripts/train.py b --set train.stage_b.epochs=5 --set model.stage_b.mapper.tau=1.0
 ```
 
-`notebooks/demo.py` walks one example end to end — load a volume, generate its
-prompt, run both stages, score it, and look at the result in an interactive 3D
-view. It is a script and a notebook at once (`# %%` cells); `pip install plotly`
-for the figure.
+## Reading a result
 
-`evaluate.py` reports Dice / IoU / Hausdorff — overall and stratified by target,
-anchor, direction and clause slot — and then four counterfactual probes. Those
-matter more than the Dice: a model that ignores the prompt and segments "the
-nearest non-anchor structure" can score well, and only the probes tell the two
-apart. See [docs/method/07_evaluation.md](docs/method/07_evaluation.md).
+A single Dice is not the result. `scripts/evaluate.py` reports six things, and
+the Dice is the third:
+
+1. **Dice, with anchor Dice beside it** — a drop is either a worse outline or a
+   Stage A failure, and those are different problems.
+2. **Centroid error in millimetres**, from the heatmap rather than the mask.
+   Dice fuses "did it point at the right structure" with "did it draw it", and
+   those two transfer differently.
+3. **The gate on this split** — the fraction of target centroids with
+   `where_raw > 0.5`.
+4. **Four counterfactuals.** A model that segments "the nearest thing that is
+   not an anchor" scores well without reading a word. `permute_channels`,
+   `permute_clauses` and `flip_direction` must fall; `permute_both` preserves
+   every relation and must not move.
+5. **Prompts that name nothing** — the null rate and the false-positive volume.
+   This is the check that the tiny spike in `where_raw` was not renormalised
+   into a confident answer.
+6. **Image replacement** — another subject's MRI into `B`, this subject's
+   anchors and fields kept. The centroid should hold and the Dice should fall.
+   That pattern is the signature that the words placed the structure and the
+   image drew it.
 
 ## Layout
 
 ```text
 configs/config.yaml   every tunable, in one file
 src/config.py         load it, override any leaf from the command line
-src/geometry.py       centroids, the direction rule, anchor selection
+src/geometry.py       centroids, the direction rule, anchor-first generation
 src/vocab.py          structure names, and the prompt language over them
-src/synthetic.py      the synthetic corpus — the only file real MRI replaces
-src/data.py           corpus on disk, datasets, rotation augmentation
-src/models.py         shared blocks, Stage A, Stage B
-src/engine.py         losses, metrics, one training loop for both stages
-scripts/              generate_data.py, train.py, evaluate.py
-tests/                geometry, data, model contracts, training, counterfactuals,
-                      config, parity with exp/realistic-appearance
-notebooks/            one example end to end with a 3D view; the occupancy ablation
-docs/method/          how the model works, and why
+src/mapper.py         PositionalMapper3D - the WHERE, with no parameters
+src/mri.py            HCP/FreeSurfer volumes -> this project's corpus
+src/data.py           corpus on disk, the datasets, the direction flip
+src/models.py         Stage A; the boundary encoder, carver and null head
+src/engine.py         the losses of §5, metrics, one training loop per stage
+scripts/              import_mri, rebuild_manifests, corpus_report, gate_mapper,
+                      cache_anchors, train, evaluate
+tests/                the mapper, the model contracts, the losses, the corpus
+docs/proposal/        the architecture, the deviations, and the baseline it is not
 ```
-
-## Scaling
-
-The project is built so that the three obvious next steps are one edit each — see
-[docs/method/08_scaling.md](docs/method/08_scaling.md).
-
-| | how |
-|---|---|
-| 128³ instead of 64³ | `--set data.resolution=128`; the depth follows, the 512-token bottleneck does not move |
-| real structure names | `vocab.json` is an ordered list; every table is sized from it, and the prompt parser is built from it |
-| real MRI | `src.data.import_corpus(...)` — remaps source label ids, writes the corpus, and nothing downstream changes |
 
 ## Conventions
 
 Arrays are indexed `(z, y, x)`; world coordinates are ordered `(x, y, z)` in a
 RAS frame (`x` right/lateral, `y` anterior, `z` superior). A label volume stores
 `vocabulary index + 1`, with 0 for background. A relation always describes the
-target relative to the anchor.
+target relative to the anchor. `mapper.tau` and every distance are in **world
+units** — the corpus is 1.25 mm/voxel, so they are millimetres.

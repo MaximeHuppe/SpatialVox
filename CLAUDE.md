@@ -1,210 +1,241 @@
 # Project constraints
 
-Segment a structure the prompt never names — it only locates it, by its relations
-to structures that *are* named. These are the invariants that make that claim
-mean something. Breaking one does not fail a test; it quietly makes the results
-unpublishable. Read this before changing `src/models.py`, `src/engine.py` or
-`configs/config.yaml`.
+Segment a structure the prompt never names — it only locates it, by its
+relations to structures that *are* named, and the mask is painted from the MRI
+rather than chosen from a list of proposals. These are the invariants that make
+that claim mean something. Breaking one does not fail a test; it quietly makes
+the results unpublishable. Read this before changing `src/models.py`,
+`src/mapper.py`, `src/engine.py` or `configs/config.yaml`.
 
-Findings and run history live in `docs/experiments_plan.md` §3.1 and
-`notebooks/occupancy_ablation.py`. This file is constraints only.
+The architecture is `docs/proposal/relational_architecture.md`. Every departure
+from it, with the measurement that justified it, is
+`docs/proposal/deviations.md`. This file is constraints only.
 
 ---
 
 ## 1. What Stage B may see
 
-**Exhaustive.** Four tensors reach the network. Anything else is a leak.
+**Exhaustive.** Three things reach `StageB.forward`, and everything else is
+derived inside it.
 
-| input | shape | enters at | pooling |
-|---|---|---|---|
-| ordered anchor masks | `[B, 3, D, H, W]` | **encoder** (+3 world-coordinate channels → 6) | — |
-| clause ids (`direction_ids`, `name_ids`) | `[B, 3]` | prompt encoder, structure encoder, decoder FiLM | — |
-| the scene image | `[B, 1, D, H, W]` | **decoder guidance only** | `avg` (area) |
-| occupancy | `[B, 1, D, H, W]` | **decoder guidance only**, after anchor subtraction | `max` |
+| input | shape | what reads it |
+|---|---|---|
+| the MRI | `[B, 1, D, H, W]` | the frozen Stage A, and `B(I)` |
+| `name_ids` | `[B, 3]` | **Stage A only** |
+| `direction_ids` | `[B, 3]` | **the mapper only** |
 
-- **The image is always sent.** `model.stage_b_image: true` is the project
-  default. `false` exists only to reproduce the reference architecture
-  bit-for-bit (`tests/test_reference_parity.py`) and for ablations — it is not a
-  deployment setting. With it off, an empty occupancy leaves Stage B unable to
-  see that any structure exists at all.
-- **The encoder stays anchors-only.** The image and occupancy must not reach it.
-  Grounding queries that could see the target's own voxels let the model pick "a
-  blob that is not an anchor" instead of reading the prompt. Relaxing this needs
-  an explicit, recorded decision — never a config flag that silently disables the
-  guarantee.
-- **Occupancy has the anchors subtracted** (`src/models.py`, `1 - anchors.amax`).
-  The anchors are already three encoder channels; re-supplying them is
-  redundant by construction. This is why `occupancy_mode: anchors-only` is
-  bit-for-bit `none` at the decoder — correct behaviour, not a bug, but it means
-  **`anchors-only` is not an experimental arm.** It is kept because it is the
-  natural thing to reach for, and documented so nobody schedules it twice.
+Everything downstream is a function of those:
 
-Pinned by `tests/test_models.py::test_stage_b_sees_the_anchors_and_an_anonymous_occupancy_and_nothing_else`
-and `::test_stage_b_image_reaches_the_decoder_but_never_the_encoder`.
+```
+A_i         = stop_gradient(sigmoid(stage_a(image, name_ids)_i))     soft, detached
+F_i         = sigmoid(margin_i / tau)  · [mass_i >= min_mass]        the pyramid
+where_raw   = F_0 · F_1 · F_2                                        never renormalised
+carver      <- B(I), A_0..2, F_0..2, where_raw, log(where_raw), where_mass
+null head   <- where_mass, mass_0, mass_1, mass_2                    four scalars, no pixels
+```
 
-### 1a. Anchor order: randomised, but shared by everything
+- **Names stop at Stage A.** There is no name, pair or slot embedding anywhere
+  downstream. `tests/test_models.py::test_names_reach_stage_a_and_stop_there`
+  holds every output bit-identical under an arbitrary renaming once the masks
+  are fixed. A token would let the triple of anchor names stand in for the
+  target.
+- **The direction id is consumed by the mapper and nowhere else.** The direction
+  is already the shape of `F_i`.
+- **No coordinate grid reaches `B` or the carver.** World coordinates exist only
+  inside the mapper, which consumes them to place a pyramid and emits fields.
+- **Stage A's feature pyramid stays out.** Those features were trained to light
+  up *named* structures. `B` is a separate encoder trained without class ids, so
+  a structure Stage A has never seen is still a boundary in the image. That is
+  the whole lesion claim.
+
+`anchors=` and `boundary_image=` are the only other arguments `forward` admits.
+`anchors` substitutes exactly the three detached soft masks Stage A would have
+produced — the precomputed cache, and the ground-truth diagnostic — and cannot
+identify the target. `boundary_image` is the §7 image-replacement test. Which
+source a run used is recorded in its checkpoint.
+
+## 2. What Stage B may never see
+
+The label volume, the target mask, the target's name, its centroid, its size, an
+occupancy map built from labels, any mask other than the three anchor
+probabilities, and a candidate list. Pinned by
+`tests/test_models.py::test_stage_b_signature_admits_nothing_that_identifies_the_target`
+and `tests/test_engine.py::test_the_task_never_hands_the_model_anything_from_the_label_volume`.
+
+The label volume is read **in the task**, to build a training target and to
+score. It is never an argument to the model.
+
+The unsigned boundary map is a pretraining target for `B` alone
+(`BoundaryPretext`), and lives outside `StageB` so it is not reachable from the
+relational forward.
+
+## 3. The anchors
+
+**Stage A is frozen and inside Stage B.** It is trained beforehand on every name
+that may be an anchor. `StageB.train()` keeps it in `eval`,
+`trainable_parameters()` excludes it, and the relational loss does not reach it.
+Relaxing that needs an explicit, recorded decision — never a config flag.
+
+**The mask handed downstream is the detached probability, not a threshold.** A
+cut at 0.5 makes the centroid the mapper reads jump and can delete a dim but
+real anchor in one step.
+
+`mapper.min_mass` rejects an anchor Stage A failed to find. Measured on
+`data/mri`, the smallest mass a real structure gets is **3.2e-6** and the
+smallest class averages 4.6e-5, so the threshold is 1e-6. **The proposal's
+starting value of 1e-3 sits above every structure in the vocabulary except the
+brainstem and the thalami.** Re-measure with `scripts/gate_mapper.py --segmenter`
+whenever Stage A is retrained.
+
+### 3a. Anchor order: randomised, but shared by everything
 
 Two rules, and they are not in tension — the order is chosen once, then used
 everywhere.
 
-1. **The order carries no information.** `select_anchors` ranks candidates by
-   distance to *choose* them and then shuffles before returning
-   (`src/geometry.py`). Storing the ranking made the slot index a perfect proxy
-   for proximity: slot 1 was the target's nearest structure in **100%** of
-   examples, readable without parsing a single direction word. After the fix,
-   the stored order is sorted-by-distance in ~17% of examples — chance for
-   3! = 6 permutations.
-2. **Channel `i` is the structure clause `i` talks about.** The randomised order
-   is the order of `anchors`, of `directions`, and of the rendered prompt's
-   clauses, all from one list in `build_examples`. Downstream, *everything*
-   indexes by that same slot: the encoder's mask channels
-   (`masks_from(labels, anchors)`), `name_ids = anchors - 1`, the relation
-   tokens, the per-slot `Evidence` grounding branches, the `Intersection` maps
-   and the decoder's FiLM context. **Never reorder one without the others.**
+1. **The order carries no information.** `anchor_first_examples` shuffles the
+   triple before returning it. Storing a distance ranking made the slot index a
+   perfect proxy for proximity, readable without parsing a single direction word.
+2. **Slot `i` is the structure clause `i` names.** The same order is the order of
+   `anchors`, of `directions`, of the rendered prompt's clauses, of `name_ids`,
+   of the mask channels and of `F_i`. **Never reorder one without the others** —
+   `roll_anchors` in `src/engine.py` exists so a counterfactual cannot.
 
-That correspondence is the thing the `permute_channels` counterfactual is built
-to detect, so it must hold by construction rather than by luck. Pinned by
-`tests/test_geometry.py::test_a_manifest_clause_always_describes_its_own_mask_channel`
-and `::test_a_manifest_anchor_order_is_not_sorted_by_distance`.
+Anchors always have **pairwise-distinct directions**: two clauses naming the same
+side would not narrow the conjunction.
 
-Anchors always have **pairwise-distinct directions** — two clauses naming the
-same side would not narrow the conjunction
-(`src/geometry.py: _distinct_directions`).
+## 4. The corpus
 
-## 2. What Stage B may never see
+**Anchor-first only.** The triple is fixed first and the targets follow, so one
+anchor set serves several targets and only the direction words tell them apart.
+A triple whose conjunction is not unique is dropped, so well-posedness holds by
+construction — measured, **100%** of manifest prompts name exactly one structure.
 
-The label volume, the target mask, the target's name, its centroid, its size.
-Pinned by `tests/test_models.py::test_stage_b_signature_admits_nothing_that_identifies_the_target`.
+The target-first generator is **deleted, not configurable**. It picked the
+anchors nearest the target, which on fixed anatomy made the anchor identities a
+name tag: the unordered anchor set alone recovered the target 98.9% of the time
+against 94.5% for solving the conjunction, so ignoring the prompt strictly beat
+reading it. No pool width inverts that; the selection rule itself was the leak.
 
-`occupancy_mode: distractors-only` is the one mode that reads `batch["target"]`.
-`StageBTask.__post_init__` refuses it under `mode: predicted`, because excluding
-a target you have not found is not something inference can do. That guard is a
-constraint. Do not relax it.
+**Stage B has no rotation augmentation.** Its one augmentation is the direction
+flip (§5 of the proposal). That is also what makes Stage A's output a function of
+the scene alone, which is what `scripts/cache_anchors.py` relies on. Stage A
+keeps its rotations.
 
-**It is a negative control, never an arm.** Occupancy is every non-anchor
-structure *except* the target, and the image supplies the foreground, so
+**The flip is training-only.** A validation curve mixing retargeted and
+empty-mask prompts would move `best.pt` for reasons unrelated to the model, and
+an empty prediction against an empty target scores Dice 1.0. `scripts/evaluate.py`
+builds the empty-prompt population separately.
 
-    target  ==  foreground(image)  -  occupancy  -  anchors
+**A flip is re-scored, never assumed empty.** Measured: it names two or more
+structures 33.2% of the time (dropped), names none 65.5% (empty mask, null target
+invalid) and retargets 1.2%. "Dropped" is the per-example `keep` weight, and it
+must reach *every* loss term and `Metrics` — `weighted_mean` is that weight.
 
-exactly — verified, Dice 1.0 by pure set arithmetic. A model trained on it
-learns that subtraction and ignores the prompt completely: `runs/occ_img_oracle_
-distractors-only` scores Dice **1.0000**, Hausdorff **0.0**, and **all four
-counterfactuals 1.0000**. Run it once to confirm the leak still behaves that
-way; never report it as a capacity result, and never compare it with `all` or
-`none`.
+## 5. Generalisation the project claims
 
-## 3. Occupancy source
+**Holds.** Stage B is supervised only on `targets.train` (8 classes).
+`targets.val` (caudate, putamen) and `targets.test` (hippocampus) are scored
+every epoch and **never used to choose a checkpoint** — `best.pt` is selected on
+held-out *subjects* with *trained* classes.
 
-`occupancy_mode` ∈ `all` | `distractors-only` | `anchors-only` | `none`, and the
-*source* is `train.stage_b.mode`:
+**Does not hold, and matters.** "Never seen" is stronger than "never a target":
 
-- **`mode: predicted` is the only deployment-relevant setting.** Occupancy is
-  then Stage A's segmentation, which is what the design intends: "all the
-  structures Stage A found", "only the anchors", or "nothing".
-- **`mode: oracle` builds occupancy from ground-truth labels.** It is a
-  diagnostic for isolating the relational architecture from Stage A's error.
-  **Every run in `runs/` used it** — so none of them tested the intended
-  occupancy path. Do not report an oracle number as an end-to-end result.
+- every class, including the held-out ones, appears as an **anchor** in training,
+  so its name embedding row in Stage A is trained;
+- Stage A sees all 23 classes in every split, deliberately: the target-class
+  split constrains what Stage B may be supervised on, not what anatomy exists.
 
-Caveat to state whenever this matters: on the current synthetic corpus Stage A
-scores 0.998 Dice, so `predicted` ≈ `oracle` (0.8913 vs 0.8905). The distinction
-is **currently non-discriminating** and only becomes real on data where
-segmentation is hard.
+**Do not describe this as zero-shot on unseen structures.** It is "never
+supervised as a relational target". The lesion claim rests on the carver — that
+the output need not be a structure Stage A knows how to draw — and the two
+mandatory tests in §6 are what support it.
 
-## 4. Generalisation the project claims
+## 6. Reporting rules
 
-**Holds today.** Stage B is supervised only on `targets.train` (7 classes) and
-tested on `targets.test` — currently `triangular_prism`, never a *target* in
-training. It scores 0.836 there.
+A bare Dice is not interpretable in this project. Any reported Dice must carry:
 
-**Does not hold today, and matters.** "Never seen" is stronger than "never a
-target":
+1. **The prompt-blind floor.** "Of the non-anchor structures, take the one
+   nearest the anchor centroid" never reads the prompt. Measured on `data/mri`,
+   val split (`scripts/corpus_report.py`):
 
-- `triangular_prism` appears as an **anchor 811 times** in training, so its name
-  embedding row is trained.
-- Stage A sees all 10 classes in every split (`scripts/train.py`, deliberate:
-  the target-class split constrains what Stage B may be supervised on, not what
-  anatomy exists).
-
-Excluding a class from the corpus entirely needs a generator change —
-`src/synthetic.py: SHAPES` is a literal dict with no allow-list, and label ids
-must stay consistent across splits. Scoped in `docs/experiments_plan.md` §3.4.
-**Do not describe the current setup as zero-shot on unseen structures.**
-
-## 5. Reporting rules
-
-A bare Dice number is not interpretable in this project. Any reported Dice must
-carry both of these:
-
-1. **The prompt-blind baseline.** "Pick the non-anchor structure nearest the
-   anchor centroid" never reads the prompt, and it scores:
-
-   | `data.anchor_pool` | prompt-blind baseline |
-   |---|---|
-   | 3 (default — anchors are the nearest feasible set) | **0.674** |
-   | 5 | **0.478** |
-
-   A perfect relational solver scores 1.000 (the conjunction is unique in 97.8%
-   of examples). So at the default the readable range is **0.674 → 1.000**, not
-   0 → 1. Recompute it whenever `anchor_pool` or the generator changes —
-   `notebooks/occupancy_ablation.py` §9 does it in seconds, from the manifests
-   alone.
-2. **The `permute_both` control.** It preserves every relation and must not
-   move. Measured on `runs/occ_img_oracle_none`, one checkpoint, val:
-
-   | corpus it is scored on | Dice | `permute_both` drop |
+   | population | prompt-blind Dice | anchor-set ceiling |
    |---|---|---|
-   | pre-fix (anchors stored nearest-first) | 0.9860 | **0.22** |
-   | shuffled (current) | 0.8753 | **0.0152** |
+   | all target classes | **0.2017** | 42.3% |
+   | `targets.train` (8, the selection curve) | **0.3067** | 67.8% |
+   | `targets.val` (4, transfer) | **0.1097** | 83.9% |
+   | `targets.test` (2, further held out) | **0.0630** | 99.2% |
 
-   The control was measuring the leak, not an architectural defect: with order
-   randomised there is nothing for a permutation to destroy, and it behaves.
-   **So no permutation-invariance refactor is needed** — the encoder's 3 mask
-   channels, `Intersection`'s ordered `cat` and the FiLM context stay
-   order-dependent, which is legitimate once order carries no information.
+   Read each number against **its own row**. Conditioning on fewer classes
+   inflates the shortcut ceiling: on the two-class test population the anchor set
+   alone identifies the target 99.2% of the time, so a high score there says
+   almost nothing. Recompute whenever the generator changes.
 
-   Two consequences that are constraints, not observations:
-   - **Any checkpoint trained on a pre-fix corpus is contaminated.** Its
-     headline number includes ~0.11 Dice of ordering leak. Everything in `runs/`
-     written before 2026-09-19 14:07 is in that category; re-score on the
-     current corpus or retrain before quoting it.
-   - If the control ever moves materially again, something has reintroduced
-     information into slot order. Check `select_anchors` and
-     `ExampleDataset._augment` first.
+2. **The counterfactuals.** `permute_channels`, `permute_clauses` and
+   `flip_direction` must drop. `permute_both` preserves every relation and must
+   not move — but note that `where_raw` is a product and therefore *exactly*
+   permutation-invariant, so the only order dependence left is the carver's
+   `cat`. A flat control is a much weaker statement here than it was under the
+   attention architecture.
 
-Also: non-determinism alone moves val Dice by ~0.01 typical / ~0.03 worst case
-(two same-seed runs with bitwise-identical inputs diverged that much; nothing
-sets `cudnn.deterministic`). That is a *lower* bound on seed spread. **≥3 seeds
-per arm**, or the arm is unreadable.
+3. **The two mandatory tests of §7**, before a Dice is treated as evidence that
+   the image was used at all:
+   - **prompt-only carver** (`scripts/train.py b --prompt-only`): `B(I)` removed.
+     If its Dice approaches the full model's, the mask is a spatial prior.
+   - **image replacement** (in `scripts/evaluate.py`): another subject's MRI into
+     `B`, this subject's anchors and fields kept. The centroid should hold and
+     the Dice should fall.
 
-## 6. Known properties of the synthetic corpus
+4. **The gate.** `scripts/gate_mapper.py` measures the fraction of target
+   centroids with `where_raw > 0.5`. §2 of the proposal makes it a precondition:
+   a carver trained on top of a mapper that disagrees with the prompts is not
+   worth scoring. At the shipped `tau = 0.5` it is **0.9742**; at the proposal's
+   starting `tau = 2.0` it is 0.6508.
 
-Not constraints on the code — constraints on what you may conclude from it.
+Also: non-determinism alone moved val Dice by ~0.01 typical / ~0.03 worst case on
+this project's earlier runs, and nothing sets `cudnn.deterministic`. That is a
+*lower* bound on seed spread. **A single-seed number is not a result** — say so
+explicitly when only one seed was run.
 
-- **Foreground is trivially separable.** Background `[0.12, 0.04]` and structures
-  `[0.45, 0.75]` do not overlap: one threshold recovers `labels > 0` at IoU
-  0.9998. So the image is nearly as informative as `occupancy_mode: all`, and
-  the occupancy axis is largely **redundant on this corpus**. It will only
-  discriminate where segmentation is hard.
-- **Intensity does not identify a class.** Per-class means span 0.488–0.586 with
-  std ≈ 0.07. Foreground, never identity.
-- **Every scene holds exactly one of all 10 primitives** (`pack_scene`), so there
-  are always 3 anchors, 1 target and 6 distractors — a 1-of-7 selection.
+## 7. Known properties of the corpus
 
-## 7. Architecture compatibility
+Not constraints on the code — constraints on what may be concluded from it.
+
+- **Predicted anchors are nearly oracle here.** Stage A's centroid error against
+  ground truth is a median of **0.84 mm** on a 1.25 mm grid (95th percentile
+  2.13 mm, worst 8.14 mm). So `anchor_source: oracle` and `predicted` are
+  *currently non-discriminating* for the mapper, and the distinction only becomes
+  real on data where segmentation is hard. Anchor Dice itself is the wrong
+  summary — the mapper consumes the centroid, not the mask.
+- **The null head's ceiling is a property of its inputs, not its width.**
+  `where_mass` alone separates "names one structure" from "names none" at
+  **AUC 0.848**. The mapper cannot see which regions hold tissue, so a roomy but
+  empty conjunction looks exactly like a valid one — and §3 forbids showing it
+  the MRI, for the right reason. A trained head at ~0.85 is working as well as
+  its four numbers permit. Report Dice both gated and ungated by it.
+- **Only ~36% of a target's voxels lie inside `where_raw > 0.05`**, and ~94%
+  inside the 8-voxel dilation `L_far` measures mass outside. The pyramid
+  describes where a *centroid* would satisfy the clause; part of the body
+  legitimately lies outside it. `where_raw` is a channel and a weak bias — never
+  a crop, never a mask, and `logit(where)` is not added to the logits unless the
+  scalar-`alpha` ablation is on.
+
+## 8. Architecture compatibility
 
 `StageB.config` is what `load_model` rebuilds from, so every architectural
-parameter must appear there or old checkpoints break. `model.stage_b_image:
-false` is bit-identical to the pre-image architecture (verified: identical
-logits, evidence maps and all 77 initial weight tensors).
+parameter must appear there or old checkpoints break — including `segmenter`,
+the frozen Stage A's own config, which makes a Stage B checkpoint
+self-contained. `flip_probability` and the loss weights are training-schedule
+values and live in the checkpoint's `meta["config"]["stage"]`, mirrored into the
+`.json` sidecar; see `deviations.md` §3.6.
 
-`tests/test_reference_parity.py` **skips** when the `exp/realistic-appearance`
-branch is absent, as in this clone. A green suite is therefore not a parity
-guarantee — check the test *ran* before claiming one.
+Checkpoints of the previous attention-based Stage B do not load here, and are
+not meant to.
 
-## 8. Conventions
+## 9. Conventions
 
 Arrays are `(z, y, x)`; world coordinates are `(x, y, z)` in a RAS frame. A label
 volume stores `vocabulary index + 1`, 0 for background. A relation always
-describes the target relative to the anchor. Every tunable lives in
+describes the target relative to the anchor. **`mapper.tau` and every distance
+are in world units** — the corpus is 1.25 mm/voxel, so they are millimetres, and
+`corpus.spacing` (not `data.spacing`) is the authority. Every tunable lives in
 `configs/config.yaml`; nothing in `src/` hard-codes a value that lives there.
