@@ -1,0 +1,127 @@
+# The 64^3 synthetic corpus: ten geometric primitives, one of each per scene.
+#
+#   scripts/train.py a --config configs/synthetic.yaml
+#   scripts/train.py b --config configs/synthetic.yaml
+#
+# Same architecture, same losses, same contract as `config.yaml` - only the
+# corpus, the resolution and the target-class split differ. What this corpus buys
+# is the thing the MRI one cannot give: **the target classes are held out of a
+# generator, not of an atlas.** Every scene is a fresh random packing, so the
+# three structures nearest a target are different in every scene. Measured on the
+# shipped manifests, the unordered anchor set alone recovers the target 24.2% of
+# the time, against 98.9% on fixed anatomy - the shortcut that made target-first
+# MRI prompts unreadable is simply not available here.
+#
+# What it does NOT buy: `docs/proposal/relational_architecture.md` §6's lesion
+# claim. The held-out classes are still in the vocabulary and still appear as
+# anchors, so Stage A has seen them. See `CLAUDE.md` §5.
+
+data:
+  root: data/synthetic
+  resolution: 64             # cube side; five encoder widths would take this to 2, so four
+  n_anchors: 3
+  normalize: none            # the generator writes a bounded [0, 1] image - background
+                             # [0.12, 0.04], structures [0.45, 0.75]. There is no brain mask
+                             # and no bias field, so `zscore-brain` has nothing to fix.
+  triples: 60                # anchor-first: candidate triples per scene. With 10 structures
+                             # and locality 8 there are C(8,3) = 56 distinct ones, so this
+                             # asks for all of them.
+  locality: 8
+  shuffle_clauses: true
+
+
+# Seven primitives supervised as the relational target, two held out, one held
+# out further. Mirrors the MRI split's shape (8 / 4 / 2) at this scale.
+targets:
+  train: [cube, sphere, cylinder, cone, pyramid, torus, capsule]
+  val:   [cuboid, ellipsoid]
+  test:  [triangular_prism]
+
+
+model:
+  stage_a:
+    encoder_channels: [32, 64, 128, 256]   # four widths: three stride-2 stages, 64 -> 8
+    bottleneck: 8                          # checked against the width list, not assumed
+    token_dim: 256                         # must equal the last encoder width
+    num_heads: 4
+    prior_foreground: 0.0016
+    deep_supervision: [0.1, 0.3, 0.6]      # three decoder scales at this depth
+
+  stage_b:
+    mapper:
+      tau: 0.5              # world units. The corpus is 1.0 unit/voxel here, not 1.25, so
+                            # this is 0.5 VOXELS - re-run scripts/gate_mapper.py before
+                            # trusting it, because the gate is a property of the corpus.
+      min_mass: 1.0e-6      # likewise: re-measure against this Stage A's smallest anchor.
+    boundary_widths: [16, 32, 32]
+    carver:
+      width: 16
+      blocks: 2
+      full_resolution_skip: true
+    use_image: true
+    additive_prior: false
+    alpha: 0.35
+    background_logit: -10.0
+    prior_foreground: 0.0016
+
+
+train:
+  seed: 20260915
+  device: auto
+  precision: bf16
+  batch_size: 16            # 64^3 is an eighth of the voxels of 128^3
+  accum: 1
+  workers: 8
+  threshold: 0.5
+  loss: {name: dice_bce, lambda_dice: 1.0, lambda_bce: 1.0}
+  early_stopping: {patience: 0, min_delta: 0.005}
+  probe_examples: 200
+  val_examples: 600
+
+  stage_a:
+    epochs: 50
+    optimizer: {name: adamw, lr: 0.001, weight_decay: 0.00001}
+    scheduler: {name: cosine, warmup_epochs: 2}
+    augment: true
+    prompts_per_item: null
+
+  boundary:
+    epochs: 30
+    optimizer: {name: adamw, lr: 0.0005, weight_decay: 0.00001}
+    scheduler: {name: cosine, warmup_epochs: 2}
+    mask_fraction: 0.5
+    patch: 8                # half the MRI patch, for half the cube side
+    loss: {boundary: 1.0, reconstruct: 1.0, edge: 0.5}
+
+  stage_b:
+    epochs: 30
+    optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
+    scheduler: {name: cosine, warmup_epochs: 2}
+    phase_a_checkpoint: runs/synthetic-stage-a/best.pt
+    boundary_checkpoint: null
+    boundary_lr_scale: 0.1
+    anchor_source: predicted
+    flip_probability: 0.25
+    loss:
+      dice: 1.0
+      bce: 1.0
+      null_bce: 0.2
+      centroid: 0.02
+      field_centroid: 0.01
+      far: 0.2
+    far: {epsilon: 0.05, dilation: 4}   # half the MRI radius, for half the cube side
+    field_centroid_on: always
+
+
+logging:
+  backend: none
+  wandb:
+    project: spatial-vox
+    tags: [synthetic, relational, carver]
+
+
+evaluation:
+  metrics: [dice, iou, hausdorff]
+  hausdorff_percentile: 95
+  stratify_by: [target, anchor, direction, slot]
+  counterfactuals: [permute_channels, permute_clauses, flip_direction, permute_both]

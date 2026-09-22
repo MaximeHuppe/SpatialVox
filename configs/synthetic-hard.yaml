@@ -1,0 +1,167 @@
+# The 64^3 synthetic corpus at MRI-grade separability - the decisive experiment.
+#
+#   scripts/generate_data.py --config configs/synthetic-hard.yaml
+#   scripts/train.py a --config configs/synthetic-hard.yaml --out runs/hard-stage-a
+#   scripts/train.py b --config configs/synthetic-hard.yaml --out runs/hard-stage-b
+#
+# On the easy synthetic appearance a single global threshold recovers every
+# structure at IoU 0.9994, so `B(I)` gets every boundary for free, the carver
+# never has to learn a class, and transfer to an unsupervised class is perfect
+# and meaningless. Measured: 0.9490 supervised, 0.9504 held out, after one epoch.
+#
+# The appearance block below scores **0.291**, against 0.9942 for the easy corpus
+# and 0.0796 for the real MRI. Everything else is held fixed - random packing (so
+# no anatomy prior to exploit), near-oracle anchors, the same architecture and the
+# same losses. If transfer collapses here the way it does on MRI, separability is
+# the cause and the architecture is not at fault.
+#
+# It is deliberately NOT at MRI's 0.0796. An earlier attempt hit 0.066 by raising
+# the noise and putting the background texture at a structure's own spatial
+# scale, and the result was a corpus whose shapes a person could not see at all -
+# Stage A reached Dice 0.27 by epoch 6 where the easy corpus reached 0.78 by
+# epoch 10. That fails the pipeline for the wrong reason. Local contrast-to-noise
+# here is 6.4 against MRI's 0.89: every structure is plainly visible against what
+# surrounds it. What is missing is a GLOBAL threshold, which is the thing under
+# test.
+
+data:
+  root: data/synthetic-hard
+  resolution: 64
+  n_anchors: 3
+  normalize: none            # the generator writes a bounded [0, 1] image
+  triples: 60
+  locality: 8
+  shuffle_clauses: true
+
+
+targets:
+  train: [cube, sphere, cylinder, cone, pyramid, torus, capsule]
+  val:   [cuboid, ellipsoid]
+  test:  [triangular_prism]
+
+
+# What `scripts/generate_data.py` writes. The appearance IS the experiment.
+synthetic:
+  scenes: {train: 400, val: 50, test: 50}
+  seeds: {train: 1000000, val: 2000000, test: 3000000}
+  spacing: [1.0, 1.0, 1.0]
+  margin: 2
+  packing: {max_object_attempts: 200, max_scene_attempts: 50}
+  size: 1.8                    # scales every structure. At 1.0 the primitives are ~8 voxels
+                               # across in a 64^3 volume and the carver's stride-2 stem sees
+                               # them at four, so Dice measures the discretisation rather than
+                               # the shape. At 1.8 they are ~14 voxels and ~2700 voxels each,
+                               # which matches the MRI targets' 1631-2322 in absolute count.
+                               # It deliberately does NOT widen the spread BETWEEN classes:
+                               # a size that identifies a class is the same shortcut as a
+                               # brightness that does, and it is the one the MRI carver took -
+                               # it learned a class-conditional size prior and predicted 93
+                               # voxels where 2219 belonged. The ten classes stay within ~2x.
+  appearance:
+    # EVERY class draws from the same band, so brightness carries no class
+    # information at all and the relational prompt is the only way to pick the
+    # target. It also makes `B(I)` genuinely class-agnostic - a held-out shape
+    # looks exactly like a trained one to it - which is the mechanism §4 claims.
+    # Replace `shared` with a number (e.g. 0.10) for the MRI-like regime, where
+    # each class gets its own narrower, overlapping range and intensity narrows
+    # identity down without fixing it.
+    structure: [0.45, 0.75]
+    class_spread: shared
+    noise: 0.035               # low ON PURPOSE - the edges must stay crisp
+    blur: 0.6                  # partial-volume edges
+    # The background is what makes this hard, not the noise. It is a slowly
+    # varying field that sweeps across the WHOLE structure range, so a structure
+    # is plainly visible against what immediately surrounds it while no single
+    # global threshold is right anywhere in the volume.
+    background: [0.45, 0.04]
+    texture: 0.90              # amplitude of the background variation
+    texture_scale: 12.0        # its spatial scale, in voxels: much larger than a structure,
+                               # so it does not masquerade as one
+    bias_field: 0.60           # a smooth multiplicative inhomogeneity on top
+
+
+model:
+  stage_a:
+    encoder_channels: [32, 64, 128, 256]   # four widths: three stride-2 stages, 64 -> 8
+    bottleneck: 8
+    token_dim: 256
+    num_heads: 4
+    prior_foreground: 0.0016
+    deep_supervision: [0.1, 0.3, 0.6]
+
+  stage_b:
+    mapper:
+      tau: 0.5              # world units, and this corpus is 1.0 unit/voxel
+      min_mass: 1.0e-6
+    boundary_widths: [16, 32, 32]
+    carver:
+      width: 16
+      blocks: 2
+      full_resolution_skip: true
+    use_image: true
+    additive_prior: false
+    alpha: 0.35
+    background_logit: -10.0
+    prior_foreground: 0.0016
+
+
+train:
+  seed: 20260915
+  device: auto
+  precision: bf16
+  batch_size: 16
+  accum: 1
+  workers: 8
+  threshold: 0.5
+  loss: {name: dice_bce, lambda_dice: 1.0, lambda_bce: 1.0}
+  early_stopping: {patience: 0, min_delta: 0.005}
+  probe_examples: 200
+  val_examples: 600
+
+  stage_a:
+    epochs: 50
+    optimizer: {name: adamw, lr: 0.001, weight_decay: 0.00001}
+    scheduler: {name: cosine, warmup_epochs: 2}
+    augment: true
+    prompts_per_item: null
+
+  boundary:
+    epochs: 30
+    optimizer: {name: adamw, lr: 0.0005, weight_decay: 0.00001}
+    scheduler: {name: cosine, warmup_epochs: 2}
+    mask_fraction: 0.5
+    patch: 8
+    loss: {boundary: 1.0, reconstruct: 1.0, edge: 0.5}
+
+  stage_b:
+    epochs: 30
+    optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
+    scheduler: {name: cosine, warmup_epochs: 2}
+    phase_a_checkpoint: runs/hard-stage-a/best.pt
+    boundary_checkpoint: null
+    boundary_lr_scale: 0.1
+    anchor_source: predicted
+    flip_probability: 0.25
+    loss:
+      dice: 1.0
+      bce: 1.0
+      null_bce: 0.2
+      centroid: 0.02
+      field_centroid: 0.01
+      far: 0.2
+    far: {epsilon: 0.05, dilation: 4}
+    field_centroid_on: always
+
+
+logging:
+  backend: none
+  wandb:
+    project: spatial-vox
+    tags: [synthetic-hard, relational, carver]
+
+
+evaluation:
+  metrics: [dice, iou, hausdorff]
+  hausdorff_percentile: 95
+  stratify_by: [target, anchor, direction, slot]
+  counterfactuals: [permute_channels, permute_clauses, flip_direction, permute_both]

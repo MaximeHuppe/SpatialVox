@@ -145,11 +145,23 @@ PLACEMENT_ORDER: tuple[str, ...] = tuple(
 )
 
 
-def pack_scene(rng: np.random.Generator, shape, spacing, margin: int, attempts: int = 200) -> np.ndarray:
+def pack_scene(
+    rng: np.random.Generator, shape, spacing, margin: int, attempts: int = 200, size: float = 1.0
+) -> np.ndarray:
     """Rejection-sample one instance of every primitive into a ``uint8`` label volume.
 
     Raises when an object cannot be placed within the attempt budget; the caller
     retries the whole scene with a fresh draw.
+
+    ``size`` scales every structure. It matters more than it looks: at the
+    default the primitives are about 8 voxels across in a 64^3 volume, and the
+    carver's stride-2 stem sees them at four - so Dice measures the discretisation
+    rather than the shape. What ``size`` must **not** do is widen the spread
+    *between* classes, because a size that identifies a class is the same kind of
+    shortcut as a brightness that does, and it is the one the MRI carver actually
+    took: it learned a class-conditional size prior and, on a class it had never
+    been supervised on, predicted 93 voxels where 2219 belonged. The ten classes
+    here sit within 1.5x of each other and this multiplier keeps them there.
     """
     labels = np.zeros(tuple(shape), dtype=np.uint8)
     occupied = np.zeros(tuple(shape), dtype=bool)
@@ -159,7 +171,7 @@ def pack_scene(rng: np.random.Generator, shape, spacing, margin: int, attempts: 
 
     for name in PLACEMENT_ORDER:
         for _ in range(attempts):
-            params = draw_params(name, rng, scale)
+            params = draw_params(name, rng, scale * float(size))
             half = half_extent(name, params)
             low, high = margin * spacing + half, last_center - margin * spacing - half
             if np.any(low > high):
@@ -194,36 +206,94 @@ def gaussian_blur(volume: np.ndarray, sigma: float) -> np.ndarray:
     return volume
 
 
-def class_bias(label: int, amplitude: float, n_classes: int = len(SHAPES)) -> float:
-    """A small deterministic per-class offset, roughly in ``[-amplitude, amplitude]``.
+def bias_field(shape, rng: np.random.Generator, amplitude: float) -> np.ndarray:
+    """A smooth multiplicative inhomogeneity, like an MRI receive field.
 
-    T1-like: brightness carries a hint of identity, but the per-structure jitter
-    is comparable to it and the ranges overlap, so it is never a lookup table.
+    Three random low-order polynomials, one per axis, multiplied together and
+    normalised to ``1 +- amplitude``. Its job is to make a *global* intensity
+    threshold fail without touching the *local* edge: after this the same tissue
+    is brighter on one side of the volume than the other, so "foreground is above
+    t" stops being true anywhere but locally - while a structure still stands out
+    against what immediately surrounds it, which is what a convolution, and an
+    eye, actually read. ``amplitude <= 0`` is a no-op.
     """
-    if amplitude == 0:
-        return 0.0
-    return float(amplitude * (label - (n_classes + 1) / 2) / ((n_classes - 1) / 2))
+    if amplitude <= 0:
+        return np.ones(tuple(shape), dtype=np.float32)
+    field = np.ones(tuple(shape), dtype=np.float32)
+    for axis in np.meshgrid(*[np.linspace(-1.0, 1.0, int(n)) for n in shape], indexing="ij"):
+        a, b, c = rng.uniform(-1.0, 1.0, 3)
+        field *= (1.0 + a * axis + b * axis**2 + c * axis**3).astype(np.float32)
+    field -= field.mean()
+    return (1.0 + amplitude * field / max(float(np.abs(field).max()), 1e-6)).astype(np.float32)
+
+
+def class_range(
+    label: int, n_classes: int, low: float, high: float, spread: float | None
+) -> tuple[float, float]:
+    """The intensity range one class is always drawn from. ``(lo, hi)``.
+
+    Every structure of a given class is painted from the *same* range in every
+    scene of the corpus - a cube is always cube-bright - while the ranges of
+    different classes overlap. That is how tissue behaves: grey matter, white
+    matter and CSF each have a characteristic intensity, they overlap, and no
+    single global threshold separates one structure from the rest.
+
+    Class ``i`` of ``n`` is centred at ``low + (high - low) * (i + 0.5) / n`` and
+    spans ``spread``. When ``spread`` exceeds the spacing between centres the
+    ranges overlap, so brightness narrows the identity down without ever fixing
+    it. Setting ``spread`` to 0 pins each class to a single value.
+
+    ``spread = None`` is the other regime, and the stronger test: **every class
+    draws from the whole band**, so brightness carries no class information at
+    all and the relational prompt becomes the only way to pick the target. It
+    also makes ``B(I)`` genuinely class-agnostic - a held-out shape looks exactly
+    like a trained one - which is the mechanism §4 claims. The per-class form
+    reproduces the MRI-like regime, where intensity partly identifies a class.
+    """
+    if spread is None:
+        return low, high
+    index = (int(label) - 1) % max(int(n_classes), 1)
+    centre = low + (high - low) * (index + 0.5) / max(int(n_classes), 1)
+    return centre - 0.5 * spread, centre + 0.5 * spread
 
 
 def paint(labels: np.ndarray, rng: np.random.Generator, appearance: Mapping) -> np.ndarray:
     """Paint an MRI-like float image over a label volume, leaving labels untouched."""
     background_mean, background_std = appearance["background"]
     low, high = appearance["structure"]
-    jitter = float(appearance.get("jitter", 0.0))
+    spread = appearance.get("class_spread", 0.0)
+    # `shared` (or null): every class draws from the whole band, so brightness
+    # carries no class information at all and the relational prompt is the only
+    # way to pick the target. A number instead gives each class its own narrower,
+    # overlapping range - the MRI-like regime, where intensity narrows identity
+    # down without fixing it.
+    spread = None if spread in (None, "shared") else float(spread)
     image = rng.normal(background_mean, background_std, labels.shape).astype(np.float32)
+    # Background texture, at the same spatial scale as a structure. Without it
+    # the background is white noise, which a blur flattens to a constant - and a
+    # constant background is what makes a single global threshold recover every
+    # structure at IoU 0.9998. `texture <= 0` reproduces that easy corpus.
+    texture = float(appearance.get("texture", 0.0))
+    if texture > 0:
+        lumps = rng.normal(0.0, 1.0, labels.shape).astype(np.float32)
+        image += texture * gaussian_blur(lumps, float(appearance.get("texture_scale", 2.0))) * 6.0
     for label in range(1, int(labels.max()) + 1):
         mask = labels == label
         if not mask.any():
             continue
-        mean = 0.5 * (low + high) + class_bias(label, float(appearance.get("class_bias", 0.0)))
-        mean += float(rng.uniform(-jitter, jitter))
+        # The class's own range, identical in every scene of the corpus.
+        lo, hi = class_range(int(label), len(SHAPES), low, high, spread)
+        mean = float(rng.uniform(lo, hi))
         mean = float(np.clip(mean, low, high))
         image[mask] = mean + rng.normal(0.0, appearance["noise"], int(mask.sum()))
-    return np.clip(gaussian_blur(image, appearance["blur"]), 0.0, 1.0)
+    image = gaussian_blur(image, appearance["blur"])
+    image = image * bias_field(labels.shape, rng, float(appearance.get("bias_field", 0.0)))
+    return np.clip(image, 0.0, 1.0)
 
 
 def generate_scene(
-    seed: int, shape, spacing, margin: int, appearance: Mapping, max_attempts: int = 50
+    seed: int, shape, spacing, margin: int, appearance: Mapping, max_attempts: int = 50,
+    size: float = 1.0
 ) -> tuple[np.ndarray, np.ndarray]:
     """One reproducible synthetic scene: ``(image, labels)``.
 
@@ -233,7 +303,7 @@ def generate_scene(
     for attempt in range(max_attempts):
         rng = np.random.default_rng([seed, attempt])
         try:
-            labels = pack_scene(rng, shape, spacing, margin)
+            labels = pack_scene(rng, shape, spacing, margin, size=size)
         except RuntimeError:
             continue
         return paint(labels, rng, appearance), labels
