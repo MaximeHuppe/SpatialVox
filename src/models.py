@@ -619,6 +619,7 @@ class StageB(nn.Module):
         carver_blocks: int = 2,
         full_resolution_skip: bool = True,
         use_image: bool = True,
+        carver_sees_anchors: bool = True,
         additive_prior: bool = False,
         alpha: float = 0.35,
         background_logit: float = -10.0,
@@ -631,12 +632,24 @@ class StageB(nn.Module):
             boundary_widths=tuple(int(w) for w in boundary_widths),
             carver_width=int(carver_width), carver_blocks=int(carver_blocks),
             full_resolution_skip=bool(full_resolution_skip), use_image=bool(use_image),
+            carver_sees_anchors=bool(carver_sees_anchors),
             additive_prior=bool(additive_prior), alpha=float(alpha),
             background_logit=float(background_logit), prior_foreground=float(prior_foreground),
         )
         self.n_anchors = int(n_anchors)
         self.spacing = tuple(float(v) for v in spacing)
         self.use_image = bool(use_image)
+        # Whether the three detached anchor MASKS go into the carver alongside
+        # the fields. They are Stage A outputs, so their shapes identify the
+        # anchor classes, and the unordered anchor set alone recovers the target
+        # 67.8% of the time on data/mri and pins it 58.3% of the time here. That
+        # is a channel through which the carver can name the target instead of
+        # solving for it, and the geometry it actually needs - three pyramids and
+        # their product - is already in `F_i` and `where_raw`.
+        #
+        # The anchor EXCLUSION below is unaffected: it uses the masks without
+        # letting their shape reach a convolution.
+        self.carver_sees_anchors = bool(carver_sees_anchors)
         self.additive_prior = bool(additive_prior)
         self.background_logit = float(background_logit)
 
@@ -649,9 +662,11 @@ class StageB(nn.Module):
         self.mapper = PositionalMapper3D(tau=tau, min_mass=min_mass)
         self.boundary = BoundaryEncoder(boundary_widths) if self.use_image else None
         boundary_channels = self.boundary.out_channels if self.boundary is not None else 0
-        # A_i (n) + F_i (n) + where_raw + log(where_raw) + where_mass, plus B(I).
+        # A_i (n, optional) + F_i (n) + where_raw + log(where_raw) + where_mass,
+        # plus B(I).
+        geometry = (2 if self.carver_sees_anchors else 1) * self.n_anchors + 3
         self.carver = Carver(
-            boundary_channels + 2 * self.n_anchors + 3, boundary_channels,
+            boundary_channels + geometry, boundary_channels,
             width=carver_width, blocks=carver_blocks,
             full_resolution_skip=full_resolution_skip, prior_foreground=prior_foreground,
         )
@@ -759,7 +774,9 @@ class StageB(nn.Module):
         if self.boundary is not None:
             source = image if boundary_image is None else boundary_image
             boundary = self.boundary(source.to(torch.float32))
-        parts = [anchors, field.fields, where, log_where, log_mass]
+        parts = ([anchors] if self.carver_sees_anchors else []) + [
+            field.fields, where, log_where, log_mass
+        ]
         # Under autocast the boundary features come back in the low-precision
         # dtype while the geometry is float32; the concatenation has to agree,
         # and matching the features is what keeps the 25-channel input at 128^3

@@ -460,19 +460,30 @@ track the true one.*
 boundary-map Dice of 0.626, loaded in, and given 0.1x the carver's learning rate
 — §4's prescription exactly. Epoch-matched against `B` from scratch:
 
-| epoch | supervised, pretrained | supervised, scratch | held-out-4, pretrained | held-out-4, scratch |
-|---|---|---|---|---|
-| 0 | 0.4647 | 0.4368 | 0.1123 | 0.1375 |
-| 1 | 0.5677 | 0.5508 | 0.0817 | 0.0813 |
-| 3 | 0.5870 | 0.6002 | 0.0089 | 0.0099 |
-| 5 | 0.6886 | 0.6411 | 0.0173 | 0.0132 |
+| epoch | supervised, scratch / pretrained | held-out-4, scratch / pretrained |
+|---|---|---|
+| 0 | 0.4368 / 0.4647 | 0.1375 / 0.1123 |
+| 4 | 0.6663 / 0.6268 | 0.0091 / 0.0162 |
+| 8 | 0.7268 / 0.7020 | 0.0072 / 0.0256 |
+| 12 | 0.7724 / 0.7455 | 0.0093 / 0.0087 |
 
-The supervised trajectories are the same within noise, and **the held-out curve
-collapses identically** — 0.112 to 0.017 by epoch 5, exactly as it did without
-the pretraining. So `deviations.md` §5.1, the one sequencing deviation this
-branch made, was **not** the cause of §5.3. Running it was still the right call:
-it was the proposal's own prescription and it is now measured rather than
-assumed.
+Over 14 matched epochs, mean (pretrained − scratch):
+
+| | difference | sd |
+|---|---|---|
+| supervised eight | **−0.0095** | 0.0276 |
+| held-out four | **+0.0012** | 0.0109 |
+
+Both sit well inside the epoch-to-epoch noise, and **the held-out curve collapses
+identically** — 0.112 to 0.009 by epoch 12, exactly as it did without the
+pretraining. So `deviations.md` §5.1, the one sequencing deviation this branch
+made, was **not** the cause of §5.3. Running it was still the right call: it was
+the proposal's own prescription and it is now measured rather than assumed.
+
+*(This arm was killed by an external process at epoch 14 of 20 — the log stops
+mid-epoch with no traceback, and another session had taken the GPU. 14 epochs is
+past the point where both curves have separated and settled, so the comparison
+stands; the run was not restarted.)*
 
 **What that leaves.** The cause is the carver's *objective*, not its features.
 Nothing in `Dice + BCE on eight classes` rewards class-agnostic behaviour, and
