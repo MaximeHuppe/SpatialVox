@@ -1,8 +1,8 @@
 #!/usr/bin/env python
-"""Audit a corpus: the numbers CLAUDE.md §6 requires beside any reported result.
+"""Audit a corpus: the numbers CLAUDE.md requires beside any reported result.
 
-    .venv/bin/python notebooks/diag_corpus.py
-    .venv/bin/python notebooks/diag_corpus.py --root data/mri --scenes 40
+    .venv/bin/python scripts/corpus_report.py
+    .venv/bin/python scripts/corpus_report.py --split val --scenes 400
 
 Run this after every `import_mri.py` or `rebuild_manifests.py`. It needs no
 checkpoint and no GPU.
@@ -24,8 +24,10 @@ Three things, none of which can be inferred from a Dice number:
 
 3. **The prompt-blind Dice baseline** - "of the non-anchor structures, take the
    one nearest the anchor centroid". Never reads the prompt. On the target-first
-   corpus it scored 0.775-1.000, above what the trained model achieved, which is
-   what made every Dice there uninterpretable.
+   corpus this project used to carry it scored 0.775-1.000, above what the
+   trained model achieved, which is what made every Dice there uninterpretable.
+   Anchor-first generation is what brought it down; this reports where it sits
+   now, and **no Dice from this project is readable without it**.
 """
 
 from __future__ import annotations
@@ -124,9 +126,9 @@ def main() -> int:
     name_of = lambda label: names[label - 1]
 
     print(f"corpus {args.root}")
-    print(f"  selection      {meta.get('selection', 'target-first')}")
+    print(f"  selection      {meta.get('selection', 'anchor-first')}")
     print(f"  shuffle_clauses{'':1s} {meta.get('shuffle_clauses', True)}")
-    print(f"  n_anchors {meta['n_anchors']}  anchor_pool {meta.get('anchor_pool')}")
+  
     print(f"  examples  {meta.get('examples')}")
 
     rows = [json.loads(line) for line in (corpus.root / f"{args.split}.jsonl").read_text().splitlines() if line.strip()]
@@ -146,8 +148,8 @@ def main() -> int:
         prompt_blind(corpus, [r for r in rows if name_of(r["target"]) in classes], label, args.scenes)
 
     print(
-        "\nCLAUDE.md §6: a Dice without its prompt-blind floor, or a selection accuracy"
-        "\nwithout its population's ceiling, is not interpretable."
+        "\nCLAUDE.md: a Dice without its prompt-blind floor is not interpretable,"
+        "\nand a shortcut ceiling must be read against its own population's row."
     )
     return 0
 

@@ -127,9 +127,7 @@ def main() -> int:
             continue
         names = label_names(structures, scheme)
         remapped, vocab = remap_source_labels(labels, names)
-        if not subject_has_examples(
-            remapped, vocab, subject_spacing, cfg.data.n_anchors, pool=cfg.data.anchor_pool
-        ):
+        if not subject_has_examples(remapped, vocab, subject_spacing, cfg.data.n_anchors):
             skipped += 1
             continue
         write_scene(output, subject_id, image, remapped, subject_spacing)
@@ -153,12 +151,9 @@ def main() -> int:
             shape = labels.shape
             manifests[split] += build_examples(
                 scene_id, labels, vocab, spacing, cfg.data.n_anchors,
-                pool=cfg.data.anchor_pool,
-                selection=str(cfg.data.get("selection", "target-first")),
                 shuffle_clauses=bool(cfg.data.get("shuffle_clauses", True)),
                 triples=int(cfg.data.get("triples", 300)),
                 locality=int(cfg.data.get("locality", 8)),
-                unique_only=bool(cfg.data.get("unique_only", True)),
                 stats=stats,
             )
     write_corpus(
@@ -168,11 +163,6 @@ def main() -> int:
         shape=shape,
         spacing=spacing,
         n_anchors=cfg.data.n_anchors,
-        anchor_pool=cfg.data.anchor_pool,
-        # Without these two the corpus would silently record itself as
-        # target-first, whatever `configs/config.yaml` says, and every prompt
-        # knob below would be a no-op.
-        selection=str(cfg.data.get("selection", "target-first")),
         shuffle_clauses=bool(cfg.data.get("shuffle_clauses", True)),
         targets=cfg.targets.to_dict(),
         extra={
