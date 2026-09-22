@@ -9,7 +9,10 @@ import torch
 from torch import nn
 
 from src.config import load_config, parse_overrides
-from src.engine import EarlyStopping, build_optimizer, build_scheduler, _logger, resolve_phase_a_checkpoint
+from src.engine import (
+    EarlyStopping, build_optimizer, build_scheduler, _logger, resolve_anchor_source,
+    resolve_segmenter,
+)
 from src.models import StageA, StageB
 
 
@@ -18,89 +21,76 @@ def cfg():
     return load_config()
 
 
-def test_the_64_cube_widths_still_match_the_reference_counts():
-    """8,021,763 / 13,710,913 — exp/realistic-appearance, 64³, four encoder widths."""
-    common = dict(
-        encoder_channels=(32, 64, 128, 256),
-        bottleneck=8,
-        token_dim=256,
-        num_heads=4,
-        prior_foreground=0.0016,
+def test_the_shipped_config_builds_both_stages(cfg):
+    """Every architectural key is read, and the two of them agree on the cube."""
+    resolution = int(cfg.data.resolution)
+    widths = list(cfg.model.stage_a.encoder_channels)
+    assert cfg.model.stage_a.bottleneck == resolution // 2 ** (len(widths) - 1)
+    segmenter = StageA(
+        23, resolution, encoder_channels=tuple(widths),
+        bottleneck=cfg.model.stage_a.bottleneck, token_dim=cfg.model.stage_a.token_dim,
+        num_heads=cfg.model.stage_a.num_heads,
+        prior_foreground=cfg.model.stage_a.prior_foreground,
+        deep_supervision=tuple(cfg.model.stage_a.deep_supervision),
     )
-    a = StageA(10, 64, deep_supervision=(0.1, 0.3, 0.6), **common)
-    b = StageB(10, 64, 3, intersection_hidden=256, **common)
-    assert sum(p.numel() for p in a.parameters()) == 8_021_763
-    assert sum(p.numel() for p in b.parameters()) == 13_710_913
+    block = cfg.model.stage_b
+    model = StageB.from_segmenter(
+        segmenter, spacing=(1.25, 1.25, 1.25), n_anchors=cfg.data.n_anchors,
+        tau=block.mapper.tau, min_mass=block.mapper.min_mass,
+        boundary_widths=tuple(block.boundary_widths), carver_width=block.carver.width,
+        carver_blocks=block.carver.blocks,
+        full_resolution_skip=block.carver.full_resolution_skip,
+        use_image=block.use_image, additive_prior=block.additive_prior, alpha=block.alpha,
+        background_logit=block.background_logit, prior_foreground=block.prior_foreground,
+    )
+    # The relational half is meant to be small beside the frozen segmenter.
+    trainable = sum(p.numel() for p in model.trainable_parameters())
+    assert trainable < sum(p.numel() for p in segmenter.parameters()) / 10
 
 
-def test_the_shipped_config_builds_at_128(cfg):
-    """The width list, the resolution and `model.bottleneck` must agree.
-
-    Derived from the config rather than hardcoded: the depth is a live
-    experimental knob (each width halves the volume once, so N widths take 128
-    down to 128 / 2**(N-1)), and a test that pins one choice only ever reports
-    that someone changed it. What must never drift is the arithmetic - a width
-    list that disagrees with `model.bottleneck` builds a model whose attention
-    grid is not the configured one.
-    """
-    assert cfg.data.resolution == 128
-    widths = list(cfg.model.encoder_channels)
-    expected = cfg.data.resolution // 2 ** (len(widths) - 1)
-    assert cfg.model.bottleneck == expected, (
-        f"{len(widths)} encoder widths reduce {cfg.data.resolution} to {expected}, "
-        f"but model.bottleneck is {cfg.model.bottleneck}"
-    )
-    common = dict(
-        encoder_channels=tuple(cfg.model.encoder_channels),
-        bottleneck=cfg.model.bottleneck,
-        token_dim=cfg.model.token_dim,
-        num_heads=cfg.model.num_heads,
-        prior_foreground=cfg.model.prior_foreground,
-    )
-    a = StageA(10, cfg.data.resolution, deep_supervision=tuple(cfg.model.deep_supervision), **common)
-    b = StageB(10, cfg.data.resolution, cfg.data.n_anchors,
-               intersection_hidden=cfg.model.intersection_hidden, **common)
-    assert a.config["bottleneck"] == expected
-    assert b.config["bottleneck"] == expected
+def test_the_shipped_constants_are_the_measured_ones(cfg):
+    """`docs/proposal/deviations.md` §1: both differ from the proposal's start."""
+    assert cfg.model.stage_b.mapper.tau == 0.5          # 2.0 fails §2's gate at 0.65
+    assert cfg.model.stage_b.mapper.min_mass == 1e-6    # 1e-3 rejects every structure
+    assert cfg.train.stage_b.flip_probability == 0.25
+    assert cfg.train.stage_b.far.epsilon == 0.05 and cfg.train.stage_b.far.dilation == 8
 
 
 def test_every_block_the_code_reads_is_present(cfg):
-    for block in ("data", "synthetic", "targets", "mri", "model", "train", "logging", "evaluation"):
-        assert block in cfg, block
-    assert {"source", "output", "n_subjects", "structures"} <= set(cfg.mri)
-    listed = {name for names in cfg.targets.to_dict().values() for name in names}
-    assert listed <= set(cfg.mri.structures)
-    for stage in ("stage_a", "stage_b"):
-        assert {"epochs", "optimizer", "scheduler", "augment"} <= set(cfg.train[stage]), stage
-        assert {"name", "lr", "weight_decay"} == set(cfg.train[stage]["optimizer"])
-        assert {"name", "warmup_epochs"} == set(cfg.train[stage]["scheduler"])
-    assert {"mode", "occupancy_mode", "phase_a_checkpoint"} <= set(cfg.train.stage_b)
-    assert cfg.train.stage_b.mode == "predicted"
-    # `all` is the shipped default *because* `mode` is `predicted`. The verdict
-    # that `all` is a silhouette leak was reached under `mode: oracle`, where
-    # occupancy came from ground-truth labels; under `predicted` it is Stage A's
-    # own output, available at inference, and `output subset of occupancy` is the
-    # intended behaviour rather than a leak. On MRI the decoder needs it: no
-    # global intensity threshold isolates structures better than IoU 0.0998, so
-    # with `none`/`anchors-only` the decoder cannot see that a structure is
-    # there at all. Pairing `all` with `oracle` is what must never ship.
-    assert cfg.train.stage_b.occupancy_mode == "all"
-    assert cfg.model.stage_b_image is True
-    assert cfg.train.stage_b.phase_a_checkpoint == "runs/phase-a/current/best.pt"
-    assert resolve_phase_a_checkpoint(cfg.train.stage_b) == Path("runs/phase-a/current/best.pt")
-    assert {"name", "lambda_dice", "lambda_bce"} == set(cfg.train.loss)
-    assert {"patience", "min_delta"} == set(cfg.train.early_stopping)
+    for block in ("data", "targets", "mri", "model", "train", "logging", "evaluation"):
+        assert block in cfg
+    for key in ("mapper", "boundary_widths", "carver", "use_image", "additive_prior",
+                "alpha", "background_logit", "prior_foreground"):
+        assert key in cfg.model.stage_b, key
+    for key in ("epochs", "optimizer", "scheduler", "phase_a_checkpoint", "anchor_source",
+                "flip_probability", "loss", "far", "field_centroid_on",
+                "boundary_checkpoint", "boundary_lr_scale"):
+        assert key in cfg.train.stage_b, key
+    for term in ("dice", "bce", "null_bce", "centroid", "field_centroid", "far"):
+        assert term in cfg.train.stage_b.loss, term
+    # Anything the architecture no longer has must be gone from the config too.
+    for gone in ("occupancy_mode", "mode", "selection_weight"):
+        assert gone not in cfg.train.stage_b, gone
+    assert "stage_b_selection" not in cfg.model and "stage_b_image" not in cfg.model
 
 
 def test_overrides_reach_a_nested_leaf():
     cfg = load_config(overrides=parse_overrides(["train.stage_b.optimizer.lr=1e-4"]))
     assert cfg.train.stage_b.optimizer.lr == 1e-4
     assert cfg.train.stage_a.optimizer.lr == 0.001  # untouched
-    cfg = load_config(overrides=parse_overrides(["train.stage_b.occupancy_mode=anchors-only"]))
-    assert cfg.train.stage_b.occupancy_mode == "anchors-only"
-    cfg = load_config(overrides=parse_overrides(["train.stage_b.mode=oracle"]))
-    assert cfg.train.stage_b.mode == "oracle"
-    assert resolve_phase_a_checkpoint(cfg.train.stage_b) is None
+    cfg = load_config(overrides=parse_overrides(["train.stage_b.anchor_source=oracle"]))
+    assert resolve_anchor_source(cfg.train.stage_b) == "oracle"
+    with pytest.raises(ValueError, match="anchor_source"):
+        resolve_anchor_source({"anchor_source": "guess"})
+
+
+def test_stage_b_always_needs_a_segmenter():
+    """Stage A is inside Stage B; there is no mode in which it is absent."""
+    cfg = load_config()
+    assert resolve_segmenter(cfg.train.stage_b) == Path(cfg.train.stage_b.phase_a_checkpoint)
+    assert resolve_segmenter(cfg.train.stage_b, "other.pt") == Path("other.pt")
+    with pytest.raises(ValueError, match="frozen Stage A"):
+        resolve_segmenter({"phase_a_checkpoint": None})
 
 
 # -- the factories reject what they cannot do --------------------------------

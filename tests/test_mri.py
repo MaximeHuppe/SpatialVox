@@ -18,7 +18,7 @@ from src.mri import (
     resize,
     split_subjects,
 )
-from src.synthetic import SHAPE_NAMES
+from conftest import NAMES
 
 
 def _write_nifti(path, data, affine):
@@ -43,7 +43,7 @@ def test_mri_targets_are_mirror_closed_and_inside_the_vocabulary():
     structures = set(cfg.mri.structures)
     listed = {name for names in cfg.targets.to_dict().values() for name in names}
     assert listed <= structures
-    assert not (listed & set(SHAPE_NAMES))
+    assert not (listed & set(NAMES))
     for fold, names in cfg.targets.to_dict().items():
         types: dict[str, set[str]] = {}
         for name in names:
@@ -129,7 +129,7 @@ def test_prepare_volume_reorients_las_to_ras_and_returns_zyx(tmp_path):
     assert x_of_marker > 4
 
 
-def test_importing_prepared_mri_writes_the_synthetic_corpus_layout(tmp_path):
+def test_importing_prepared_mri_writes_the_corpus_layout(tmp_path):
     cfg = load_config()
     names = label_names(cfg.mri.structures.to_dict(), "fs")
     shape = (16, 16, 16)

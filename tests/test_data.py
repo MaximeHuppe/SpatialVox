@@ -1,73 +1,30 @@
-"""Synthetic generation, the corpus on disk, and what the datasets hand the model."""
+"""The corpus on disk, the flip, and what the datasets hand the model."""
 
 from __future__ import annotations
 
 import numpy as np
 import pytest
 
+import torch
+
 from src.data import (
+    AnchorCache,
     Corpus,
     ExampleDataset,
     ROTATIONS,
     SceneDataset,
+    anchor_cache_dir,
     build_examples,
-    check_scene,
     collate,
     import_corpus,
     load_nifti,
+    normalize,
     rotate,
     save_nifti,
-    normalize,
 )
-from src.geometry import centroids_world, classify, volume_center_world
-from src.synthetic import SHAPE_NAMES, half_extent, draw_params, voxelize
-
-
-# -- synthetic geometry ------------------------------------------------------
-def test_every_primitive_voxelises_inside_its_own_bounding_box():
-    rng = np.random.default_rng(0)
-    shape, spacing = (32, 32, 32), (1.0, 1.0, 1.0)
-    for name in SHAPE_NAMES:
-        params = draw_params(name, rng, scale=0.5)
-        center = np.array([16.0, 16.0, 16.0])
-        mask = voxelize(name, params, center, shape, spacing)
-        assert mask.any(), name
-        half = half_extent(name, params)
-        indices = np.nonzero(mask)  # (z, y, x)
-        for axis, world_axis in enumerate((2, 1, 0)):
-            span = (indices[axis].min(), indices[axis].max())
-            assert center[world_axis] - half[world_axis] - 1 <= span[0]
-            assert span[1] <= center[world_axis] + half[world_axis] + 1
-
-
-def test_a_generated_scene_holds_one_instance_of_every_structure(scene):
-    _, labels = scene
-    check_scene(labels, len(SHAPE_NAMES), margin=1)
-    assert sorted(np.unique(labels)) == list(range(len(SHAPE_NAMES) + 1))
-
-
-def test_structures_never_overlap(scene):
-    """One label volume cannot represent overlap, so count voxels instead."""
-    _, labels = scene
-    total = sum(int((labels == label).sum()) for label in range(1, len(SHAPE_NAMES) + 1))
-    assert total == int((labels != 0).sum())
-
-
-def test_intensity_does_not_identify_a_structure(scene):
-    """Structure means share one range, so brightness must not be a giveaway."""
-    image, labels = scene
-    means = [float(image[labels == label].mean()) for label in range(1, len(SHAPE_NAMES) + 1)]
-    assert max(means) - min(means) < 0.35  # inside the configured [0.45, 0.75] band
-    assert float(image[labels == 0].mean()) < min(means)  # background is still darker
-
-
-def test_a_scene_is_reproducible_from_its_seed():
-    from src.synthetic import generate_scene
-
-    settings = ((24, 24, 24), (1.0, 1.0, 1.0), 1, {"background": [0.1, 0.02], "structure": [0.4, 0.8], "noise": 0.02, "blur": 0.5})
-    first = generate_scene(11, *settings)
-    second = generate_scene(11, *settings)
-    assert np.array_equal(first[1], second[1]) and np.allclose(first[0], second[0])
+from src.geometry import (
+    OPPOSITE, centroids_world, classify, solutions_for, volume_center_world,
+)
 
 
 # -- examples and manifests --------------------------------------------------
@@ -94,13 +51,6 @@ def test_prompt_clause_order_is_the_channel_order(scene, vocab):
         clauses = vocab.parse(example["prompt"])
         assert [c["anchor"] for c in clauses] == [vocab.name(a) for a in example["anchors"]]
         assert [c["direction"] for c in clauses] == example["directions"]
-
-
-def test_check_scene_rejects_a_structure_on_the_border():
-    labels = np.zeros((8, 8, 8), dtype=np.uint8)
-    labels[0, 0, 0] = 1
-    with pytest.raises(ValueError, match="border"):
-        check_scene(labels, 1, margin=1)
 
 
 def test_nifti_survives_a_round_trip(tmp_path):
@@ -133,34 +83,6 @@ def test_rotation_preserves_every_structure(scene):
         assert rotated.shape == labels.shape
 
 
-def test_augmented_clauses_describe_the_rotated_volume(corpus):
-    """The point of the rewrite: prompt and tensor can never disagree."""
-    dataset = ExampleDataset(corpus, "train", augment=True)
-    spacing = corpus.spacing
-    for epoch in range(3):
-        dataset.set_epoch(epoch)
-        for index in range(len(dataset)):
-            item = dataset[index]
-            labels = item["labels"].numpy()
-            centroids = centroids_world(labels, len(corpus.vocab), spacing)
-            center = volume_center_world(labels.shape, spacing)
-            target = int(item["target"])
-            for anchor, direction in zip(item["anchors"].tolist(), item["directions"]):
-                assert classify(centroids[target], centroids[anchor], center) == direction
-            clauses = corpus.vocab.parse(item["prompt"])
-            assert [c["direction"] for c in clauses] == item["directions"]
-            assert [c["anchor"] for c in clauses] == item["anchor_names"]
-
-
-def test_augmentation_actually_moves_the_volume(corpus):
-    dataset = ExampleDataset(corpus, "train", augment=True)
-    poses = set()
-    for epoch in range(8):
-        dataset.set_epoch(epoch)
-        poses.add(dataset[0]["labels"].numpy().tobytes())
-    assert len(poses) > 1
-
-
 # -- datasets ----------------------------------------------------------------
 def test_stage_a_items_carry_labels_not_masks(corpus):
     item = SceneDataset(corpus, "train")[0]
@@ -173,16 +95,6 @@ def test_stage_a_can_subsample_the_vocabulary(corpus):
     item = SceneDataset(corpus, "train", prompts_per_item=3)[0]
     assert item["prompt_ids"].shape == (3,)
     assert len(set(item["prompt_ids"].tolist())) == 3
-
-
-def test_stage_b_items_expose_only_what_the_model_may_see(corpus):
-    item = ExampleDataset(corpus, "train")[0]
-    assert set(item) == {
-        "image", "labels", "target", "anchors", "direction_ids",
-        "example_id", "scene", "prompt", "target_name", "anchor_names", "directions",
-    }
-    assert item["anchors"].shape == (corpus.n_anchors,)
-    assert item["target"] not in item["anchors"]
 
 
 def test_collate_keeps_one_metadata_entry_per_sample(corpus):
@@ -202,14 +114,13 @@ ANATOMY = {
 
 def test_importing_real_volumes_produces_the_same_corpus_shape(tmp_path):
     """The MRI entry point: arbitrary label ids and real names in, a corpus out."""
-    from src.synthetic import generate_scene
+    from conftest import make_scene
 
-    appearance = {"background": [0.12, 0.04], "structure": [0.45, 0.75], "noise": 0.03, "blur": 0.6}
-    source_ids = np.array(list(ANATOMY))  # synthetic label i+1 stands in for source id i
+    source_ids = np.array(list(ANATOMY))  # fixture label i+1 stands in for source id i
     scenes = {}
     for index, seed in enumerate((3, 4)):
-        image, labels = generate_scene(seed, (24, 24, 24), (1.0, 1.0, 1.0), 1, appearance)
-        index_of = np.clip(labels.astype(np.int64) - 1, 0, None)
+        image, labels = make_scene(seed, shift=1)
+        index_of = np.clip(labels.astype(np.int64) - 1, 0, len(source_ids) - 1)
         scenes[f"subject_{index}"] = (image, source_ids[index_of] * (labels > 0))
 
     root = import_corpus(
@@ -220,7 +131,7 @@ def test_importing_real_volumes_produces_the_same_corpus_shape(tmp_path):
     assert (corpus.root / "scenes" / "subject_0" / "labels.nii.gz").is_file()
 
     item = ExampleDataset(corpus, "train")[0]
-    assert set(item["labels"].unique().tolist()) == set(range(len(ANATOMY) + 1))
+    assert set(item["labels"].unique().tolist()) <= set(range(len(ANATOMY) + 1))
     assert item["target_name"] in ANATOMY.values()
     assert corpus.vocab.parse(item["prompt"]) == [
         {"direction": d, "anchor": a} for d, a in zip(item["directions"], item["anchor_names"])
@@ -257,3 +168,145 @@ def test_zscore_brain_survives_an_all_background_volume():
 def test_an_unknown_normalize_mode_names_the_ones_that_exist():
     with pytest.raises(ValueError, match="zscore-brain"):
         normalize(np.zeros((2, 2, 2), np.float32), "quantile")
+
+
+# ---------------------------------------------------------------------------
+# The flip: §5's three outcomes, measured rather than assumed
+# ---------------------------------------------------------------------------
+def outcome(corpus, record, labels):
+    """What the corpus rule says about a record's clauses, independently of the dataset."""
+    centroids = centroids_world(labels, len(corpus.vocab), corpus.spacing)
+    center = volume_center_world(labels.shape, corpus.spacing)
+    present = [int(v) for v in np.unique(labels) if v != 0]
+    return solutions_for(record["anchors"], record["directions"], centroids, present, center)
+
+
+def test_a_flip_is_retargeted_emptied_or_dropped_and_never_assumed_empty(corpus):
+    """§5: "A flip is not assumed to be empty." Each item must agree with the rule."""
+    dataset = ExampleDataset(corpus, "train", flip_probability=1.0, normalize_mode="none")
+    seen = {"retargeted": 0, "empty": 0, "dropped": 0}
+    for index in range(len(dataset)):
+        item = dataset[index]
+        _, labels = load_nifti(corpus.root / "scenes" / item["scene"] / "labels.nii.gz", np.int16), None
+        labels = load_nifti(corpus.root / "scenes" / item["scene"] / "labels.nii.gz", np.int16)
+        record = {"anchors": item["anchors"].tolist(), "directions": item["directions"]}
+        if int(item["keep"]) == 0:
+            seen["dropped"] += 1
+            continue
+        solutions = outcome(corpus, record, labels)
+        if int(item["valid"]) == 1:
+            seen["retargeted"] += 1
+            assert solutions == [int(item["target"])]
+            assert item["target_name"] == corpus.vocab.name(int(item["target"]))
+        else:
+            seen["empty"] += 1
+            assert solutions == []
+            assert int(item["target"]) == 0
+            assert item["target_name"] == ExampleDataset.NONE
+    assert seen["empty"] > 0 and seen["dropped"] > 0, seen
+
+
+def test_a_record_with_target_zero_is_an_empty_prompt_however_it_got_there(corpus):
+    """`scripts/evaluate.py` writes an empty-prompt population straight into
+    `records`; `valid` has to follow the target, not a separate flag."""
+    dataset = ExampleDataset(corpus, "train", normalize_mode="none")
+    dataset.records = [{**dataset.records[0], "target": 0}]
+    item = dataset[0]
+    assert int(item["valid"]) == 0 and int(item["keep"]) == 1
+    assert item["target_name"] == ExampleDataset.NONE
+
+
+def test_an_unflipped_item_is_valid_kept_and_its_manifest_target(corpus):
+    dataset = ExampleDataset(corpus, "train", flip_probability=0.0, normalize_mode="none")
+    item = dataset[0]
+    assert int(item["valid"]) == 1 and int(item["keep"]) == 1
+    assert int(item["target"]) == dataset.records[0]["target"]
+    assert item["directions"] == dataset.records[0]["directions"]
+
+
+def test_the_flip_is_reproducible_from_the_epoch_and_the_index(corpus):
+    dataset = ExampleDataset(corpus, "train", flip_probability=0.5, normalize_mode="none")
+    first = [dataset[i]["directions"] for i in range(6)]
+    assert [dataset[i]["directions"] for i in range(6)] == first
+    dataset.set_epoch(1)
+    assert [dataset[i]["directions"] for i in range(6)] != first
+
+
+def test_a_stage_b_item_carries_no_mask_and_no_target_geometry(corpus):
+    """The dataset hands over the label volume; the task derives the target from it.
+
+    `labels` is there because the *losses* need a target and the metrics need
+    something to score against - `tests/test_engine.py` pins that it never
+    reaches the model.
+    """
+    item = ExampleDataset(corpus, "train", normalize_mode="none")[0]
+    assert set(item) == {
+        "image", "labels", "target", "anchors", "direction_ids", "valid", "keep",
+        "example_id", "scene", "prompt", "target_name", "anchor_names", "directions",
+    }
+    assert item["image"].shape == (1, *corpus.shape)
+
+
+# ---------------------------------------------------------------------------
+# The precomputed anchors
+# ---------------------------------------------------------------------------
+def test_the_anchor_cache_reproduces_the_masks_it_was_built_from(corpus, tmp_path):
+    """The cache is an optimisation, so it has to be numerically the same thing."""
+    rng = np.random.default_rng(0)
+    dense = np.zeros((len(corpus.vocab), *corpus.shape), dtype=np.float32)
+    for channel in range(len(corpus.vocab)):
+        z, y, x = rng.integers(4, 20, 3)
+        dense[channel, z:z + 4, y:y + 4, x:x + 4] = rng.random((4, 4, 4)).astype(np.float32)
+    dense[dense < 1e-3] = 0.0  # the cache's own truncation, applied to the reference
+
+    boxes, chunks = [], []
+    for channel in range(len(corpus.vocab)):
+        occupied = np.nonzero(dense[channel] > 1e-3)
+        low = [int(a.min()) for a in occupied]
+        high = [int(a.max()) + 1 for a in occupied]
+        boxes.append([*low, *high])
+        chunks.append(dense[channel][tuple(slice(l, h) for l, h in zip(low, high))].astype(np.float16).reshape(-1))
+    directory = tmp_path / "anchors"
+    directory.mkdir()
+    np.savez(
+        directory / "train_0.npz",
+        bbox=np.array(boxes, dtype=np.int16),
+        data=np.concatenate(chunks),
+        offset=np.cumsum([0] + [c.size for c in chunks]).astype(np.int64),
+    )
+    cache = AnchorCache(directory, corpus.shape)
+    taken = cache.take("train_0", [2, 5, 1])
+    assert np.allclose(taken, dense[[1, 4, 0]].astype(np.float16), atol=1e-3)
+
+
+def test_the_anchor_cache_directory_is_keyed_by_the_checkpoint(tmp_path):
+    """A different Stage A writes a different directory - no silent staleness."""
+    first, second = tmp_path / "a.pt", tmp_path / "b.pt"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    assert anchor_cache_dir(tmp_path, first) != anchor_cache_dir(tmp_path, second)
+    assert anchor_cache_dir(tmp_path, first) == anchor_cache_dir(tmp_path, first)
+
+
+def test_the_dataset_emits_cached_anchors_in_slot_order(corpus, tmp_path):
+    directory = tmp_path / "anchors"
+    directory.mkdir()
+    size = len(corpus.vocab)
+    dense = np.zeros((size, *corpus.shape), dtype=np.float32)
+    for channel in range(size):
+        dense[channel, channel, channel, channel] = 1.0  # a unique voxel per structure
+    boxes = [[c, c, c, c + 1, c + 1, c + 1] for c in range(size)]
+    for scene_id in corpus.scene_ids("train"):
+        np.savez(
+            directory / f"{scene_id}.npz",
+            bbox=np.array(boxes, dtype=np.int16),
+            data=np.ones(size, dtype=np.float16),
+            offset=np.arange(size + 1, dtype=np.int64),
+        )
+    item = ExampleDataset(corpus, "train", anchor_cache=directory, normalize_mode="none")[0]
+    masks = item["anchor_probability"]
+    assert masks.shape == (corpus.n_anchors, *corpus.shape)
+    for slot, label in enumerate(item["anchors"].tolist()):
+        channel = label - 1
+        assert float(masks[slot, channel, channel, channel]) == 1.0
+        assert float(masks[slot].sum()) == 1.0
