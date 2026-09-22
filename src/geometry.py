@@ -18,6 +18,15 @@ A relation always describes the TARGET relative to an ANCHOR, from
 
 A direction is never invented. Coincident centroids and exact medial/lateral
 ties raise :class:`AmbiguousDirection`, and the caller drops that pair.
+
+Prompts are generated **anchor-first** and only anchor-first: the landmark
+triple is fixed before anyone asks what it determines. The target-first
+generator this project used to carry picked the anchors *nearest the target*,
+which on fixed anatomy made the anchor identities a name tag - measured on
+``data/mri``, the unordered anchor set alone recovered the target 98.9% of the
+time against 94.5% for solving the conjunction, so ignoring the prompt was
+strictly better than reading it. No pool width inverts that; the selection rule
+itself was the leak, so it is gone rather than configurable.
 """
 
 from __future__ import annotations
@@ -104,15 +113,6 @@ def centroid_world(mask: np.ndarray, spacing: tuple[float, float, float] = (1.0,
     return np.array([x * spacing[0], y * spacing[1], z * spacing[2]])
 
 
-def bbox_extent_world(mask: np.ndarray, spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> np.ndarray:
-    """Inclusive bounding-box extent ``(x, y, z)``; one voxel spans one spacing unit."""
-    indices = np.nonzero(mask)
-    if indices[0].size == 0:
-        raise ValueError("cannot take the bounding box of an empty mask")
-    spans = [int(idx.max()) - int(idx.min()) + 1 for idx in indices]  # (z, y, x)
-    return np.array([spans[2] * spacing[0], spans[1] * spacing[1], spans[0] * spacing[2]])
-
-
 def volume_center_world(
     shape: tuple[int, int, int], spacing: tuple[float, float, float] = (1.0, 1.0, 1.0)
 ) -> np.ndarray:
@@ -145,111 +145,6 @@ def classify(target: np.ndarray, anchor: np.ndarray, center: np.ndarray) -> str:
     if abs(target_offset - anchor_offset) <= ATOL:
         raise AmbiguousDirection("target and anchor are equidistant from the mid-sagittal plane")
     return "lateral" if target_offset > anchor_offset else "medial"
-
-
-def _distinct_directions(
-    candidates: Sequence[tuple[int, str]], n_anchors: int
-) -> list[tuple[int, str]] | None:
-    """Take candidates in the order given, keeping each new direction.
-
-    No two anchors may share a direction: two clauses naming the same side would
-    not narrow the conjunction, and the prompt would under-determine the target.
-    """
-    chosen: list[tuple[int, str]] = []
-    used: set[str] = set()
-    for label, direction in candidates:
-        if direction in used:
-            continue
-        used.add(direction)
-        chosen.append((label, direction))
-        if len(chosen) == n_anchors:
-            return chosen
-    return None
-
-
-def select_anchors(
-    target: int,
-    centroids: np.ndarray,
-    present: list[int],
-    center: np.ndarray,
-    n_anchors: int = 3,
-    *,
-    pool: int | None = None,
-    rng: np.random.Generator | None = None,
-    shuffle: bool = True,
-    fallbacks: list[int] | None = None,
-) -> list[tuple[int, str]] | None:
-    """Anchor selection for one target, with pairwise-distinct directions.
-
-    Candidates are ranked by centroid distance (label id as tie-break). ``pool``
-    is how many of those nearest candidates are eligible; ``n_anchors`` are then
-    drawn from that window. ``pool <= n_anchors`` (the default) reproduces the
-    deterministic nearest-feasible set. A wider pool trades realism - a reader
-    names *nearby* landmarks - for a target that is no longer simply "the
-    structure closest to its anchors", which is the shortcut a prompt-blind
-    baseline exploits.
-
-    **The returned order is randomised whenever ``rng`` is given**, and it is the
-    order the prompt clauses and the anchor mask channels both take. Ranking by
-    distance and then storing that ranking made the slot index a perfect proxy
-    for "how close is this anchor" - a leak the model can read without parsing a
-    single direction word. Order must carry no information.
-
-    Feasibility never depends on ``pool``: if the window holds no set of
-    ``n_anchors`` distinct directions, the scan falls back to the full ranking,
-    so widening the pool never drops a target that a narrower one would keep.
-
-    Returns ``None`` when no such set exists anywhere, in which case the caller
-    drops this target.
-    """
-    ranked = sorted(
-        (label for label in present if label != target),
-        key=lambda label: (float(np.linalg.norm(centroids[label] - centroids[target])), label),
-    )
-    candidates: list[tuple[int, str]] = []
-    for label in ranked:
-        try:
-            candidates.append((label, classify(centroids[target], centroids[label], center)))
-        except AmbiguousDirection:  # never invent a direction; drop the pair
-            continue
-
-    width = max(int(n_anchors if pool is None else pool), int(n_anchors))
-    chosen = None
-    if rng is not None and width > n_anchors:
-        window = list(candidates[:width])
-        rng.shuffle(window)  # which of the k nearest, not just the nearest
-        chosen = _distinct_directions(window, n_anchors)
-    if chosen is None:
-        # The pool window held no feasible triple, so this example silently
-        # reverts to the deterministic nearest set. Counted, because a corpus
-        # that is part-deterministic without saying so is a leak in waiting.
-        if fallbacks is not None and width > n_anchors:
-            fallbacks.append(1)
-        chosen = _distinct_directions(candidates, n_anchors)
-    if chosen is not None and rng is not None and shuffle:
-        rng.shuffle(chosen)  # slot order must not encode distance rank
-    return chosen
-
-
-def directions_for(
-    target: int,
-    anchors: Sequence[int],
-    centroids: np.ndarray,
-    center: np.ndarray,
-) -> list[str] | None:
-    """The clause directions describing ``target`` against each of ``anchors``.
-
-    ``None`` when any pair is undecidable, or when two clauses would name the
-    same side - two identical directions do not narrow the conjunction, which is
-    the ``_distinct_directions`` rule applied to a triple that is already fixed.
-    """
-    directions: list[str] = []
-    for anchor in anchors:
-        try:
-            directions.append(classify(centroids[target], centroids[anchor], center))
-        except AmbiguousDirection:
-            return None
-    return directions if len(set(directions)) == len(directions) else None
 
 
 def solutions_for(
@@ -342,8 +237,11 @@ def anchor_first_examples(
     volume, so clauses name landmarks a reader would actually name together.
 
     Returns ``(anchors, directions, target)``. Anchor order is shuffled when
-    ``shuffle`` - slot order must carry no information (see
-    :func:`select_anchors`).
+    ``shuffle``: ranking candidates by distance and then *storing* that ranking
+    made the slot index a perfect proxy for proximity, readable without parsing
+    a single direction word. Order must carry no information, and the shuffled
+    order is then shared by the clauses and the mask channels alike - clause
+    ``i`` always describes channel ``i``.
     """
     labels = [int(l) for l in present]
     if len(labels) <= n_anchors:

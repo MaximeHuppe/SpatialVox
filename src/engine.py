@@ -1,14 +1,20 @@
-"""Losses, metrics, and the one training loop both stages use.
+"""Losses, metrics, and the one training loop every stage uses.
 
-The two stages differ only in how a batch becomes ``(logits, target, groups)``.
-That is what a *task* is (:class:`StageATask`, :class:`StageBTask`); everything
-after it - optimiser, schedule, precision, checkpoint selection, metrics - is
-shared, which is why there is one :class:`Trainer` and not two.
+The stages differ only in how a batch becomes ``(logits, target, groups)``. That
+is what a *task* is (:class:`StageATask`, :class:`BoundaryTask`,
+:class:`StageBTask`); everything after it - optimiser, schedule, precision,
+checkpoint selection, metrics - is shared, which is why there is one
+:class:`Trainer` and not three.
 
-``groups`` is the per-channel label used for the metric breakdown: the structure
-name for Stage A, the target's name for Stage B. It is what turns one accumulator
-into "per-class Dice" for one stage and "Dice on held-out target classes" for the
-other.
+``groups`` is the per-channel label the metric breakdown uses: the structure name
+for Stage A, the target's name for Stage B. It is what turns one accumulator into
+"per-class Dice" for one stage and "Dice on held-out target classes" for another.
+
+Stage B's losses are the table in ``docs/proposal/relational_architecture.md``
+§5, and its one structural consequence is that **every term is per-sample**: a
+flipped prompt that names two structures is *dropped*, and a dropped example must
+contribute to no loss and to no metric. That is the ``keep`` weight, and it runs
+through :func:`segmentation_loss`, every relational term and :class:`Metrics`.
 """
 
 from __future__ import annotations
@@ -28,37 +34,57 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.models import StageA, StageB
+from src.models import BoundaryPretrainer, StageA, StageB
 
 EPS = 1e-8
 
 
 # ---------------------------------------------------------------------------
-# Losses and metrics
+# Losses
 # ---------------------------------------------------------------------------
+def weighted_mean(values: Tensor, weight: Tensor | None) -> Tensor:
+    """Mean of ``values`` over samples, with ``weight`` zeroing dropped examples.
+
+    ``weight`` is ``[B]``; ``values`` is ``[B]`` or ``[B, C]``. An all-dropped
+    batch returns zero rather than ``nan``, which keeps a rare unlucky batch from
+    poisoning the running loss.
+    """
+    if weight is None:
+        return values.mean()
+    weight = weight.to(values.dtype).reshape(-1, *([1] * (values.ndim - 1)))
+    return (values * weight).sum() / (weight.sum() * values[0].numel()).clamp(min=EPS)
+
+
 def segmentation_loss(
-    logits: Tensor, target: Tensor, lambda_dice: float = 1.0, lambda_bce: float = 1.0
+    logits: Tensor,
+    target: Tensor,
+    lambda_dice: float = 1.0,
+    lambda_bce: float = 1.0,
+    weight: Tensor | None = None,
 ) -> Tensor:
-    """``lambda_dice * soft Dice + lambda_bce * BCEWithLogits``.
+    """``lambda_dice * soft Dice + lambda_bce * BCEWithLogits``, per sample.
 
     Always computed in float32: the Dice denominator sums one probability per
-    voxel - 262,144 of them at 64^3 - and float16 has neither the range nor the
-    resolution for that sum, so the objective would depend on the autocast dtype.
+    voxel - two million of them at 128^3 - and float16 has neither the range nor
+    the resolution for that sum, so the objective would depend on the autocast
+    dtype.
     """
     logits, target = logits.float(), target.float()
     probability = torch.sigmoid(logits).flatten(2)
     reference = target.flatten(2)
     intersection = (probability * reference).sum(-1)
-    dice = 1 - ((2 * intersection + 1) / (probability.sum(-1) + reference.sum(-1) + 1)).mean()
-    return lambda_dice * dice + lambda_bce * F.binary_cross_entropy_with_logits(logits, target)
+    dice = 1 - (2 * intersection + 1) / (probability.sum(-1) + reference.sum(-1) + 1)
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none").flatten(2).mean(-1)
+    return lambda_dice * weighted_mean(dice, weight) + lambda_bce * weighted_mean(bce, weight)
 
 
 def downsample_target(target: Tensor, size: Sequence[int]) -> Tensor:
     """Shrink binary targets for a coarse supervision scale, preserving presence.
 
-    Max pooling, not nearest or average: at a quarter resolution a torus is about
-    one voxel thick and both alternatives can delete it entirely, which would
-    supervise the coarse head towards an empty mask for a structure that is there.
+    Max pooling, not nearest or average: at a quarter resolution a small nucleus
+    is about one voxel thick and both alternatives can delete it entirely, which
+    would supervise the coarse head towards an empty mask for a structure that is
+    there.
     """
     target_size = tuple(int(v) for v in size)
     if tuple(target.shape[2:]) == target_size:
@@ -72,10 +98,9 @@ def downsample_target(target: Tensor, size: Sequence[int]) -> Tensor:
 def deep_supervision_weights(n_scales: int, configured: Sequence[float]) -> list[float]:
     """One weight per decoder scale, coarse to fine.
 
-    ``configured`` is used as given when it has the right length - which is the
-    case at the resolution the weights were tuned for. At another depth it cannot
-    be, so a doubling ramp normalised to sum to one stands in, keeping the same
-    shape: coarse scales matter least.
+    ``configured`` is used as given when it has the right length. At another
+    depth it cannot be, so a doubling ramp normalised to sum to one stands in,
+    keeping the same shape: coarse scales matter least.
     """
     if len(configured) == n_scales:
         return [float(w) for w in configured]
@@ -91,6 +116,70 @@ def deep_supervision_loss(
         weight * segmentation_loss(logits, downsample_target(target, logits.shape[2:]), **loss_weights)
         for logits, weight in zip(scales, weights)
     )
+
+
+def dilate(mask: Tensor, radius: int) -> Tensor:
+    """Binary dilation by a cube of half-width ``radius``, separably.
+
+    A ``(2r+1)^3`` max pool is 4913 taps at ``r = 8``; three one-dimensional
+    passes are 51 and give the same L-infinity ball. The structuring element is a
+    cube, not a sphere - ``L_far`` only needs "well away from the field", and the
+    corner voxels of the cube are further out, so the penalty stays the looser of
+    the two.
+    """
+    radius = int(radius)
+    if radius <= 0:
+        return mask
+    size = 2 * radius + 1
+    x = mask.float()
+    for axis in range(3):
+        kernel = [1, 1, 1]
+        kernel[axis] = size
+        padding = [0, 0, 0]
+        padding[axis] = radius
+        x = F.max_pool3d(x, tuple(kernel), 1, tuple(padding))
+    return x
+
+
+def mask_centroid_world(mask: Tensor, spacing: Sequence[float]) -> tuple[Tensor, Tensor]:
+    """``[B, 1, D, H, W]`` -> ``([B, 3]`` world ``(x, y, z)``, ``[B]`` total mass``)``.
+
+    From the three axis marginals, so it costs one pass and no coordinate grid.
+    Empty masks return the origin and a zero mass; the caller decides what that
+    means rather than having a ``nan`` decide for it.
+    """
+    mask = mask.float()
+    if mask.ndim == 5:
+        mask = mask.squeeze(1)
+    total = mask.flatten(1).sum(-1)
+    depth, height, width = mask.shape[1:]
+    options = dict(device=mask.device, dtype=mask.dtype)
+    x = torch.arange(width, **options) * float(spacing[0])
+    y = torch.arange(height, **options) * float(spacing[1])
+    z = torch.arange(depth, **options) * float(spacing[2])
+    centroid = torch.stack(
+        [
+            (mask.sum(dim=(1, 2)) * x).sum(-1),
+            (mask.sum(dim=(1, 3)) * y).sum(-1),
+            (mask.sum(dim=(2, 3)) * z).sum(-1),
+        ],
+        dim=-1,
+    ) / total.clamp(min=EPS).unsqueeze(-1)
+    return centroid, total
+
+
+def far_mass(probability: Tensor, where_raw: Tensor, epsilon: float, radius: int) -> Tensor:
+    """Mean predicted probability outside ``dilate(where_raw > epsilon)``, per sample.
+
+    ``L_far`` is the *only* spatial penalty on a valid prompt. A coverage term on
+    the whole exterior fights the body of a structure that legitimately extends
+    past the pyramid - measured on ``data/mri``, only 36% of a target's voxels sit
+    inside ``where_raw > 0.05``, and 94% inside its 8-voxel dilation. Dice is
+    allowed to follow an MRI boundary a few voxels out; this term only says "not
+    on the other side of the head".
+    """
+    outside = 1.0 - dilate((where_raw > float(epsilon)).float(), radius)
+    return (probability.float() * outside).flatten(1).sum(-1) / outside.flatten(1).sum(-1).clamp(min=1.0)
 
 
 def dice_iou(prediction: Tensor, target: Tensor, threshold: float = 0.5) -> tuple[Tensor, Tensor]:
@@ -140,6 +229,9 @@ def hausdorff(prediction: Tensor, target: Tensor, spacing=(1.0, 1.0, 1.0), perce
     )
 
 
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
 @dataclass
 class Metrics:
     """Per-channel scores with their labels, summarised however you ask.
@@ -161,20 +253,28 @@ class Metrics:
         strata: Sequence[Mapping[str, Sequence[str]]] | None = None,
         spacing: Sequence[float] | None = None,
         percentile: float = 95.0,
+        keep: Tensor | None = None,
+        extra: Mapping[str, Sequence[float]] | None = None,
     ) -> None:
         """Accumulate one batch. ``groups[i][c]`` names channel ``c`` of sample ``i``.
 
-        ``spacing`` turns on the Hausdorff distance, which is the one metric here
-        that costs a surface extraction per sample; leave it ``None`` to skip it.
+        ``spacing`` turns on the Hausdorff distance, the one metric here that
+        costs a surface extraction per sample; leave it ``None`` to skip it.
+        ``keep`` drops a sample entirely - a prompt the loss table drops must not
+        appear in a reported mean either. ``extra`` carries per-sample scalars
+        (centroid error, field mass) that are averaged alongside Dice.
         """
         dice, iou = dice_iou(torch.sigmoid(logits.float()).cpu(), target.float().cpu(), threshold)
         for sample in range(dice.shape[0]):
+            if keep is not None and float(keep[sample]) <= 0:
+                continue
             distance = None
             if spacing is not None and logits.shape[1] == 1:
                 distance = hausdorff(
                     torch.sigmoid(logits[sample, 0].float()).cpu(),
                     target[sample, 0].float().cpu(), spacing, percentile,
                 )
+            values = {k: float(v[sample]) for k, v in (extra or {}).items()}
             for channel in range(dice.shape[1]):
                 self.rows.append(
                     {
@@ -183,27 +283,28 @@ class Metrics:
                         "hausdorff": distance,
                         "name": groups[sample][channel],
                         "strata": dict(strata[sample]) if strata else {},
+                        **values,
                     }
                 )
 
     @staticmethod
     def _mean(rows: list[dict[str, Any]]) -> dict[str, float]:
-        distances = [row["hausdorff"] for row in rows if row["hausdorff"] is not None and not math.isnan(row["hausdorff"])]
         summary = {
             "dice": sum(row["dice"] for row in rows) / len(rows),
             "iou": sum(row["iou"] for row in rows) / len(rows),
             "n": len(rows),
         }
-        if distances:
-            summary["hausdorff"] = sum(distances) / len(distances)
+        for key in sorted({k for row in rows for k in row} - {"dice", "iou", "name", "strata"}):
+            values = [
+                row[key] for row in rows
+                if row.get(key) is not None and not math.isnan(float(row[key]))
+            ]
+            if values:
+                summary[key] = sum(values) / len(values)
         return summary
 
     def summary(self, stratify_by: Sequence[str] | None = None) -> dict[str, Any]:
-        """Overall and per-name means, plus the requested strata.
-
-        ``stratify_by`` is ``evaluation.stratify_by``; ``None`` reports every
-        stratum the rows happen to carry.
-        """
+        """Overall and per-name means, plus the requested strata."""
         if not self.rows:
             return {"dice": 0.0, "iou": 0.0, "n": 0, "by_name": {}}
         wanted = None if stratify_by is None else set(stratify_by)
@@ -234,9 +335,17 @@ def format_table(summary: Mapping[str, Any], title: str = "overall") -> str:
     def row(label: str, entry: Mapping[str, Any]) -> str:
         distance = entry.get("hausdorff")
         rendered = "      -" if distance is None else f"{distance:>7.2f}"
-        return f"  {label:<26} {entry['dice']:>7.4f} {entry['iou']:>7.4f} {rendered} {entry['n']:>5}"
+        error = entry.get("centroid_error")
+        offset = "      -" if error is None else f"{error:>7.2f}"
+        return (
+            f"  {label:<26} {entry['dice']:>7.4f} {entry['iou']:>7.4f} "
+            f"{rendered} {offset} {entry['n']:>5}"
+        )
 
-    lines = [f"  {title:<26} {'dice':>7} {'iou':>7} {'hd95':>7} {'n':>5}", row("all", summary)]
+    lines = [
+        f"  {title:<26} {'dice':>7} {'iou':>7} {'hd95':>7} {'centr':>7} {'n':>5}",
+        row("all", summary),
+    ]
     for name, entry in summary.get("by_name", {}).items():
         lines.append(row(f"  {name}", entry))
     for stratum, buckets in summary.get("strata", {}).items():
@@ -247,7 +356,7 @@ def format_table(summary: Mapping[str, Any], title: str = "overall") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tasks: the only thing that differs between the two stages
+# Tasks
 # ---------------------------------------------------------------------------
 def masks_from(labels: Tensor, ids: Tensor) -> Tensor:
     """``labels [B, D, H, W]`` and ``ids [B, K]`` -> ``[B, K, D, H, W]`` float masks.
@@ -258,102 +367,60 @@ def masks_from(labels: Tensor, ids: Tensor) -> Tensor:
     return (labels.unsqueeze(1) == ids[..., None, None, None]).float()
 
 
-OCCUPANCY_MODES = ("all", "distractors-only", "anchors-only", "none")
-STAGE_B_MODES = ("predicted", "oracle")
+ANCHOR_SOURCES = ("predicted", "oracle")
+
+#: Which prompts the heatmap's *field* target acts on. ``always`` is §5's table
+#: read literally - "peak of ``where_raw``" appears in the *names one* column as
+#: well as the *names none* one. ``empty-only`` restricts it to prompts that name
+#: nothing, where it is the only target available.
+#:
+#: The choice is measurable, not stylistic. ``scripts/gate_mapper.py`` reports the
+#: distance from the field's centre of mass to the target's centroid as **20.2 mm**
+#: on ``data/mri``, almost independent of ``tau``: the conjunction of three cones
+#: is an elongated wedge, the target sits near its apex, and so the region
+#: *contains* the target without *pointing at* it. Under ``always`` that term
+#: therefore pulls the heatmap about 20 mm off on every valid prompt, against the
+#: structure-centroid term pulling it back.
+FIELD_CENTROID_ON = ("always", "empty-only")
 
 
-def _take_channels(masks: Tensor, ids: Tensor) -> Tensor:
-    """``masks [B, C, ...]`` indexed by ``ids [B, K]`` along the channel axis."""
-    extra = (1,) * (masks.ndim - 2)
-    index = ids.to(dtype=torch.long).reshape(*ids.shape, *extra)
-    return masks.gather(1, index.expand(-1, -1, *masks.shape[2:]))
+def roll_anchors(batch: Mapping[str, Any], shift: int) -> dict[str, Any]:
+    """Rotate the anchor slots as a unit: ids, names, and any precomputed masks.
 
-
-def occupancy_from(
-    batch: Mapping[str, Any],
-    mode: str = "all",
-    *,
-    anchors: Tensor | None = None,
-    full: Tensor | None = None,
-) -> Tensor:
-    """Which masks of an already-chosen source are unioned into occupancy.
-
-    Source is resolved by :class:`StageBTask` — this function never queries a
-    segmenter. Omitted ``anchors`` / ``full`` fall back to ground-truth labels
-    (the oracle source).
-
-    * ``all`` - every shape the source can name. Ceiling: ground truth includes
-      the target, and a segmenter trained on the target's name will paint it too.
-    * ``distractors-only`` - ``all`` with the target's own voxels removed: the
-      candidate blobs without the answer's silhouette. This is the only mode
-      that reads ``batch["target"]``, which makes it a **diagnostic, not a
-      deployable setting** - inference cannot exclude a target it has not found
-      yet. :class:`StageBTask` allows it under ``mode: oracle`` only.
-    * ``anchors-only`` - the union of the prompt's three anchors. After
-      :meth:`StageB.forward` subtracts those same channels, the decoder
-      occupancy is empty, so this is bit-for-bit ``none`` at the decoder. Kept
-      as a named arm because it is the natural thing to reach for; see
-      ``docs/phase_b_mri_investigation.md`` for the proof.
-    * ``none`` - an empty channel; Stage B has to localise from the relations
-      alone, and from the intensity volume if the model takes one.
+    The three move together or the counterfactual is not the one it claims to be
+    - with a cache in play, rolling ``name_ids`` alone would leave channel ``i``
+    holding the mask of the structure it *used* to name.
     """
-    if mode not in OCCUPANCY_MODES:
-        raise ValueError(f"occupancy_mode must be one of {OCCUPANCY_MODES}, got {mode!r}")
-
-    labels: Tensor = batch["labels"]
-    batch_size, device, spatial = labels.shape[0], labels.device, labels.shape[1:]
-    if mode == "none":
-        return torch.zeros(batch_size, 1, *spatial, dtype=torch.float32, device=device)
-    if mode == "anchors-only":
-        if anchors is None:
-            anchors = masks_from(labels, batch["anchors"])
-        return anchors.amax(dim=1, keepdim=True)
-    union = full if full is not None else (labels > 0).float().unsqueeze(1)
-    if mode == "distractors-only":
-        return (union - masks_from(labels, batch["target"].unsqueeze(1))).clamp(0, 1)
-    return union
+    names = batch.get("name_ids", batch["anchors"] - 1)
+    probe = {**batch, "anchors": batch["anchors"].roll(shift, 1), "name_ids": names.roll(shift, 1)}
+    if batch.get("anchor_probability") is not None:
+        probe["anchor_probability"] = batch["anchor_probability"].roll(shift, 1)
+    return probe
 
 
-def resolve_stage_b_mode(stage_cfg: Mapping[str, Any]) -> str:
-    """``train.stage_b.mode``: ``predicted`` (default) or ``oracle``."""
-    raw = stage_cfg["mode"] if "mode" in stage_cfg else "predicted"
-    mode = str(raw)
-    if mode not in STAGE_B_MODES:
-        raise ValueError(f"train.stage_b.mode must be one of {STAGE_B_MODES}, got {mode!r}")
-    return mode
+def resolve_anchor_source(stage_cfg: Mapping[str, Any]) -> str:
+    """``train.stage_b.anchor_source``: ``predicted`` (the method) or ``oracle``."""
+    source = str(stage_cfg["anchor_source"] if "anchor_source" in stage_cfg else "predicted")
+    if source not in ANCHOR_SOURCES:
+        raise ValueError(f"anchor_source must be one of {ANCHOR_SOURCES}, got {source!r}")
+    return source
 
 
-def resolve_phase_a_checkpoint(
-    stage_cfg: Mapping[str, Any], override: Path | str | None = None
-) -> Path | None:
-    """The Stage A checkpoint Stage B should use, or ``None`` for ground truth.
+def resolve_segmenter(stage_cfg: Mapping[str, Any], override: Path | str | None = None) -> Path:
+    """The Stage A checkpoint Stage B is built around. Always required.
 
-    ``train.stage_b.mode`` defaults to ``predicted``, which *requires* a Stage A
-    checkpoint from ``train.stage_b.phase_a_checkpoint`` or the CLI
-    ``--segmenter``. Missing that path is an error. The only bypass is
-    ``mode: oracle``, which reads ground-truth anchors and occupancy and
-    ignores a leftover checkpoint path in the config.
-
-    ``override`` is the CLI ``--segmenter``. In predicted mode it wins over the
-    config path. In oracle mode it is rejected: pick one source.
+    Stage A is inside :class:`~src.models.StageB` and is what turns the three
+    names into masks, so there is no mode in which it is absent -
+    ``anchor_source: oracle`` replaces the *masks* it produces for a diagnostic,
+    not the module. ``override`` is the CLI ``--segmenter`` and wins.
     """
-    mode = resolve_stage_b_mode(stage_cfg)
-    if mode == "oracle":
-        if override is not None:
-            raise ValueError(
-                "train.stage_b.mode is 'oracle' (ground-truth anchors); "
-                "do not pass --segmenter. Set train.stage_b.mode: predicted "
-                "to use a Stage A checkpoint."
-            )
-        return None
     raw = override if override is not None else (
         stage_cfg["phase_a_checkpoint"] if "phase_a_checkpoint" in stage_cfg else None
     )
     if raw in (None, "", "null"):
         raise ValueError(
-            "Stage B mode is 'predicted' and needs a pretrained Stage A checkpoint. "
-            "Set train.stage_b.phase_a_checkpoint, pass --segmenter, or set "
-            "train.stage_b.mode: oracle to use ground-truth anchors."
+            "Stage B is built around a frozen Stage A. Set "
+            "train.stage_b.phase_a_checkpoint or pass --segmenter."
         )
     return Path(raw)
 
@@ -367,8 +434,15 @@ class Prediction:
     groups: list[list[str]]
     strata: list[dict[str, list[str]]] | None = None
     scales: list[Tensor] | None = None  # deep-supervision maps, coarse to fine
-    selection: Tensor | None = None  # [B, K] candidate logits, when the head is on
-    selection_target: Tensor | None = None  # [B] index of the true structure
+    keep: Tensor | None = None  # [B] 0 = dropped from every loss and every metric
+    valid: Tensor | None = None  # [B] null-head logits
+    valid_target: Tensor | None = None  # [B] 1 = the clauses name exactly one structure
+    centroid: Tensor | None = None  # [B, 3] predicted, world (x, y, z)
+    centroid_target: Tensor | None = None  # [B, 3] the structure's own centroid
+    field_centroid: Tensor | None = None  # [B, 3] first moment of where_raw
+    has_field: Tensor | None = None  # [B] whether where_raw has any mass at all
+    where_raw: Tensor | None = None
+    anchor_dice: Tensor | None = None  # [B, A] predicted anchors against ground truth
 
 
 @dataclass
@@ -379,7 +453,6 @@ class StageATask:
     vocab: Any
     loss_weights: Mapping[str, float] = field(default_factory=dict)
     name: str = "stage_a"
-    segmenter: None = None  # Stage A has no anchor source; keeps the two tasks alike
 
     def __call__(self, batch: Mapping[str, Any]) -> Prediction:
         output = self.model(batch["image"], batch["prompt_ids"], deep_supervision=self.model.training)
@@ -396,165 +469,210 @@ class StageATask:
         )
 
 
+def label_boundary(labels: Tensor) -> Tensor:
+    """``[B, D, H, W]`` -> ``[B, 1, D, H, W]``: 1 where a 6-neighbour has a different label.
+
+    No class channel and no target indicator - the map says *there is an edge
+    here*, never *whose*. It is a pretraining target for ``B`` and never an
+    inference input.
+    """
+    volume = labels.unsqueeze(1).float()
+    different = torch.zeros_like(volume)
+    for axis in range(2, 5):
+        for shift in (1, -1):
+            rolled = volume.roll(shift, dims=axis)
+            index = [slice(None)] * 5
+            index[axis] = 0 if shift == 1 else -1
+            rolled = rolled.clone()
+            rolled[tuple(index)] = volume[tuple(index)]  # replicate at the border
+            different = torch.maximum(different, (rolled != volume).float())
+    return different
+
+
+@dataclass
+class BoundaryTask:
+    """Pretrain ``B`` with objectives that carry no class id.
+
+    Three terms, all of which a structure Stage A has never seen would also
+    satisfy: put back cubes blanked out of ``I``; mark where two neighbouring
+    voxels differ in label; regress ``|grad I|``. The point is that ``B`` learns
+    *edges*, not *which named thing this is*, so the carver can draw a lesion.
+    """
+
+    model: BoundaryPretrainer
+    vocab: Any
+    loss_weights: Mapping[str, float] = field(default_factory=dict)
+    name: str = "boundary"
+
+    def __call__(self, batch: Mapping[str, Any]) -> Prediction:
+        image = batch["image"].float()
+        blanked, holes = self.model.blank(image)
+        heads = self.model(blanked)
+        self._image, self._holes = image, holes
+        boundary = label_boundary(batch["labels"])
+        # Reported as a segmentation of the boundary map: it is the term whose
+        # quality decides whether the carver has an edge to follow.
+        return Prediction(
+            logits=heads["boundary"], target=boundary,
+            groups=[["boundary"]] * image.shape[0],
+            scales=[heads["reconstruct"], heads["edge"]],
+        )
+
+    def loss(self, prediction: Prediction) -> Tensor:
+        weights = dict(self.loss_weights)
+        reconstruct, edge = prediction.scales
+        image, holes = self._image, self._holes
+        # Reconstruction is scored on the blanked voxels only; elsewhere it is
+        # a copy, which teaches nothing.
+        filled = (reconstruct.float() - image).abs() * holes
+        target_edge = self.model.edges(image)
+        return (
+            float(weights.get("boundary", 1.0))
+            * segmentation_loss(prediction.logits, prediction.target, 1.0, 1.0)
+            + float(weights.get("reconstruct", 1.0)) * filled.sum() / holes.sum().clamp(min=1.0)
+            + float(weights.get("edge", 0.5)) * (edge.float() - target_edge).abs().mean()
+        )
+
+
 @dataclass
 class StageBTask:
-    """Segment the relational target from one mask source.
+    """The relational model: image and three clauses in, one mask and a null logit out.
 
-    ``mode: predicted`` (default) requires a :class:`~src.models.StageA`
-    ``segmenter``; one forward produces both the encoder anchors and the
-    occupancy union. ``mode: oracle`` reads ground-truth labels and rejects a
-    segmenter. ``occupancy_mode`` then chooses which of that source's masks
-    are unioned: ``all``, ``anchors-only``, or ``none``.
+    The batch supplies the clauses, the label volume the losses need, and the
+    ``keep`` / ``valid`` flags ``ExampleDataset`` computed when it flipped a
+    direction. Nothing that identifies the target reaches :meth:`StageB.forward`:
+    the label volume is read *here*, to build a training target and to score, and
+    is never an argument to the model.
     """
 
     model: StageB
     vocab: Any
-    mode: str = "predicted"
-    segmenter: StageA | None = None
-    threshold: float = 0.5
-    occupancy_mode: str = "all"
-    selection_weight: float = 0.5
+    spacing: Sequence[float] = (1.0, 1.0, 1.0)
+    anchor_source: str = "predicted"
     loss_weights: Mapping[str, float] = field(default_factory=dict)
-    anchor_scores: list[float] = field(default_factory=list)
+    far_epsilon: float = 0.05
+    far_dilation: int = 8
+    field_centroid_on: str = "always"
+    name: str = "stage_b"
+    components: dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if self.occupancy_mode not in OCCUPANCY_MODES:
+        if self.anchor_source not in ANCHOR_SOURCES:
+            raise ValueError(f"anchor_source must be one of {ANCHOR_SOURCES}, got {self.anchor_source!r}")
+        if self.field_centroid_on not in FIELD_CENTROID_ON:
             raise ValueError(
-                f"occupancy_mode must be one of {OCCUPANCY_MODES}, got {self.occupancy_mode!r}"
+                f"field_centroid_on must be one of {FIELD_CENTROID_ON}, got {self.field_centroid_on!r}"
             )
-        self.mode = resolve_stage_b_mode({"mode": self.mode})
-        if self.occupancy_mode == "distractors-only" and self.mode != "oracle":
-            raise ValueError(
-                "occupancy_mode 'distractors-only' removes the target's own voxels, which needs "
-                "ground truth: it is a diagnostic and runs under mode 'oracle' only"
-            )
-        if self.mode == "oracle":
-            if self.segmenter is not None:
-                raise ValueError("Stage B mode is 'oracle'; do not pass a segmenter")
-            return
-        if self.segmenter is None:
-            raise ValueError("Stage B mode is 'predicted' and needs a Stage A segmenter")
-        if not isinstance(self.segmenter, StageA):
-            raise TypeError(f"segmenter must be a StageA, got {type(self.segmenter).__name__}")
-        if int(self.segmenter.config["vocab_size"]) != len(self.vocab):
-            raise ValueError(
-                f"Stage A vocab_size {self.segmenter.config['vocab_size']} "
-                f"!= Stage B vocab {len(self.vocab)}"
-            )
-        self.segmenter.eval()
-
-    @property
-    def name(self) -> str:
-        return "stage_b_predicted" if self.mode == "predicted" else "stage_b"
-
-    def source(self, batch: Mapping[str, Any]) -> tuple[Tensor, Tensor | None]:
-        """Anchor channels and, when needed, the full occupancy union. One source."""
-        needs_union = self.occupancy_mode in ("all", "distractors-only")
-        oracle = masks_from(batch["labels"], batch["anchors"])
-        if self.mode == "oracle":
-            full = (batch["labels"] > 0).float().unsqueeze(1) if needs_union else None
-            return oracle, full
-        image = batch["image"]
-        name_ids = batch["anchors"] - 1
-        if needs_union:
-            vocab_ids = torch.arange(len(self.vocab), device=image.device).unsqueeze(0).expand(image.shape[0], -1)
-            all_masks = self.segmenter.masks_for(image, vocab_ids, self.threshold)
-            predicted = _take_channels(all_masks, name_ids)
-            full = all_masks.amax(dim=1, keepdim=True)
-        else:
-            predicted = self.segmenter.masks_for(image, name_ids, self.threshold)
-            full = None
-        self.anchor_scores += dice_iou(predicted, oracle)[0].flatten().tolist()
-        self._candidates = all_masks if needs_union else None
-        return predicted, full
-
-    def candidates(self, batch: Mapping[str, Any], anchors: Tensor) -> Tensor | None:
-        """Stage A's per-structure masks, with the anchors zeroed.
-
-        ``source`` already segments the whole vocabulary whenever occupancy needs
-        a union, then collapses it with ``amax``; that discards exactly the
-        candidate identities the selection head needs, so it is kept instead of
-        recomputed. Under ``mode: oracle`` the candidates come from the labels,
-        which makes the head's ceiling measurable separately from Stage A's error.
-        """
-        if getattr(self.model, "selection", False) is not True:
-            return None
-        if self.mode == "oracle":
-            labels = batch["labels"]
-            ids = torch.arange(1, len(self.vocab) + 1, device=labels.device)
-            masks = (labels.unsqueeze(1) == ids.view(1, -1, *([1] * (labels.dim() - 1)))).float()
-        elif getattr(self, "_candidates", None) is not None:
-            masks = self._candidates
-        else:
-            image = batch["image"]
-            vocab_ids = torch.arange(len(self.vocab), device=image.device).unsqueeze(0).expand(image.shape[0], -1)
-            masks = self.segmenter.masks_for(image, vocab_ids, self.threshold)
-        # The anchors are the given, not the answer - the same reason they are
-        # subtracted from occupancy. Leaving them in lets the head "choose" one.
-        return (masks * (1 - anchors.amax(dim=1, keepdim=True))).clamp(0, 1)
+        self.model.segmenter.eval()
 
     def __call__(self, batch: Mapping[str, Any]) -> Prediction:
-        anchor_masks, full = self.source(batch)
-        occupancy = occupancy_from(
-            batch, self.occupancy_mode, anchors=anchor_masks, full=full,
-        )
-        # The anchor names the prompt uses default to the ones the channels hold.
-        # A counterfactual overrides `name_ids` to break exactly that link.
+        labels = batch["labels"]
         name_ids = batch.get("name_ids", batch["anchors"] - 1)
-        # The intensity volume, when the model was built to take one. It is the
-        # scene as acquired - never the labels, and never anything derived from
-        # the target - so it says what is there without saying which one.
-        image = batch["image"] if self.model.config.get("image") else None
-        candidates = self.candidates(batch, anchor_masks)
+        truth = masks_from(labels, batch["anchors"])
+        anchors = truth if self.anchor_source == "oracle" else batch.get("anchor_probability")
         output = self.model(
-            anchor_masks, batch["direction_ids"], name_ids, occupancy, image, candidates
+            batch["image"], batch["direction_ids"], name_ids,
+            anchors=anchors, boundary_image=batch.get("boundary_image"),
         )
-        target = masks_from(batch["labels"], batch["target"].unsqueeze(1))
+
+        keep = batch["keep"].float()
+        valid_target = batch["valid"].float()
+        # An empty prompt has no structure, so its mask target is the empty
+        # volume - built by zeroing, never by asking for label 0, which is the
+        # background and would be almost the whole head.
+        target = masks_from(labels, batch["target"].unsqueeze(1)) * valid_target.reshape(-1, 1, 1, 1, 1)
+        centroid_target, _ = mask_centroid_world(target, self.spacing)
+        field_centroid, field_total = mask_centroid_world(output.where_raw, self.spacing)
+
         strata = [
             {
                 "target": [name],
-                "anchor": anchors,
+                "anchor": anchor_names,
                 "direction": directions,
                 "slot": [f"slot{i + 1}:{d}" for i, d in enumerate(directions)],
             }
-            for name, anchors, directions in zip(batch["target_name"], batch["anchor_names"], batch["directions"])
+            for name, anchor_names, directions in zip(
+                batch["target_name"], batch["anchor_names"], batch["directions"]
+            )
         ]
         return Prediction(
             logits=output.logits, target=target,
             groups=[[name] for name in batch["target_name"]], strata=strata,
-            selection=output.selection,
-            selection_target=batch["target"] - 1 if output.selection is not None else None,
+            keep=keep, valid=output.valid, valid_target=valid_target,
+            centroid=output.centroid, centroid_target=centroid_target,
+            field_centroid=field_centroid, has_field=(field_total > 0).float(),
+            where_raw=output.where_raw,
+            anchor_dice=dice_iou(output.anchors, truth)[0],
         )
 
     def loss(self, prediction: Prediction) -> Tensor:
-        loss = segmentation_loss(prediction.logits, prediction.target, **dict(self.loss_weights))
-        if prediction.selection is None or prediction.selection_target is None:
-            return loss
-        # Cross-entropy over Stage A's candidates. This is the class-agnostic
-        # half of the objective: it supervises *which structure*, using a
-        # computation with no per-class parameters, so it is the part that can
-        # transfer to a target the decoder was never trained to draw.
-        scores = prediction.selection.float()
-        valid = torch.isfinite(scores).any(dim=-1)
-        if not bool(valid.any()):
-            return loss
-        picked = F.cross_entropy(
-            scores[valid].nan_to_num(neginf=-1e4), prediction.selection_target[valid]
-        )
-        return loss + float(self.selection_weight) * picked
+        """§5's table. Every term is per-sample, and ``keep`` is how one is dropped.
+
+        The components are kept in :attr:`components` and logged per epoch. Six
+        terms on different scales - a Dice in [0, 1], a BCE in nats, two offsets
+        in millimetres - cannot be balanced by reading the total, and a run whose
+        loss is 80% heatmap is training a different model from the one intended.
+        """
+        weights, keep = dict(self.loss_weights), prediction.keep
+        valid = prediction.valid_target
+        # The heatmap carries two targets and the mask loss reaches neither: the
+        # structure's own centroid when there is a structure, and the field's own
+        # centre always - which is what keeps a centroid when the mask is empty.
+        offset = lambda a, b: F.smooth_l1_loss(a.float(), b.float(), reduction="none", beta=2.0).sum(-1)
+        terms = {
+            "mask": segmentation_loss(
+                prediction.logits, prediction.target,
+                float(weights.get("dice", 1.0)), float(weights.get("bce", 1.0)), weight=keep,
+            ),
+            "null_bce": float(weights.get("null_bce", 0.2)) * weighted_mean(
+                F.binary_cross_entropy_with_logits(
+                    prediction.valid.float(), valid, reduction="none"
+                ),
+                keep,
+            ),
+            "centroid": float(weights.get("centroid", 0.02)) * weighted_mean(
+                offset(prediction.centroid, prediction.centroid_target), keep * valid
+            ),
+            "field_centroid": float(weights.get("field_centroid", 0.01)) * weighted_mean(
+                offset(prediction.centroid, prediction.field_centroid),
+                keep * prediction.has_field
+                * (1.0 if self.field_centroid_on == "always" else 1.0 - valid),
+            ),
+            # L_far is the only spatial penalty, and only on a valid prompt. On an
+            # impossible one the empty-mask loss is already the penalty everywhere.
+            "far": float(weights.get("far", 0.2)) * weighted_mean(
+                far_mass(
+                    torch.sigmoid(prediction.logits), prediction.where_raw,
+                    self.far_epsilon, self.far_dilation,
+                ),
+                keep * valid,
+            ),
+        }
+        self.components = {k: float(v.detach()) for k, v in terms.items()}
+        return sum(terms.values())
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 def build_optimizer(model: nn.Module, cfg: Mapping[str, Any]) -> torch.optim.Optimizer:
-    """``{name, lr, weight_decay}`` -> an optimiser. Only ``adamw`` is supported."""
+    """``{name, lr, weight_decay}`` -> an optimiser. Only ``adamw`` is supported.
+
+    A model that declares ``trainable_parameters`` hands over only those: Stage B
+    carries the frozen Stage A as a submodule, and the relational loss must not
+    flow back into it.
+    """
     name = str(cfg.get("name", "adamw")).lower()
     if name != "adamw":
         raise ValueError(f"optimizer.name must be 'adamw', got {name!r}")
-    return torch.optim.AdamW(
-        model.parameters(), lr=float(cfg["lr"]), weight_decay=float(cfg.get("weight_decay", 0.0))
-    )
+    lr = float(cfg["lr"])
+    if hasattr(model, "parameter_groups"):
+        parameters = model.parameter_groups(lr)
+    elif hasattr(model, "trainable_parameters"):
+        parameters = model.trainable_parameters()
+    else:
+        parameters = model.parameters()
+    return torch.optim.AdamW(parameters, lr=lr, weight_decay=float(cfg.get("weight_decay", 0.0)))
 
 
 def build_scheduler(
@@ -581,10 +699,9 @@ class EarlyStopping:
     """Stop when the metric has not improved by ``min_delta`` for ``patience`` epochs.
 
     ``patience = 0`` disables it. The first value is always an improvement, so a
-    run cannot stop before it has a baseline. Note this is a *separate* notion of
+    run cannot stop before it has a baseline. This is a *separate* notion of
     "best" from the one that decides checkpointing: a rise smaller than
-    ``min_delta`` still saves a better checkpoint, it just does not reset the
-    wait.
+    ``min_delta`` still saves a better checkpoint, it just does not reset the wait.
     """
 
     patience: int = 0
@@ -593,7 +710,6 @@ class EarlyStopping:
     waited: int = field(default=0, init=False)
 
     def update(self, metric: float) -> bool:
-        """Record ``metric``; returns True when training should stop."""
         if self.patience <= 0:
             return False
         if metric > self.best + self.min_delta:
@@ -629,7 +745,13 @@ def git_revision() -> str | None:
 
 
 def save_checkpoint(path: Path | str, model: nn.Module, meta: Mapping[str, Any]) -> Path:
-    """Weights plus everything needed to rebuild and trace the model."""
+    """Weights plus everything needed to rebuild and trace the model.
+
+    ``model.config`` holds the architecture ``load_model`` reconstructs from;
+    ``meta`` holds the training schedule that produced these weights -
+    ``flip_probability`` and the loss weights among them. Both are mirrored into
+    a ``.json`` sidecar, so a run's settings are readable without torch.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -649,7 +771,8 @@ def save_checkpoint(path: Path | str, model: nn.Module, meta: Mapping[str, Any])
 def load_model(path: Path | str, device="cpu") -> nn.Module:
     """Rebuild a model from its checkpoint; the architecture comes from the file."""
     payload = torch.load(path, map_location=device, weights_only=False)
-    model = {"StageA": StageA, "StageB": StageB}[payload["kind"]](**payload["model"])
+    registry = {"StageA": StageA, "StageB": StageB, "BoundaryPretrainer": BoundaryPretrainer}
+    model = registry[payload["kind"]](**payload["model"])
     model.load_state_dict(payload["state_dict"])
     return model.to(device).eval()
 
@@ -663,21 +786,20 @@ def load_stage_a(path: Path | str, device="cpu") -> StageA:
 
 
 class Trainer:
-    """One loop for both stages: schedule, AMP, metrics, best-Dice checkpointing.
+    """One loop for every stage: schedule, AMP, metrics, best-Dice checkpointing.
 
     Args:
         task: what turns a batch into a :class:`Prediction` and a loss.
         cfg: the ``train`` block - seed, device, precision, batch/accum, and the
             ``early_stopping`` sub-block.
         stage: that stage's ``{epochs, optimizer, scheduler}`` block.
-        evaluation: the ``evaluation`` block - which metrics to compute and which
-            strata to report.
+        evaluation: the ``evaluation`` block - which metrics and which strata.
         logging: the ``logging`` block - backend and its settings.
     """
 
     def __init__(
         self,
-        task: StageATask | StageBTask,
+        task: StageATask | StageBTask | BoundaryTask,
         train_loader: DataLoader,
         val_loader: DataLoader | None,
         cfg: Mapping[str, Any],
@@ -709,12 +831,16 @@ class Trainer:
         self.stopper = EarlyStopping(
             patience=int(stopping.get("patience", 0)), min_delta=float(stopping.get("min_delta", 0.0))
         )
+        self.extra_loaders: dict[str, DataLoader] = {}
+        #: A smaller loader for `prompt_dependence`, which costs five passes.
+        #: The per-epoch probe is a trend, not a reported number - those come
+        #: from `scripts/evaluate.py` over the whole split.
+        self.probe_loader: DataLoader | None = None
         self.history: list[dict[str, Any]] = []
         self.best = -1.0
 
     @property
     def wants_hausdorff(self) -> bool:
-        """Whether ``evaluation.metrics`` asks for the one metric that costs anything."""
         return "hausdorff" in self.evaluation.get("metrics", ())
 
     def to_device(self, batch: Mapping[str, Any]) -> dict[str, Any]:
@@ -727,7 +853,6 @@ class Trainer:
         """Batch bar for a live run; silent when ``verbose`` is off (tests, scripts)."""
         if not self.verbose:
             return iterable
-        # Forced on even under ``tee``: tqdm would otherwise see a pipe and hide.
         return tqdm(iterable, desc=desc, leave=False, dynamic_ncols=True, mininterval=1.0, unit="batch")
 
     def train_epoch(self, epoch: int) -> dict[str, float]:
@@ -736,6 +861,7 @@ class Trainer:
         accumulation = max(int(self.cfg["accum"]), 1)
         self.optimizer.zero_grad(set_to_none=True)
         total_loss, total_dice, steps = 0.0, 0.0, 0
+        components: dict[str, float] = {}
         batches = self._progress(self.train_loader, desc=f"epoch {epoch} train")
         for index, raw in enumerate(batches):
             batch = self.to_device(raw)
@@ -748,10 +874,11 @@ class Trainer:
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
             with torch.no_grad():
-                total_dice += float(
-                    dice_iou(torch.sigmoid(prediction.logits.float()), prediction.target)[0].mean()
-                )
+                dice = dice_iou(torch.sigmoid(prediction.logits.float()), prediction.target)[0]
+                total_dice += float(weighted_mean(dice, prediction.keep))
             total_loss += float(loss.detach())
+            for key, value in getattr(self.task, "components", {}).items():
+                components[key] = components.get(key, 0.0) + value
             steps += 1
             if hasattr(batches, "set_postfix"):
                 batches.set_postfix(loss=f"{total_loss / steps:.3f}", dice=f"{total_dice / steps:.3f}", refresh=False)
@@ -759,7 +886,11 @@ class Trainer:
             self.scaler.step(self.optimizer)
             self.scaler.update()
             self.optimizer.zero_grad(set_to_none=True)
-        return {"loss": total_loss / max(steps, 1), "dice": total_dice / max(steps, 1)}
+        return {
+            "loss": total_loss / max(steps, 1),
+            "dice": total_dice / max(steps, 1),
+            **{f"loss_{k}": v / max(steps, 1) for k, v in components.items()},
+        }
 
     @torch.no_grad()
     def evaluate(
@@ -775,99 +906,108 @@ class Trainer:
         if with_hausdorff is None:
             with_hausdorff = self.wants_hausdorff
         self.model.eval()
-        if hasattr(self.task, "anchor_scores"):
-            self.task.anchor_scores.clear()
         metrics, total_loss, steps = Metrics(), 0.0, 0
         percentile = float(self.evaluation.get("hausdorff_percentile", 95.0))
-        picked = correct = 0
+        anchor_dice: list[float] = []
+        null_scores: list[tuple[float, float]] = []
         for raw in self._progress(loader, desc=desc):
             batch = self.to_device(raw)
             with self._autocast():
                 prediction = self.task(batch)
             total_loss += float(self.task.loss(prediction))
             steps += 1
-            if prediction.selection is not None and prediction.selection_target is not None:
-                choice = prediction.selection.float().nan_to_num(neginf=-1e4).argmax(dim=-1)
-                correct += int((choice == prediction.selection_target).sum())
-                picked += int(choice.numel())
+            extra = {}
+            if prediction.centroid is not None:
+                # Localisation, reported apart from Dice. Dice fuses "did it
+                # point at the right structure" with "did it outline it", and
+                # those two transfer differently.
+                error = (prediction.centroid - prediction.centroid_target).norm(dim=-1)
+                extra["centroid_error"] = torch.where(
+                    prediction.valid_target > 0, error, torch.full_like(error, float("nan"))
+                ).tolist()
+            if prediction.anchor_dice is not None:
+                anchor_dice += prediction.anchor_dice.flatten().tolist()
+            if prediction.valid is not None:
+                null_scores += list(
+                    zip(prediction.valid.float().tolist(), prediction.valid_target.tolist())
+                )
             metrics.update(
                 prediction.logits, prediction.target, prediction.groups,
                 strata=prediction.strata, threshold=float(self.cfg.get("threshold", 0.5)),
                 spacing=self.spacing if with_hausdorff else None, percentile=percentile,
+                keep=prediction.keep, extra=extra or None,
             )
         summary = metrics.summary(self.evaluation.get("stratify_by"))
         summary["loss"] = total_loss / max(steps, 1)
-        scores = getattr(self.task, "anchor_scores", [])
-        if scores:
-            summary["anchor_dice"] = sum(scores) / len(scores)
-        if picked:
-            # Localisation, reported apart from Dice. Dice fuses "did it point at
-            # the right structure" with "did it outline it"; those transfer
-            # differently, and conflating them is what made the val curve
-            # unreadable - 0.07 Dice was 31% localisation, not bad delineation.
-            summary["selection_accuracy"] = correct / picked
+        if anchor_dice:
+            summary["anchor_dice"] = sum(anchor_dice) / len(anchor_dice)
+        if null_scores:
+            summary.update(null_summary(null_scores))
         return summary
 
     @torch.no_grad()
     def prompt_dependence(self, loader: DataLoader | None = None) -> dict[str, float]:
-        """How far Dice falls when one clause asks for the opposite side.
+        """How far Dice falls when the prompt is altered in four different ways.
 
         The only signal that separates the two ways val Dice can rise. A model
-        reading the prompt must lose Dice here; one that has found a shortcut -
-        anchor identity, proximity - will not move. `configs/config.yaml` has
-        listed these probes since the beginning, but nothing in the training loop
-        ever ran them, so a run could climb for thirty epochs on a shortcut and
-        report nothing unusual.
+        reading the prompt must lose Dice under ``flip_direction``,
+        ``permute_channels`` and ``permute_clauses``.
 
-        `permute_both` is the control: it preserves every relation, so it must
-        not move. If it ever does, something has put information back into slot
-        order (check `select_anchors` and `ExampleDataset._augment`).
+        ``permute_both`` is the control: it preserves every relation, so it must
+        not move. Note what it can still detect *here*: ``where_raw`` is a product
+        and therefore exactly permutation-invariant, so the only order dependence
+        left in the model is the carver's ``cat``. A flat control is now a much
+        weaker statement than it was under the attention architecture.
         """
-        loader = loader or self.val_loader
+        loader = loader or self.probe_loader or self.val_loader
         if loader is None or not isinstance(self.task, StageBTask):
             return {}
         from src.geometry import DIRECTIONS, OPPOSITE
 
         self.model.eval()
         opposites = torch.tensor([DIRECTIONS.index(OPPOSITE[d]) for d in DIRECTIONS])
-        base, flipped, control = [], [], []
+        scores: dict[str, list[float]] = {
+            k: [] for k in ("base", "flip_direction", "permute_channels", "permute_clauses", "permute_both")
+        }
         for raw in self._progress(loader, desc="probes"):
             batch = self.to_device(raw)
             with self._autocast():
                 reference = self.task(batch)
-                target = reference.target
-                base += dice_iou(torch.sigmoid(reference.logits.float()), target)[0].flatten().tolist()
-
+                target, keep = reference.target, reference.keep
                 directions = batch["direction_ids"]
                 turned = directions.clone()
                 turned[:, 0] = opposites.to(directions.device)[turned[:, 0]]
-                probe = {**batch, "direction_ids": turned}
-                flipped += dice_iou(
-                    torch.sigmoid(self.task(probe).logits.float()), target
-                )[0].flatten().tolist()
-
-                rolled = {
-                    **batch,
-                    "anchors": batch["anchors"].roll(1, dims=1),
-                    "name_ids": (batch["anchors"] - 1).roll(1, dims=1),
-                    "direction_ids": directions.roll(1, dims=1),
+                rolled = roll_anchors(batch, 1)
+                probes = {
+                    "base": batch,
+                    "flip_direction": {**batch, "direction_ids": turned},
+                    # The masks move, the words stay: channel i stops being the
+                    # structure clause i names.
+                    "permute_channels": rolled,
+                    "permute_clauses": {**batch, "direction_ids": directions.roll(1, 1)},
+                    "permute_both": {**rolled, "direction_ids": directions.roll(1, 1)},
                 }
-                control += dice_iou(
-                    torch.sigmoid(self.task(rolled).logits.float()), target
-                )[0].flatten().tolist()
-        if not base:
+                for key, probe in probes.items():
+                    logits = reference.logits if key == "base" else self.task(probe).logits
+                    dice = dice_iou(torch.sigmoid(logits.float()), target)[0].flatten()
+                    scores[key] += dice[keep > 0].tolist() if keep is not None else dice.tolist()
+        if not scores["base"]:
             return {}
         mean = lambda xs: sum(xs) / len(xs)
-        return {
-            "flip_direction_drop": mean(base) - mean(flipped),
-            "permute_both_drop": mean(base) - mean(control),
-        }
+        base = mean(scores["base"])
+        return {f"{key}_drop": base - mean(values) for key, values in scores.items() if key != "base"}
 
     def fit(self) -> list[dict[str, Any]]:
         seed_all(int(self.cfg["seed"]))
-        parameters = sum(p.numel() for p in self.model.parameters()) / 1e6
+        trainable = sum(
+            p.numel() for group in self.optimizer.param_groups for p in group["params"]
+        ) / 1e6
+        total = sum(p.numel() for p in self.model.parameters()) / 1e6
         if self.verbose:
-            print(f"{self.task.name}: {parameters:.2f}M parameters on {self.device} ({self.cfg['precision']})")
+            print(
+                f"{self.task.name}: {trainable:.2f}M trainable of {total:.2f}M "
+                f"on {self.device} ({self.cfg['precision']})"
+            )
         log = (self.out_dir / "metrics.jsonl").open("w", encoding="utf-8")
         run = _logger(self.logging, self.out_dir.name, {**self.cfg, **self.stage})
         try:
@@ -875,7 +1015,9 @@ class Trainer:
                 started = time.perf_counter()
                 train = self.train_epoch(epoch)
                 self.schedule.step()
-                val = self.evaluate(desc="val")
+                # Hausdorff costs a surface extraction and a cdist per sample and
+                # selects nothing; the final pass in `scripts/train.py` reports it.
+                val = self.evaluate(desc="val", with_hausdorff=False)
                 record = {
                     "epoch": epoch,
                     "train": train,
@@ -884,28 +1026,16 @@ class Trainer:
                     "seconds": round(time.perf_counter() - started, 2),
                 }
                 record["val"].update(self.prompt_dependence())
-                transfer = getattr(self, "transfer_loader", None)
-                if transfer is not None:
-                    scored = self.evaluate(transfer, with_hausdorff=False, desc="transfer")
-                    record["transfer"] = {
-                        k: v for k, v in scored.items() if k not in ("by_name", "strata")
-                    }
+                for name, loader in self.extra_loaders.items():
+                    scored = self.evaluate(loader, with_hausdorff=False, desc=name)
+                    record[name] = {k: v for k, v in scored.items() if k not in ("by_name", "strata")}
                 self.history.append({**record, "val_full": val})
                 log.write(json.dumps(record) + "\n")
                 log.flush()
                 if run is not None:
                     run.log(_flatten(record), step=epoch)
                 if self.verbose:
-                    print(
-                        f"  epoch {epoch:>3}  loss {train['loss']:.4f}  train dice {train['dice']:.4f}"
-                        f"  val dice {val.get('dice', 0.0):.4f}"
-                        + (f"  sel {val['selection_accuracy']:.3f}" if "selection_accuracy" in val else "")
-                        + (f"  flip {record['val']['flip_direction_drop']:+.3f}"
-                           if "flip_direction_drop" in record["val"] else "")
-                        + (f"  transfer {record['transfer'].get('dice', 0.0):.4f}"
-                           if "transfer" in record else "")
-                        + f"  ({record['seconds']}s)"
-                    )
+                    print(self._line(epoch, train, val, record))
                 dice = val.get("dice", 0.0)
                 # Checkpointing and early stopping use different notions of
                 # "better": any rise is worth keeping, but only a rise of more
@@ -928,6 +1058,24 @@ class Trainer:
         (self.out_dir / "history.json").write_text(json.dumps(self.history, indent=2) + "\n", encoding="utf-8")
         return self.history
 
+    def _line(self, epoch, train, val, record) -> str:
+        parts = [
+            f"  epoch {epoch:>3}  loss {train['loss']:.4f}  train dice {train['dice']:.4f}",
+            f"  val dice {val.get('dice', 0.0):.4f}",
+        ]
+        for key, label, fmt in (
+            ("centroid_error", "centr", "{:.2f}"), ("null_auc", "null", "{:.3f}"),
+        ):
+            if key in val:
+                parts.append(f"  {label} {fmt.format(val[key])}")
+        for key in ("flip_direction_drop", "permute_both_drop"):
+            if key in record["val"]:
+                parts.append(f"  {key.split('_')[0][:4]} {record['val'][key]:+.3f}")
+        for name in self.extra_loaders:
+            if name in record:
+                parts.append(f"  {name} {record[name].get('dice', 0.0):.4f}")
+        return "".join(parts) + f"  ({record['seconds']}s)"
+
     def _meta(self, epoch: int, metrics: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "stage": self.task.name,
@@ -936,6 +1084,29 @@ class Trainer:
             "metrics": {k: v for k, v in metrics.items() if k != "strata"},
             "config": {**self.cfg, "stage": self.stage, "evaluation": self.evaluation},
         }
+
+
+def null_summary(scores: Sequence[tuple[float, float]]) -> dict[str, float]:
+    """Accuracy and AUC of the null head, plus the rate it calls a prompt empty.
+
+    The AUC is what matters: ``scripts/gate_mapper.py`` measures the ceiling that
+    ``where_mass`` alone imposes on this head, and a trained value at that ceiling
+    means the head is working as well as its four inputs permit - not that the
+    architecture is sound.
+    """
+    logits = np.array([s for s, _ in scores])
+    labels = np.array([t for _, t in scores])
+    positive, negative = logits[labels > 0], logits[labels <= 0]
+    summary = {
+        "null_accuracy": float(((logits > 0) == (labels > 0)).mean()),
+        "null_rate": float((logits <= 0).mean()),
+    }
+    if positive.size and negative.size:
+        summary["null_auc"] = float(
+            (positive[:, None] > negative[None, :]).mean()
+            + 0.5 * (positive[:, None] == negative[None, :]).mean()
+        )
+    return summary
 
 
 def _flatten(record: Mapping[str, Any], prefix: str = "") -> dict[str, float]:

@@ -226,11 +226,9 @@ def subject_has_examples(
     vocab: Vocabulary,
     spacing: Sequence[float],
     n_anchors: int,
-    *,
-    pool: int | None = None,
 ) -> bool:
     """True when the remapped scene supports at least one relational example."""
-    return bool(build_examples("probe", labels, vocab, spacing, n_anchors, pool=pool))
+    return bool(build_examples("probe", labels, vocab, spacing, n_anchors))
 
 
 def download_subject(

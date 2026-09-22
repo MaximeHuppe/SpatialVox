@@ -1,62 +1,36 @@
 # The whole project's configuration. Override any leaf from the command line:
 #   scripts/train.py b --set train.stage_b.optimizer.lr=1e-4
 #
-# Every key here is read by the code. The defaults reproduce the runs on
-# exp/realistic-appearance; anything marked "reference:" is load-bearing for that,
-# and changing it makes a new experiment rather than a rerun.
+# Every key here is read by the code, and nothing in `src/` hard-codes a value
+# that lives here. The architecture is `docs/proposal/relational_architecture.md`;
+# every constant that departs from the value that document starts from is marked
+# "measured:" and is justified in `docs/proposal/deviations.md`.
 
 data:
   root: data/mri            # corpus directory: images, labels, manifests, vocabulary
-  resolution: 128            # cube side; must match the corpus and model.bottleneck
-  spacing: [1.0, 1.0, 1.0]   # world units per voxel, ordered (x, y, z)
-  n_anchors: 3               # relations per prompt, and anchor mask channels
-  anchor_pool: 3             # number of nearest candidates to draw from for anchors
-  margin: 2                  # voxels every structure must keep from the border
+  resolution: 128            # cube side the importer writes; must match the corpus
+  n_anchors: 3               # clauses per prompt, and anchor mask channels
   normalize: zscore-brain    # none | zscore | zscore-brain. `zscore` uses whole-volume
                              # statistics; with mri.apply_brainmask 66.5% of the volume is
                              # exact zero, which puts tissue at +1.35 sigma with a 0.52 spread
                              # that drifts per subject. `zscore-brain` measures over the brain.
 
-  # How a prompt's anchors are chosen. `target-first` takes the `anchor_pool`
-  # nearest structures to the target and draws `n_anchors` of them - which makes
-  # the anchor identities a name tag for the target: on fixed anatomy the
-  # unordered anchor set alone recovers the target 98.9% of the time, while
-  # solving the conjunction is right 94.5% of the time, so ignoring the prompt
-  # strictly beats reading it. No pool width inverts that.
-  # `anchor-first` fixes the triple first and keeps the targets it determines
-  # uniquely: P(target|anchors) drops to 42.3%, the conjunction is unique by
-  # construction, and the prompt-blind floor falls from 0.800 to 0.205.
-  selection: anchor-first    # target-first | anchor-first
-  triples: 60               # anchor-first: candidate triples drawn per scene
-  locality: 8                # anchor-first: draw the triple from the k nearest a seed,
-                             # so clauses name landmarks a reader would name together
-  unique_only: true          # drop examples whose clauses describe more than one structure
-  shuffle_clauses: true      # randomise slot order. false reproduces the pre-dbc1e0c
-                             # ordering leak, which was worth ~0.11 Dice - never for a real run.
+  # Prompts are generated anchor-first: the landmark triple is fixed, then the
+  # targets it determines uniquely are kept. Picking the anchors *nearest the
+  # target* instead made the anchor identities a name tag - on fixed anatomy the
+  # unordered anchor set alone recovered the target 98.9% of the time against
+  # 94.5% for solving the conjunction, so ignoring the prompt strictly beat
+  # reading it. That generator is gone rather than configurable.
+  triples: 60                # candidate triples drawn per scene
+  locality: 8                # draw the triple from the k nearest a seed, so clauses
+                             # name landmarks a reader would name together
+  shuffle_clauses: true      # randomise slot order. false stores the distance ranking in
+                             # the slot index, which was worth ~0.11 Dice - never for a real run.
 
 
-synthetic:
-  scenes: {train: 400, val: 50, test: 50}
-  seeds: {train: 1000000, val: 2000000, test: 3000000}   # disjoint per split
-
-  packing:
-    max_object_attempts: 200   # placements tried per structure before giving up
-    max_scene_attempts: 50     # whole-scene retries, each with a fresh seed
-
-  appearance:
-    background: [0.12, 0.04]   # mean, std of the noise floor
-    structure: [0.45, 0.75]    # one shared, overlapping range of structure means
-    class_bias: 0.04           # small T1-like per-class offset; still overlapping
-    jitter: 0.05               # per-structure draw around that offset
-    noise: 0.03                # intra-structure noise
-    blur: 0.6                  # voxels; makes edges partial-volume
-
-
-# Stage B target-class split. Every name stays in the vocabulary (and may be an
-# anchor) in every split; only supervision-as-target is restricted.
-# MRI: compact grey-matter nuclei, mirror-closed by type, size-extremes in train
-# (accumbens, thalamus). Ventricles and the brainstem are vocab-only landmarks.
-# Synthetic generation ignores this block when the names are not primitives.
+# Stage B target-class split. Every name stays in the vocabulary and may be an
+# anchor in every split; only supervision-as-target is restricted.
+# `train` selects `best.pt`. `val` and `test` are scored and never selected on.
 targets:
   train: [Left-Thalamus, Right-Thalamus, Left-Pallidum, Right-Pallidum,
           Left-Amygdala, Right-Amygdala, Left-Accumbens, Right-Accumbens]
@@ -64,11 +38,11 @@ targets:
   test:  [Left-Hippocampus, Right-Hippocampus]
 
 
-# Real MRI — the corpus this project trains on. `scripts/import_mri.py` writes
+# Real MRI - the corpus this project trains on. `scripts/import_mri.py` writes
 # `scenes/<id>/{image,labels}.nii.gz`, the manifests and the vocabulary, honouring
 # every prompt knob in the `data:` block above. Unlisted FreeSurfer / dense ids
 # become background. To change a prompt knob afterwards use
-# `scripts/rebuild_manifests.py` — seconds, no volumes rewritten.
+# `scripts/rebuild_manifests.py` - seconds, no volumes rewritten.
 mri:
   source: /home/imag2/Documents/IMAG2/HCP
   output: data/mri
@@ -109,74 +83,127 @@ mri:
     Right-VentralDC:         {fs: 60, dense: 32}
 
 
-
 model:
-  encoder_channels: [32, 64, 128, 256]    # one width per scale; 128³ needs the extra 256 so the bottleneck stays 8³
-  bottleneck: 16                                # bottleneck dimension of the encoder
-  token_dim: 256                               # dimension of the token embeddings (textual and spatial)
-  num_heads: 4                                 # number of attention heads (heads = token_dim / head_dim)
-  intersection_hidden: 256                     # width inside Stage B's intersection block
-  stage_b_image: true                          # Stage B sees the intensity volume at its decoder,
-                                               # resampled per scale. Off = the pre-image architecture,
-                                               # where an empty occupancy left it unable to see the scene.
-  stage_b_selection: true                      # Stage B also scores Stage A's candidate masks and is
-                                               # supervised on which one the prompt describes. The dense
-                                               # head learns a silhouette per class, which is why
-                                               # localisation is 100% on trained classes and 31% on unseen
-                                               # ones; selection has no per-class parameters, so it is the
-                                               # half of the objective that can transfer.
-  prior_foreground: 0.0016                     # expected foreground fraction; initialises the head bias
-  deep_supervision: [0.1, 0.3, 0.6]     # Stage A loss weights per decoder scale, coarse to fine (4 scales at 128³)
+  # Stage A: the promptable segmenter. Trained beforehand on every name that may
+  # be an anchor, then frozen inside Stage B. These widths are the ones
+  # `runs/phase-a/current` was trained with; a checkpoint carries its own
+  # architecture, so this block only matters when Stage A is retrained.
+  stage_a:
+    encoder_channels: [32, 64, 128, 256, 256]   # one width per scale; five take 128 to 8
+    bottleneck: 8                               # checked against the width list, not assumed
+    token_dim: 256                              # must equal the last encoder width
+    num_heads: 4
+    prior_foreground: 0.0016                    # expected foreground fraction; initialises the head bias
+    deep_supervision: [0.05, 0.1, 0.25, 0.6]    # loss weight per decoder scale, coarse to fine
 
+  # Stage B: the relational model. No name, pair or slot embedding; no occupancy;
+  # no coordinate grid; no candidate list.
+  stage_b:
+    mapper:
+      tau: 0.5              # world units (the corpus is 1.25 mm/voxel), the ONLY geometric
+                            # constant. measured: the proposal starts at 2.0, where only 65%
+                            # of target centroids clear `where_raw > 0.5`; at 0.5 it is 97.4%
+                            # (scripts/gate_mapper.py). §2 makes that fraction the gate.
+      min_mass: 1.0e-6      # reject an anchor Stage A failed to find, as a fraction of the
+                            # volume. measured: the smallest mass a real structure gets from
+                            # `runs/phase-a/current` is 3.2e-6, and the proposal's 1e-3 would
+                            # reject every structure in the vocabulary.
+    boundary_widths: [16, 32, 32]   # B(I): three stages at 128/64/32 and back. Image only.
+    carver:
+      width: 16                   # "two 16-channel blocks, stride-2 stem"
+      blocks: 2
+      full_resolution_skip: true  # let the final 1x1 see B(I) at 128^3. Off = the literal
+                                  # reading of §4, where the stride-2 stem is the only path
+                                  # and the mask is a trilinear upsample of a 64^3 map.
+    use_image: true               # the method. false is the §7 prompt-only carver - B(I) removed,
+                                  # anchors and fields kept - which `scripts/train.py b
+                                  # --prompt-only` sets for that ablation.
+    additive_prior: false         # the ablation `logits = residual + alpha * logit(where_raw)`
+    alpha: 0.35                   # its one scalar, with no other input
+    background_logit: -10.0       # what "logits = background where A_i > 0.5" writes. Finite,
+                                  # because BCE against a target that disagrees must stay finite.
+    prior_foreground: 0.0016
 
 
 train:
   seed: 20260915
   device: auto                                                    # auto -> cuda, then mps, then cpu
   precision: bf16                                                 # fp32 | bf16 | fp16 (fp16 adds a gradient scaler)
-  batch_size: 4                                                   # 128³ is 8× the voxels of 64³; keep the effective batch via accum
+  batch_size: 4
   accum: 1                                                        # optimiser step every `accum` batches
-  workers: 4                                                      # number of workers for data loading
+  workers: 4
   threshold: 0.5                                                  # probability cut for a binary mask
-  loss: {name: dice_bce, lambda_dice: 1.0, lambda_bce: 1.0}       # loss function and weights
-  early_stopping: {patience: 0, min_delta: 0.005}                 # early stopping parameters
-  selection_weight: 0.5                                           # weight of the candidate cross-entropy
+  loss: {name: dice_bce, lambda_dice: 1.0, lambda_bce: 1.0}       # Stage A's mask loss
+  early_stopping: {patience: 0, min_delta: 0.005}
+  probe_examples: 200                                             # examples the per-epoch
+                                                                  # counterfactual probes use. They
+                                                                  # cost five forward passes each, and
+                                                                  # the reported drops come from
+                                                                  # scripts/evaluate.py over the whole
+                                                                  # split - this is a trend line.
   val_examples: 600                                               # fixed random subset per val curve
                                                                   # (null = all). Anchor-first emits
-                                                                  # ~380 prompts/scene, so unsubsampled
+                                                                  # ~90 prompts/scene, so unsubsampled
                                                                   # validation costs more than training.
-
 
   stage_a:
     epochs: 50
     optimizer: {name: adamw, lr: 0.001, weight_decay: 0.00001}
     scheduler: {name: cosine, warmup_epochs: 2}
-    augment: true           
-    prompts_per_item: null                                         # sample this many structure names per scene; null = all
+    augment: true                # one octahedral rotation per item. Stage A only.
+    prompts_per_item: null       # sample this many names per scene; null = all
 
+  # Pretraining for B, with objectives that carry no class id: put back blanked
+  # cubes of I, mark where two neighbouring voxels differ in label, regress
+  # |grad I|. The boundary map is a pretraining target, never an inference input.
+  boundary:
+    epochs: 30
+    optimizer: {name: adamw, lr: 0.0005, weight_decay: 0.00001}
+    scheduler: {name: cosine, warmup_epochs: 2}
+    mask_fraction: 0.5           # fraction of cubes blanked
+    patch: 16                    # cube side, in voxels
+    loss: {boundary: 1.0, reconstruct: 1.0, edge: 0.5}
 
   stage_b:
     epochs: 30
     optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
     scheduler: {name: cosine, warmup_epochs: 5}
-    augment: true
-    mode: predicted                    # predicted | oracle. predicted requires phase_a_checkpoint; oracle uses ground-truth anchors and occupancy.
-    phase_a_checkpoint: runs/phase-a/current/best.pt   # Stage A weights. Required when mode is predicted;
-                                        # ignored when mode is oracle. Prefer passing --segmenter explicitly:
-                                        # two Phase B runs once recorded this same path while consuming
-                                        # different weights, because Phase A was re-run and overwrote it.
-    occupancy_mode: all                 # all | distractors-only | anchors-only | none. Which masks of that
-                                        # source are unioned into occupancy, on top of model.stage_b_image.
-                                        # all leaks the target's silhouette; distractors-only is an oracle
-                                        # diagnostic; anchors-only is bit-for-bit none at the decoder.
-                             
+    phase_a_checkpoint: runs/phase-a/current/best.pt   # the frozen Stage A. Always required:
+                                        # it is what turns the three names into masks. Prefer
+                                        # passing --segmenter explicitly.
+    boundary_checkpoint: null           # a `scripts/train.py boundary` run, or null to train B
+                                        # from scratch alongside the carver.
+    boundary_lr_scale: 0.1              # B's learning rate relative to the carver's, once pretrained
+    anchor_source: predicted            # predicted | oracle. `predicted` is the method. `oracle`
+                                        # substitutes ground-truth anchor masks and is a diagnostic
+                                        # that separates Stage A's error from the architecture's.
+    flip_probability: 0.25              # one clause to its opposite, then re-scored. Train only.
+    loss:                               # §5's table, one weight per term
+      dice: 1.0
+      bce: 1.0
+      null_bce: 0.2                     # BCE on the null head ("null" alone is a YAML None key)
+      centroid: 0.02                    # heatmap against the structure's centroid. The term is
+                                        # smooth-L1 in MILLIMETRES summed over three axes, so at a
+                                        # 17 mm error it is ~27 before weighting - at 0.1 it would
+                                        # be four times the Dice and the carver's trunk would be
+                                        # trained mostly to localise. Per-term losses are logged.
+      field_centroid: 0.01              # the same, against the field's own centre
+      far: 0.2                          # L_far
+    far: {epsilon: 0.05, dilation: 8}   # mass outside dilate(where_raw > epsilon) is penalised
+    field_centroid_on: always           # always | empty-only. `always` is §5's table read
+                                        # literally. Measured: the field's centre of mass sits
+                                        # 20.2 mm from the target's centroid (the conjunction is
+                                        # an elongated wedge and the target is near its apex), so
+                                        # under `always` this term pulls the heatmap ~20 mm off on
+                                        # every valid prompt. `empty-only` restricts it to prompts
+                                        # that name nothing, where it is the only target there is.
+
 
 logging:
   backend: wandb              # wandb | none
   wandb:
     project: spatial-vox-mri
-    tags: [mri, stage-b, augment, anchors-only, zscore]
-
+    tags: [mri, relational, carver]
 
 
 evaluation:

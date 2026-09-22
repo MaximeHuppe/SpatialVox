@@ -20,7 +20,7 @@ DEFAULT_CONFIG = ROOT / "configs" / "config.yaml"
 class Config(Mapping[str, Any]):
     """A read-only nested mapping with attribute access.
 
-    ``cfg.model.base_channels`` and ``cfg["model"]["base_channels"]`` are the
+    ``cfg.model.stage_b.carver.width`` and ``cfg["model"]["stage_b"]`` are the
     same thing; nested dicts are wrapped on the way out.
     """
 

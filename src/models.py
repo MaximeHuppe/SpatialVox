@@ -1,33 +1,32 @@
 """Both networks, and the blocks they share.
 
 **Stage A** (:class:`StageA`) is a promptable segmenter: an intensity volume and
-a set of structure names in, one mask per name out. On synthetic data it segments
-primitives; on MRI it is the anatomy segmenter that supplies Stage B's anchors.
+a set of structure names in, one mask per name out. It is trained beforehand on
+every name that may be an anchor, then frozen. Nothing below trains it.
 
-**Stage B** (:class:`StageB`) is the relational segmenter: ordered anchor masks
-and a relational prompt in, the target mask out. The target is never an input -
-it has to be inferred from the intersection of the relations.
+**Stage B** (:class:`StageB`) is the relational model of
+``docs/proposal/relational_architecture.md``. Its inputs are the MRI and three
+clauses, each a direction and an anchor name, and it segments a structure the
+prompt never names::
 
-The architecture is the one from ``exp/realistic-appearance``, parameter for
-parameter (``tests/test_reference_parity.py`` loads a checkpoint from that branch
-into these classes and compares outputs). What changed is only how it is sized:
-``model.encoder_channels`` lists one width per scale, with a stride-2 stage
-between each pair, so its length sets the depth and the bottleneck follows:
-``resolution / 2^(len - 1)``, checked against ``model.bottleneck``. A 128^3 corpus
-wants one more width than a 64^3 one, and the bottleneck stays at ``8^3`` - 512
-tokens, small enough for global cross-attention. Embedding tables are sized from
-the vocabulary, so ten primitives and eighty anatomical labels are the same code.
-See ``docs/method/``.
+    image   [B, 1, 128, 128, 128]
+    clauses [B, 3] x {direction, name}
+            ->  target logits [B, 1, 128, 128, 128]
+            ->  null logit             one number: the clauses name nothing
+            ->  centroid [B, 3]        from a heatmap, not from the mask
 
-The two stages differ in more than their inputs, and the differences are
-deliberate:
+**Names stop at Stage A.** They buy three soft masks and are then gone: no name
+embedding, no pair embedding, no slot embedding downstream. The direction ids
+are consumed by :mod:`src.mapper` and by nothing else - the direction is already
+the shape of ``F_i``, and a token would let the triple of anchor names stand in
+for the target. The carver sees ``B(I)`` beside maps computed from detached
+masks, and no coordinate grid.
 
-* Stage A sees an *image*, so it uses ReLU, no coordinate channels, and deep
-  supervision at three decoder scales;
-* Stage B sees *masks*, so it uses leaky ReLU and needs normalised world
-  coordinates at every scale - the anchor channels alone are
-  translation-ambiguous, and `medial`/`lateral` is defined against the volume
-  centre plane, which exists only in world coordinates.
+Stage A's feature pyramid stays out too. Those features were trained to light up
+*named* structures; ``B`` is a separate encoder trained without class ids, so a
+structure Stage A has never seen is still a boundary in the image. That is the
+whole lesion claim: the mask is painted from the MRI, not chosen from a list of
+things Stage A already knows how to draw.
 """
 
 from __future__ import annotations
@@ -40,11 +39,18 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from src.geometry import volume_center_world
+from src.mapper import PositionalMapper3D
+
 EPS = 1e-6
-#: centroid (3) + bounding-box extent (3) + linear size (1) + presence flag (1)
-GEOMETRY_FEATURES = 8
-#: Number of coordinate channels appended per scale: (x, y, z).
-COORDS = 3
+
+#: Floor under ``log(where_raw)`` and ``log(where_mass)``, and the scale both are
+#: divided by. The measured range of ``where_mass`` on ``data/mri`` spans 1e-21
+#: to 2e-2, so the raw number is indistinguishable from zero to a convolution
+#: whose other nine input channels live in ``[0, 1]``. Dividing by ``-log(floor)``
+#: maps the clamped log onto ``[-1, 0]``: the same one number, monotonically
+#: reparameterised, still saying "the conjunction has no mass".
+LOG_FLOOR = 1e-9
 
 
 # ---------------------------------------------------------------------------
@@ -121,22 +127,6 @@ class PosEnc3D(nn.Module):
 MAX_ATTENTION_TOKENS = 4096
 
 
-def widths_for(base: int, depth: int, cap: int) -> list[int]:
-    """Channel width per scale: doubling from ``base``, capped at ``cap``.
-
-    A convenience for sweeps; ``configs/config.yaml`` lists the widths outright.
-    """
-    return [min(base * 2**level, cap) for level in range(depth + 1)]
-
-
-def depth_for(resolution: int, bottleneck: int) -> int:
-    """Number of stride-2 stages that takes ``resolution`` down to ``bottleneck``."""
-    depth = round(math.log2(resolution / bottleneck))
-    if bottleneck * 2**depth != resolution:
-        raise ValueError(f"resolution {resolution} is not a power-of-two multiple of {bottleneck}")
-    return depth
-
-
 def bottleneck_for(resolution: int, channels: Sequence[int], expected: int | None = None) -> int:
     """The bottleneck grid side implied by one width per scale.
 
@@ -169,45 +159,6 @@ def bottleneck_for(resolution: int, channels: Sequence[int], expected: int | Non
     return bottleneck
 
 
-def world_grid(grid: Sequence[int], full: Sequence[int], device, dtype) -> Tensor:
-    """Normalised world coordinates ``(x, y, z)`` on a possibly coarse grid.
-
-    Returns ``[1, 3, *grid]`` in ``[-1, 1]`` at the corners of the *full* volume.
-    A cell of a grid ``f`` times coarser covers input indices ``f*i .. f*i+f-1``,
-    so its world position is ``f*i + (f-1)/2``. Feeding local indices instead
-    would make the same anatomical position take different values at different
-    scales. Voxel spacing cancels in the normalisation, which is why no module
-    here takes a spacing argument.
-    """
-    axes = []
-    for size, full_size in zip(grid, full):
-        factor = full_size / size
-        index = torch.arange(size, device=device, dtype=dtype)
-        world = index * factor + (factor - 1.0) / 2.0
-        half = (full_size - 1) / 2.0
-        # Written as (world - half) / half rather than the algebraically equal
-        # 2*world/(full-1) - 1, so the rounding matches the reference
-        # implementation exactly and a ported checkpoint reproduces it bitwise.
-        axes.append((world - half) / max(half, 1e-8))
-    z, y, x = (axis.reshape([-1 if a == i else 1 for a in range(3)]) for i, axis in enumerate(axes))
-    return torch.stack(torch.broadcast_tensors(x, y, z), dim=0).unsqueeze(0)
-
-
-def pool_to(x: Tensor, size: Sequence[int], mode: str = "max") -> Tensor:
-    """Resize a mask-like tensor to a coarser grid.
-
-    ``max`` preserves presence (a thin structure vanishes under averaging);
-    ``avg`` gives the occupancy fraction, which is what pooling weights want.
-    """
-    target = tuple(int(v) for v in size)
-    if tuple(x.shape[2:]) == target:
-        return x
-    factors = [s // t for s, t in zip(x.shape[2:], target)]
-    if [t * f for t, f in zip(target, factors)] != list(x.shape[2:]):
-        return F.interpolate(x, size=target, mode="nearest" if mode == "max" else "area")
-    return (F.max_pool3d if mode == "max" else F.avg_pool3d)(x, factors, factors)
-
-
 def prior_bias(fraction: float) -> float:
     """``log(p / (1 - p))``: the head bias that makes sigmoid output ``p`` at init.
 
@@ -218,20 +169,34 @@ def prior_bias(fraction: float) -> float:
     return math.log(fraction / (1.0 - fraction))
 
 
-# ---------------------------------------------------------------------------
-# Encoder / decoder
-# ---------------------------------------------------------------------------
-class Encoder(nn.Module):
-    """Stem plus ``depth`` stride-2 stages, optionally with world coordinates."""
+def grid_world_axes(
+    grid: Sequence[int], full: Sequence[int], spacing: Sequence[float], device, dtype
+) -> list[Tensor]:
+    """World ``(x, y, z)`` axes of a grid ``full / grid`` times coarser, in world units.
 
-    def __init__(self, in_channels: int, widths: Sequence[int], act: str, coords: bool) -> None:
+    A cell of a grid ``f`` times coarser covers input indices ``f*i .. f*i+f-1``,
+    so it sits at ``f*i + (f-1)/2`` of the full grid. Used by the soft-argmax, so
+    a centroid read off the carver's 64^3 working grid is in the same millimetres
+    as the label volume's centroid and the two are directly comparable.
+    """
+    axes = []
+    for axis, (size, full_size) in enumerate(zip(grid[::-1], full[::-1])):  # (z,y,x) -> (x,y,z)
+        factor = full_size / size
+        index = torch.arange(size, device=device, dtype=dtype)
+        axes.append((index * factor + (factor - 1.0) / 2.0) * float(spacing[axis]))
+    return axes
+
+
+class Encoder(nn.Module):
+    """Stem plus one stride-2 stage per further width."""
+
+    def __init__(self, in_channels: int, widths: Sequence[int], act: str) -> None:
         super().__init__()
-        self.widths, self.coords = list(widths), bool(coords)
-        extra = COORDS if coords else 0
+        self.widths = list(widths)
         inputs = [in_channels] + self.widths[:-1]
         self.stages = nn.ModuleList(
             nn.Sequential(
-                ConvBlock(channels + extra, width, act, stride=1 if level == 0 else 2),
+                ConvBlock(channels, width, act, stride=1 if level == 0 else 2),
                 ResBlock(width, act),
             )
             for level, (channels, width) in enumerate(zip(inputs, self.widths))
@@ -239,127 +204,46 @@ class Encoder(nn.Module):
 
     def forward(self, x: Tensor) -> list[Tensor]:
         """``[B, C, D, H, W]`` -> one feature map per scale, finest first."""
-        full = x.shape[2:]
         features = []
         for stage in self.stages:
-            if self.coords:
-                grid = world_grid(x.shape[2:], full, x.device, x.dtype)
-                x = torch.cat([x, grid.expand(x.shape[0], -1, -1, -1, -1)], dim=1)
             x = stage(x)
             features.append(x)
         return features
 
 
-class FiLM(nn.Module):
-    """``y = (1 + gamma(context)) * x + beta(context)``, starting as the identity."""
-
-    def __init__(self, context_dim: int, channels: int) -> None:
-        super().__init__()
-        self.channels = channels
-        self.project = nn.Linear(context_dim, 2 * channels)
-        nn.init.zeros_(self.project.weight)
-        nn.init.zeros_(self.project.bias)
-
-    def forward(self, x: Tensor, context: Tensor) -> Tensor:
-        gamma, beta = self.project(context).chunk(2, dim=-1)
-        shape = (x.shape[0], self.channels, 1, 1, 1)
-        return (1 + gamma.reshape(shape)) * x + beta.reshape(shape)
-
-
 class Decoder(nn.Module):
-    """Upsample, concatenate the skip, optionally inject guidance and context.
+    """Upsample and concatenate the skip, once per scale.
 
     Returns every stage's features, coarse to fine, so Stage A can supervise all
-    of them. Conditioning is FiLM rather than attention: at half resolution a
-    64^3 volume already has 32,768 query tokens, sixty-four times the bottleneck
-    budget. FiLM is applied at every stage except the finest, which is where the
-    reference architecture puts it (16^3 and 32^3 of 64^3).
-
-    *Guidance* is the volumetric side input, resampled to each scale and mixed in
-    by a 1x1 convolution: the binary ``occupancy`` map, the intensity ``image``,
-    or both, in that order. The projection is still called ``occupancy`` because
-    that is the name its weights carry in every checkpoint written so far.
+    of them.
     """
 
-    def __init__(
-        self,
-        widths: Sequence[int],
-        act: str,
-        *,
-        coords: bool = False,
-        refine: bool = False,
-        context_dim: int = 0,
-        occupancy: bool = False,
-        image: bool = False,
-    ) -> None:
+    def __init__(self, widths: Sequence[int], act: str) -> None:
         super().__init__()
         widths = list(widths)
         outputs = widths[-2::-1]  # coarse to fine: w_{D-1} ... w_0
         inputs = widths[:0:-1]  # w_D ... w_1
-        extra = COORDS if coords else 0
-        self.coords = bool(coords)
-        self.image = bool(image)
-        self.fuse = nn.ModuleList(ConvBlock(i + extra + s, s, act) for i, s in zip(inputs, outputs))
-        self.refine = nn.ModuleList(ConvBlock(w, w, act) for w in outputs) if refine else None
-        planes = int(bool(occupancy)) + int(self.image)
-        self.occupancy = (
-            nn.ModuleList(nn.Conv3d(w + planes, w, 1) for w in outputs) if occupancy else None
-        )
-        if self.image and not occupancy:
-            raise ValueError("image guidance rides on the occupancy projection; enable occupancy too")
-        # Every stage but the finest, which keeps the reference's 16^3/32^3 at
-        # 64^3 and generalises to any resolution.
-        self.film = (
-            nn.ModuleDict({str(i): FiLM(context_dim, w) for i, w in enumerate(outputs[:-1])})
-            if context_dim
-            else None
-        )
+        self.fuse = nn.ModuleList(ConvBlock(i + s, s, act) for i, s in zip(inputs, outputs))
 
-    def forward(
-        self,
-        features: Sequence[Tensor],
-        *,
-        context: Tensor | None = None,
-        occupancy: Tensor | None = None,
-        image: Tensor | None = None,
-    ) -> list[Tensor]:
-        if self.image and image is None:
-            raise ValueError("this decoder was built with image guidance; pass `image`")
-        x, full = features[-1], features[0].shape[2:]
-        stages = []
+    def forward(self, features: Sequence[Tensor]) -> list[Tensor]:
+        x, stages = features[-1], []
         for level, skip in enumerate(features[-2::-1]):
-            if self.coords:
-                grid = world_grid(x.shape[2:], full, x.device, x.dtype)
-                x = torch.cat([x, grid.expand(x.shape[0], -1, -1, -1, -1)], dim=1)
             x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=True)
             x = self.fuse[level](torch.cat([x, skip], dim=1))
-            if self.occupancy is not None and occupancy is not None:
-                # `max` keeps a thin structure present in the mask; the image
-                # wants `avg`, whose area filter is the anti-aliased downsample.
-                # `max` on intensities would return the brightest voxel per block
-                # and saturate into "structure everywhere".
-                guidance = [pool_to(occupancy, x.shape[2:], "max")]
-                if self.image:
-                    guidance.append(pool_to(image, x.shape[2:], "avg"))
-                x = self.occupancy[level](torch.cat([x, *guidance], dim=1))
-            if self.film is not None and context is not None and str(level) in self.film:
-                x = self.film[str(level)](x, context)
-            if self.refine is not None:
-                x = self.refine[level](x)
             stages.append(x)
         return stages
 
 
 # ---------------------------------------------------------------------------
-# Prompt encoders
+# Stage A: promptable segmenter
 # ---------------------------------------------------------------------------
 class NamePrompt(nn.Module):
     """A structure name as a learned embedding, projected to the token width.
 
     The vocabulary is closed, so an embedding table is the exact and
     deterministic representation - there is no open-vocabulary text to
-    generalise over. Swap this module for a frozen sentence encoder to accept
-    free-text names.
+    generalise over. This is the **only** name embedding in the project, and it
+    lives on the far side of the freeze.
     """
 
     def __init__(self, vocab_size: int, dim: int, text_dim: int | None = None) -> None:
@@ -372,137 +256,13 @@ class NamePrompt(nn.Module):
         return self.projection(self.table(name_ids))
 
 
-class RelationPrompt(nn.Module):
-    """One token per clause, never pooled::
-
-        token_i = direction_i + name_i + pair(direction_i, name_i) + slot_i
-
-    The pair table is what lets a relation be more than the sum of its parts
-    (``lateral to the thalamus`` need not behave like ``lateral`` plus
-    ``thalamus``). Keeping the clauses separate all the way into the grounding
-    branches is what makes correspondence learnable at all.
-    """
-
-    def __init__(self, vocab_size: int, n_clauses: int, dim: int, n_directions: int = 6) -> None:
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.name = NamePrompt(vocab_size, dim)
-        self.direction = nn.Embedding(n_directions, dim)
-        self.pair = nn.Embedding(n_directions * vocab_size, dim)
-        self.slot = nn.Embedding(n_clauses, dim)
-        self.norm = nn.LayerNorm(dim)
-        for table in (self.direction, self.pair, self.slot):
-            nn.init.trunc_normal_(table.weight, std=0.02)
-
-    def forward(self, direction_ids: Tensor, name_ids: Tensor) -> Tensor:
-        """``[B, A]`` + ``[B, A]`` -> ``[B, A, dim]``, clause ``i`` in slot ``i``."""
-        slots = torch.arange(direction_ids.shape[1], device=direction_ids.device)
-        tokens = (
-            self.slot(slots)[None]
-            + self.direction(direction_ids)
-            + self.name(name_ids)
-            + self.pair(direction_ids * self.vocab_size + name_ids)
-        )
-        return self.norm(tokens)
-
-
-class StructureEncoder(nn.Module):
-    """One token per anchor channel: what it looks like, and where it is.
-
-    Every geometric feature is measured **from the mask channel itself**, never
-    read out of the manifest. That is what makes ground-truth and predicted
-    anchors interchangeable: when the segmenter supplies a slightly wrong mask,
-    the token describes *that* mask, so an oracle-versus-predicted gap measures
-    Stage A's error rather than a change of interface.
-    """
-
-    def __init__(self, visual_channels: int, vocab_size: int, n_clauses: int, dim: int) -> None:
-        super().__init__()
-        self.visual = nn.Linear(visual_channels, dim)
-        self.geometry = nn.Sequential(
-            nn.Linear(GEOMETRY_FEATURES, dim), nn.ReLU(inplace=True), nn.Linear(dim, dim)
-        )
-        self.name = nn.Embedding(vocab_size, dim)
-        self.slot = nn.Embedding(n_clauses, dim)
-        self.norm = nn.LayerNorm(dim)
-        for table in (self.name, self.slot):
-            nn.init.trunc_normal_(table.weight, std=0.02)
-
-    def forward(self, masks: Tensor, bottleneck: Tensor, name_ids: Tensor) -> Tensor:
-        slots = torch.arange(masks.shape[1], device=masks.device)
-        tokens = (
-            self.visual(masked_pool(bottleneck, masks))
-            + self.geometry(mask_geometry(masks))
-            + self.slot(slots)[None]
-            + self.name(name_ids)
-        )
-        return self.norm(tokens)
-
-
-def masked_pool(features: Tensor, masks: Tensor) -> Tensor:
-    """Pool ``[B, C, ...]`` features under each of ``[B, A, ...]`` mask channels.
-
-    Masks are average-pooled onto the feature grid, so a structure smaller than
-    one cell still contributes a fractional weight instead of vanishing. An
-    empty channel falls back to the globally pooled features rather than a NaN.
-    """
-    weights = pool_to(masks.to(features.dtype), features.shape[2:], mode="avg").flatten(2)
-    flat = features.flatten(2)
-    totals = weights.sum(-1, keepdim=True)
-    pooled = torch.bmm(weights, flat.transpose(1, 2)) / totals.clamp(min=EPS)
-    return torch.where(totals > EPS, pooled, flat.mean(-1).unsqueeze(1))
-
-
-def mask_geometry(masks: Tensor) -> Tensor:
-    """``[B, A, D, H, W]`` -> ``[B, A, 8]`` normalised geometry per channel.
-
-    Normalised centroid ``(x, y, z)`` in ``[-1, 1]``, bounding-box extent as a
-    fraction of each axis, the cube root of the occupied volume fraction (a
-    linear size, which keeps the feature O(0.1) rather than O(0.001)), and a
-    presence flag so the network can tell "tiny structure at the origin" from
-    "no structure at all".
-    """
-    occupancy = (masks > 0.5).to(torch.float32)
-    counts = occupancy.flatten(2).sum(-1)
-    present = (counts > 0).to(counts.dtype)
-    centroids, extents = [], []
-    for axis, size in enumerate(masks.shape[2:]):  # array axes are (z, y, x)
-        others = tuple(a for a in (2, 3, 4) if a != axis + 2)
-        profile, weights = occupancy.amax(dim=others), occupancy.sum(dim=others)
-        index = torch.arange(size, device=masks.device, dtype=counts.dtype)
-        centre = (weights * index).sum(-1) / counts.clamp(min=1.0)
-        # (centre - half) / half, not the equal 2*centre/(size-1) - 1: same value,
-        # same rounding as the reference, so a ported checkpoint matches bitwise.
-        half = (size - 1) / 2.0
-        centroids.append((centre - half) / max(half, EPS) * present)
-        occupied = profile > 0
-        low = torch.where(occupied, index, torch.full_like(profile, size)).amin(-1)
-        high = torch.where(occupied, index, torch.zeros_like(profile)).amax(-1)
-        extents.append((high - low + 1) / size * present)
-    voxels = float(masks.shape[2] * masks.shape[3] * masks.shape[4])
-    size_fraction = (counts / voxels).clamp(min=0.0) ** (1 / 3)
-    return torch.cat(
-        [
-            torch.stack(centroids[::-1], -1),
-            torch.stack(extents[::-1], -1),
-            size_fraction[..., None],
-            present[..., None],
-        ],
-        dim=-1,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Stage A: promptable segmenter
-# ---------------------------------------------------------------------------
 class MaskHead(nn.Module):
     """Per-prompt mask logits: a scaled dot product plus a per-query bias.
 
     Visual features are only *read*, never modulated by the prompt set, and
     queries never interact. So the logits for one name do not depend on which
     other names were requested - which is what lets Stage A be trained on the
-    whole vocabulary and queried for just the three anchors a relational prompt
-    names.
+    whole vocabulary and queried for just the three anchors a clause names.
     """
 
     def __init__(self, dim: int, visual_channels: int, prior_foreground: float) -> None:
@@ -537,8 +297,8 @@ class StageA(nn.Module):
     Name queries attend over the flattened bottleneck - the query says *what*,
     the keys say *where* (they alone carry the positional encoding), the values
     carry the unmodified visual content - and the aligned queries are turned into
-    masks at three decoder scales by :class:`MaskHead`. Inference uses the
-    full-resolution map; training also supervises the coarse two.
+    masks at each decoder scale by :class:`MaskHead`. Inference uses the
+    full-resolution map; training also supervises the coarse ones.
     """
 
     def __init__(
@@ -567,7 +327,7 @@ class StageA(nn.Module):
                 "the prompt decoder attends over the bottleneck directly"
             )
         self.deep_supervision = tuple(float(w) for w in deep_supervision)
-        self.encoder = Encoder(1, widths, "relu", coords=False)
+        self.encoder = Encoder(1, widths, "relu")
         self.decoder = Decoder(widths, "relu")
         self.prompt = NamePrompt(vocab_size, token_dim)
         self.pos = PosEnc3D((grid,) * 3, token_dim)
@@ -596,240 +356,435 @@ class StageA(nn.Module):
         return StageAOutput(logits=logits, scales=scales)
 
     @torch.no_grad()
-    def masks_for(self, image: Tensor, name_ids: Tensor, threshold: float = 0.5) -> Tensor:
-        """Binary masks for the named structures, in the order they were asked for."""
-        logits = self(image, name_ids, deep_supervision=False).logits
-        return (torch.sigmoid(logits.float()) >= threshold).float()
+    def probability(self, image: Tensor, name_ids: Tensor) -> Tensor:
+        """Soft masks for the named structures, in the order they were asked for.
+
+        The *probability*, not a threshold. A cut at 0.5 makes the centroid the
+        mapper reads jump, and can delete a dim but real anchor in one step.
+        """
+        return torch.sigmoid(self(image, name_ids, deep_supervision=False).logits.float())
 
 
 # ---------------------------------------------------------------------------
-# Stage B: relational segmenter
+# Stage B: boundary encoder, carver, null head
 # ---------------------------------------------------------------------------
-class Evidence(nn.Module):
-    """One clause -> one spatial evidence map at the bottleneck.
+class BoundaryEncoder(nn.Module):
+    """``B(I)``: generic boundary features from the MRI, and nothing else.
 
-    The relation token is first fused with its structure token by a small
-    cross-attention block: the relation queries ``[relation, structure]``, then a
-    residual MLP. The fused clause is then grounded with **visual locations as
-    queries** and the clause's three tokens ``{fused, relation, structure}`` as
-    keys and values, so each location decides for itself how much of the
-    relation, the anchor's appearance and their combination it needs.
+    No prompt, no name, no direction, no coordinate grid and no label reaches
+    this module - ``forward`` takes one argument and it is the image. That is the
+    point: its pretraining objectives carry no class id, so a structure Stage A
+    has never been given a mask for is still a boundary here.
 
-    This is the only attention over space in Stage B, and it is affordable
-    exactly because the bottleneck is 512 tokens.
+    Small beside Stage A: three stages at 128/64/32 and a symmetric path back,
+    16-32 channels. Stage A's pyramid is not a substitute, because those features
+    were trained to light up *named* structures.
+
+    The residual pair is used at every stride-2 stage but **not** at full
+    resolution. A 16-to-16 3x3x3 convolution on a 128^3 volume is by a wide
+    margin the most expensive operation in Stage B: measured on this corpus, the
+    two extra ones cost 350 ms of a 530 ms training step, two thirds of ``B``, for
+    6% more parameters. Depth is cheaper one octave down, and the up path reads
+    the finest skip again anyway.
     """
 
-    def __init__(self, visual_channels: int, dim: int, heads: int, grid: Sequence[int], act: str) -> None:
+    def __init__(self, widths: Sequence[int] = (16, 32, 32), act: str = "leaky_relu") -> None:
         super().__init__()
-        self.dim = dim
-        self.clause_attention = nn.MultiheadAttention(dim, heads, batch_first=True)
-        self.clause_norm = nn.LayerNorm(dim)
-        self.mlp = nn.Sequential(nn.Linear(dim, 2 * dim), nn.GELU(), nn.Linear(2 * dim, dim))
-        self.norm = nn.LayerNorm(dim)
-
-        self.to_query = nn.Linear(visual_channels, dim)
-        self.pos = PosEnc3D(grid, dim)
-        self.attention = nn.MultiheadAttention(dim, heads, batch_first=True)
-        self.attention_norm = nn.LayerNorm(dim)
-        self.project = nn.Sequential(
-            conv(visual_channels + dim, visual_channels, 1), *norm_act(visual_channels, act),
-            conv(visual_channels, visual_channels), *norm_act(visual_channels, act),
+        widths = [int(w) for w in widths]
+        if len(widths) < 2:
+            raise ValueError(f"the boundary encoder needs at least two widths, got {widths}")
+        self.widths, self.out_channels = widths, widths[0]
+        self.down = nn.ModuleList(
+            nn.Sequential(
+                ConvBlock(inp, width, act, stride=1 if level == 0 else 2),
+                *([] if level == 0 else [ResBlock(width, act)]),
+            )
+            for level, (inp, width) in enumerate(zip([1] + widths[:-1], widths))
+        )
+        self.up = nn.ModuleList(
+            ConvBlock(coarse + skip, skip, act)
+            for coarse, skip in zip(widths[:0:-1], widths[-2::-1])
         )
 
-    def forward(self, visual: Tensor, relation: Tensor, structure: Tensor) -> tuple[Tensor, Tensor]:
-        """``-> (evidence map [B, C, ...], fused clause token [B, dim])``."""
-        memory = torch.stack([relation, structure], dim=1)
-        attended, _ = self.clause_attention(relation.unsqueeze(1), memory, memory, need_weights=False)
-        clause = self.clause_norm(attended.squeeze(1) + relation)
-        clause = self.norm(clause + self.mlp(clause))
-
-        tokens = torch.stack([clause, relation, structure], dim=1)
-        queries = self.to_query(visual.flatten(2).transpose(1, 2)) + self.pos(visual.shape[2:])
-        grounded, _ = self.attention(queries, tokens, tokens, need_weights=False)
-        grounded = self.attention_norm(grounded + queries)
-        grid = grounded.transpose(1, 2).reshape(visual.shape[0], self.dim, *visual.shape[2:])
-        return self.project(torch.cat([visual, grid], dim=1)), clause
+    def forward(self, image: Tensor) -> Tensor:
+        """``[B, 1, D, H, W]`` -> ``[B, out_channels, D, H, W]``."""
+        skips = []
+        x = image
+        for stage in self.down:
+            x = stage(x)
+            skips.append(x)
+        for level, skip in enumerate(skips[-2::-1]):
+            x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=True)
+            x = self.up[level](torch.cat([x, skip], dim=1))
+        return x
 
 
-class Intersection(nn.Module):
-    """Pointwise fusion of ``[H_1, ..., H_A, H_1 * ... * H_A]``, then a refinement.
+class BoundaryPretrainer(nn.Module):
+    """``B`` plus its pretext heads - the module ``scripts/train.py boundary`` trains.
 
-    The product term is the point: it is high only where *every* relation is
-    satisfied at once, which is the definition of the target, and no sum of the
-    maps can express that. The maps are kept alongside it so softer combinations
-    stay available. Each map is squashed to ``[0, 1]`` first, or the product of
-    unbounded activations has no usable gradient.
+    A separate model rather than a mode of :class:`StageB`, so the heads that
+    read the label volume are not reachable from the relational forward at all.
+    The trained ``encoder`` weights are then loaded into ``StageB.boundary`` and
+    given a lower learning rate.
     """
 
-    def __init__(self, channels: int, n_clauses: int, hidden: int, act: str) -> None:
+    def __init__(
+        self, widths: Sequence[int] = (16, 32, 32), mask_fraction: float = 0.5, patch: int = 16
+    ) -> None:
         super().__init__()
-        self.fuse = nn.Sequential(
-            conv((n_clauses + 1) * channels, hidden, 1), *norm_act(hidden, act),
-            conv(hidden, hidden, 1), *norm_act(hidden, act),
-            conv(hidden, channels, 1),
+        self.config = dict(
+            widths=tuple(int(w) for w in widths),
+            mask_fraction=float(mask_fraction),
+            patch=int(patch),
         )
-        self.refine = nn.Sequential(conv(channels, channels), *norm_act(channels, act))
+        self.mask_fraction, self.patch = float(mask_fraction), int(patch)
+        self.encoder = BoundaryEncoder(widths)
+        channels = self.encoder.out_channels
+        self.reconstruct = nn.Conv3d(channels, 1, 1)
+        self.boundary = nn.Conv3d(channels, 1, 1)
+        self.edge = nn.Conv3d(channels, 1, 1)
 
-    def forward(self, maps: Sequence[Tensor]) -> Tensor:
-        product = torch.sigmoid(maps[0])
-        for other in maps[1:]:
-            product = product * torch.sigmoid(other)
-        return self.refine(self.fuse(torch.cat([*maps, product], dim=1)))
+    def blank(self, image: Tensor) -> tuple[Tensor, Tensor]:
+        """Blank a fraction of ``patch``-sized cubes. Returns ``(blanked, holes)``.
+
+        Whole cubes, not scattered voxels: a voxel-wise mask is filled in by its
+        own neighbours and teaches nothing about structure.
+        """
+        grid = [max(s // self.patch, 1) for s in image.shape[2:]]
+        coarse = (torch.rand(image.shape[0], 1, *grid, device=image.device) < self.mask_fraction).float()
+        holes = F.interpolate(coarse, size=image.shape[2:], mode="nearest")
+        return image * (1 - holes), holes
+
+    @staticmethod
+    def edges(image: Tensor) -> Tensor:
+        """``|grad I|`` by central differences - the class-agnostic edge target."""
+        gradients = []
+        for axis in range(2, 5):
+            gradients.append(0.5 * (image.roll(-1, axis) - image.roll(1, axis)))
+        return torch.sqrt(sum(g**2 for g in gradients) + EPS)
+
+    def forward(self, image: Tensor) -> dict[str, Tensor]:
+        features = self.encoder(image)
+        return {
+            "reconstruct": self.reconstruct(features),
+            "boundary": self.boundary(features),
+            "edge": self.edge(features),
+        }
 
 
-class SelectionHead(nn.Module):
-    """Score each candidate structure mask against the relational target map.
+class NullHead(nn.Module):
+    """``valid = MLP(where_mass, mass_0, mass_1, mass_2)``. Four numbers, no image.
 
-    The dense head has to *synthesise* the target's silhouette. That is learned
-    per class, so it memorises the training classes instead of generalising:
-    measured on the val split, localisation is 100% correct on trained classes
-    (0.9 voxels of centroid error) and 31.2% on unseen ones, where the most
-    common failure is emitting a blob on one of the anchors.
+    It cannot decide "empty" by looking at tissue, which is the point: the
+    feasible field's mass is the reason an impossible prompt loses. The inputs
+    are taken in ``log10``, which is a monotone reparameterisation of the same
+    four numbers and not extra information - measured on ``data/mri`` they span
+    1e-21 to 2e-2, and a linear layer cannot resolve that range.
 
-    Selection cannot memorise a class, because it has no per-class parameters at
-    all. It reads one number per candidate - how much of that candidate lies
-    where the relations say the target is - and the same computation applies to a
-    structure never seen as a target. That is the class-agnostic pathway the
-    architecture was missing, and it supervises *localisation* directly, which is
-    the ability that failed to transfer.
-
-    Candidates come from Stage A's own segmentation of the whole vocabulary, so
-    nothing here reveals which one is the target; Stage B still has to choose.
-    Anchors are masked out, exactly as they are subtracted from occupancy.
+    Its ceiling is a property of those inputs, not of its width:
+    ``scripts/gate_mapper.py`` measures ``where_mass`` alone at AUC 0.848 for
+    "names one structure" against "names none", because the mapper cannot see
+    which regions hold tissue and a roomy but empty conjunction looks exactly
+    like a valid one.
     """
 
-    def __init__(self, channels: int, hidden: int) -> None:
+    def __init__(self, n_anchors: int = 3, hidden: int = 32) -> None:
         super().__init__()
-        self.score = nn.Sequential(
-            nn.Linear(2, hidden), nn.ReLU(inplace=True), nn.Linear(hidden, 1)
+        self.mlp = nn.Sequential(
+            nn.Linear(1 + n_anchors, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden), nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
         )
-        self.project = nn.Conv3d(channels, 1, 1)
 
-    def forward(self, features: Tensor, candidates: Tensor) -> Tensor:
-        """``[B,C,d,h,w]`` target map + ``[B,K,D,H,W]`` masks -> ``[B,K]`` logits."""
-        target_map = torch.sigmoid(self.project(features))
-        target_map = pool_to(target_map, candidates.shape[2:], "area")
-        masks = candidates.to(target_map.dtype)
-        area = masks.flatten(2).sum(-1)                       # [B, K]
-        inside = (masks * target_map).flatten(2).sum(-1)      # [B, K]
-        # Coverage: what fraction of the candidate sits in the target region.
-        # Share: what fraction of the target region this candidate accounts for.
-        coverage = inside / area.clamp(min=1.0)
-        share = inside / inside.sum(-1, keepdim=True).clamp(min=1e-6)
-        logits = self.score(torch.stack([coverage, share], dim=-1)).squeeze(-1)
-        return logits.masked_fill(area <= 0, float("-inf"))
+    def forward(self, where_mass: Tensor, masses: Tensor) -> Tensor:
+        """``[B, 1]`` and ``[B, A]`` -> ``[B]`` logits."""
+        features = torch.cat([where_mass, masses], dim=-1).clamp_min(1e-24).log10()
+        return self.mlp(features.float()).squeeze(-1)
 
 
-@dataclass
-class StageBOutput:
-    logits: Tensor
-    evidence: list[Tensor]
-    selection: Tensor | None = None
+class Carver(nn.Module):
+    """The WHAT: ``B(I)`` and the geometric maps in, target logits and a heatmap out.
 
+    ``residual = two 16-channel blocks, stride-2 stem, then 1x1 up to 128^3``.
+    The stem is what keeps 3x3x3 convolutions affordable on a 128^3 volume.
 
-class StageB(nn.Module):
-    """Segment the structure described only by its relations to named anchors.
+    ``full_resolution_skip`` carries ``B(I)`` past that stem, so the final 1x1
+    sees the boundary features at the resolution they were computed at. It
+    defaults on, and it is a departure from the literal reading of §4 recorded in
+    ``docs/proposal/deviations.md``: a stride-2 stem otherwise destroys exactly
+    the full-resolution boundary detail the method claims the mask is drawn from,
+    which would leave a trilinear upsample of a 2.5 mm grid as the only path to
+    the output. It is a flag so the claim stays measurable.
 
-    Inputs are the ordered anchor masks, the clause indices, the binary
-    occupancy of the scene, and - when ``image`` is on - the intensity volume it
-    came from. It never receives the label volume, the target mask, the target
-    name or the target's position - the point of the experiment is that it has
-    to derive them.
-
-    Occupancy and the image enter on the decoder side only. They say *what* is
-    there, and the encoder must not see them: grounding queries that could look
-    at the target's own voxels would let the model ignore the prompt and pick "a
-    blob that is not an anchor". The anchors are subtracted from occupancy for
-    the same reason the prompt names them - they are the given, not the answer.
-
-    ``image`` is what makes the occupancy ablation honest. With it off, an empty
-    occupancy leaves the network no way to see that any structure exists, so
-    ``anchors-only`` and ``none`` can only guess a region; and an ``all``
-    occupancy built from ground-truth labels hands over the answer's silhouette,
-    which is oracle information no deployment has. The intensity volume is the
-    input that is always available, so it carries "what is there" while the
-    relations carry "which one" - see ``docs/phase_b_mri_investigation.md``.
+    The heatmap is a *separate* 1x1 on the working grid, not a reading of the
+    mask: it survives the prompt being empty, which the mask does not.
     """
 
     def __init__(
         self,
-        vocab_size: int,
-        resolution: int,
-        n_anchors: int = 3,
+        in_channels: int,
+        boundary_channels: int,
         *,
-        encoder_channels: Sequence[int] = (32, 64, 128, 256),
-        token_dim: int = 256,
-        num_heads: int = 4,
-        intersection_hidden: int | None = None,
-        bottleneck: int | None = None,
+        width: int = 16,
+        blocks: int = 2,
+        act: str = "leaky_relu",
+        full_resolution_skip: bool = True,
         prior_foreground: float = 0.0016,
-        image: bool = False,
-        selection: bool = False,
     ) -> None:
         super().__init__()
-        widths = [int(w) for w in encoder_channels]
-        grid = bottleneck_for(resolution, widths, bottleneck)
-        hidden = int(intersection_hidden or token_dim)
-        self.image = bool(image)
-        self.selection = bool(selection)
-        self.config = dict(
-            vocab_size=vocab_size, resolution=resolution, n_anchors=n_anchors,
-            encoder_channels=tuple(widths), token_dim=token_dim, num_heads=num_heads,
-            intersection_hidden=hidden, bottleneck=grid, prior_foreground=prior_foreground,
-            image=self.image, selection=self.selection,
-        )
-        self.n_anchors = n_anchors
-        self.encoder = Encoder(n_anchors, widths, "leaky_relu", coords=True)
-        self.prompt = RelationPrompt(vocab_size, n_anchors, token_dim)
-        self.structure = StructureEncoder(widths[-1], vocab_size, n_anchors, token_dim)
-        # One evidence branch, applied to every clause: sharing the parameters is
-        # what stops a clause being grounded by a slot-specific shortcut. All that
-        # distinguishes branch 2 from branch 1 is its tokens.
-        self.evidence = Evidence(widths[-1], token_dim, num_heads, (grid,) * 3, "leaky_relu")
-        self.intersection = Intersection(widths[-1], n_anchors, hidden, "leaky_relu")
-        self.decoder = Decoder(
-            widths, "leaky_relu", coords=True, refine=True,
-            context_dim=n_anchors * token_dim, occupancy=True, image=self.image,
-        )
-        self.head = nn.Conv3d(widths[0], 1, 1)
+        self.full_resolution_skip = bool(full_resolution_skip) and boundary_channels > 0
+        self.stem = ConvBlock(in_channels, width, act, stride=2)
+        self.blocks = nn.Sequential(*[ResBlock(width, act) for _ in range(int(blocks))])
+        self.head = nn.Conv3d(width + (boundary_channels if self.full_resolution_skip else 0), 1, 1)
         nn.init.zeros_(self.head.weight)
         nn.init.constant_(self.head.bias, prior_bias(prior_foreground))
-        self.selector = SelectionHead(widths[0], hidden) if self.selection else None
+        self.heatmap = nn.Conv3d(width, 1, 1)
+
+    def forward(self, x: Tensor, boundary: Tensor | None) -> tuple[Tensor, Tensor]:
+        """``-> (logits [B, 1, D, H, W], heatmap logits [B, 1, D/2, H/2, W/2])``."""
+        features = self.blocks(self.stem(x))
+        full = F.interpolate(features, size=x.shape[2:], mode="trilinear", align_corners=True)
+        if self.full_resolution_skip and boundary is not None:
+            full = torch.cat([full, boundary], dim=1)
+        return self.head(full), self.heatmap(features)
+
+
+def soft_argmax(
+    heatmap: Tensor, full: Sequence[int], spacing: Sequence[float]
+) -> Tensor:
+    """``[B, 1, d, h, w]`` logits -> ``[B, 3]`` world ``(x, y, z)``.
+
+    The expectation under a softmax over voxels, computed from the three axis
+    marginals of that distribution rather than a dense coordinate grid. The
+    result is continuous, so reading it off the carver's coarse working grid
+    costs resolution in the *weights*, not in the coordinate.
+    """
+    weights = torch.softmax(heatmap.flatten(1).float(), dim=-1).reshape(heatmap.shape)
+    axes = grid_world_axes(heatmap.shape[2:], full, spacing, heatmap.device, torch.float32)
+    return torch.stack(
+        [
+            (weights.sum(dim=(1, 2, 3)) * axes[0]).sum(-1),  # x
+            (weights.sum(dim=(1, 2, 4)) * axes[1]).sum(-1),  # y
+            (weights.sum(dim=(1, 3, 4)) * axes[2]).sum(-1),  # z
+        ],
+        dim=-1,
+    )
+
+
+@dataclass
+class StageBOutput:
+    """Everything one relational forward produces.
+
+    ``logits`` and ``valid`` are the answers; the rest is what the losses and the
+    report need, and is carried rather than recomputed because every piece of it
+    is a pure function of inputs the caller no longer holds.
+    """
+
+    logits: Tensor  # [B, 1, D, H, W]
+    valid: Tensor  # [B] one logit: do the clauses name a structure
+    centroid: Tensor  # [B, 3] world (x, y, z), soft-argmax of the heatmap
+    where_raw: Tensor  # [B, 1, D, H, W] the product, never renormalised
+    where_mass: Tensor  # [B, 1]
+    fields: Tensor  # [B, A, D, H, W]
+    anchors: Tensor  # [B, A, D, H, W] detached soft masks
+    masses: Tensor  # [B, A]
+    anchor_centroids: Tensor  # [B, A, 3]
+
+
+class StageB(nn.Module):
+    """Segment the structure the three clauses describe and never name.
+
+    One forward: the three names go to the frozen Stage A and produce detached
+    soft masks; :class:`~src.mapper.PositionalMapper3D` turns those masks and the
+    three direction ids into the fields and their product; ``B`` reads the image
+    with no knowledge of any of that; the carver puts them together; and the null
+    head reads four scalars.
+
+    The segmenter is a submodule so the checkpoint is self-contained and the
+    signature can admit nothing else - but it is frozen at construction, it is
+    excluded from :meth:`trainable_parameters`, and :meth:`train` keeps it in
+    ``eval``. The relational loss does not flow back into it.
+    """
+
+    def __init__(
+        self,
+        segmenter: dict,
+        *,
+        spacing: Sequence[float] = (1.0, 1.0, 1.0),
+        n_anchors: int = 3,
+        tau: float = 0.5,
+        min_mass: float = 1e-6,
+        boundary_widths: Sequence[int] = (16, 32, 32),
+        carver_width: int = 16,
+        carver_blocks: int = 2,
+        full_resolution_skip: bool = True,
+        use_image: bool = True,
+        additive_prior: bool = False,
+        alpha: float = 0.35,
+        background_logit: float = -10.0,
+        prior_foreground: float = 0.0016,
+    ) -> None:
+        super().__init__()
+        self.config = dict(
+            segmenter=dict(segmenter), spacing=tuple(float(v) for v in spacing),
+            n_anchors=int(n_anchors), tau=float(tau), min_mass=float(min_mass),
+            boundary_widths=tuple(int(w) for w in boundary_widths),
+            carver_width=int(carver_width), carver_blocks=int(carver_blocks),
+            full_resolution_skip=bool(full_resolution_skip), use_image=bool(use_image),
+            additive_prior=bool(additive_prior), alpha=float(alpha),
+            background_logit=float(background_logit), prior_foreground=float(prior_foreground),
+        )
+        self.n_anchors = int(n_anchors)
+        self.spacing = tuple(float(v) for v in spacing)
+        self.use_image = bool(use_image)
+        self.additive_prior = bool(additive_prior)
+        self.background_logit = float(background_logit)
+
+        self.segmenter = StageA(**segmenter)
+        self.segmenter.requires_grad_(False).eval()
+        resolution = int(self.segmenter.config["resolution"])
+        self.resolution = resolution
+        self.center = tuple(volume_center_world((resolution,) * 3, self.spacing).tolist())
+
+        self.mapper = PositionalMapper3D(tau=tau, min_mass=min_mass)
+        self.boundary = BoundaryEncoder(boundary_widths) if self.use_image else None
+        boundary_channels = self.boundary.out_channels if self.boundary is not None else 0
+        # A_i (n) + F_i (n) + where_raw + log(where_raw) + where_mass, plus B(I).
+        self.carver = Carver(
+            boundary_channels + 2 * self.n_anchors + 3, boundary_channels,
+            width=carver_width, blocks=carver_blocks,
+            full_resolution_skip=full_resolution_skip, prior_foreground=prior_foreground,
+        )
+        self.null = NullHead(self.n_anchors)
+        #: Set by the trainer when ``B`` came from a pretraining run; 1.0 otherwise.
+        self.boundary_lr_scale = 1.0
+        # One scalar, with no other input. It cannot depend on the MRI, a class
+        # or a name - that is what makes the additive form an ablation and not a
+        # second, learned field.
+        self.alpha = nn.Parameter(torch.tensor(float(alpha))) if self.additive_prior else None
+
+    # -- the freeze -------------------------------------------------------
+    def train(self, mode: bool = True) -> "StageB":
+        super().train(mode)
+        self.segmenter.eval()  # frozen; never a training-mode submodule
+        return self
+
+    def trainable_parameters(self):
+        """Every parameter except the frozen segmenter's - what the optimiser gets."""
+        frozen = {id(p) for p in self.segmenter.parameters()}
+        return [p for p in self.parameters() if id(p) not in frozen]
+
+    def parameter_groups(self, lr: float) -> list[dict]:
+        """Two groups when ``B`` was pretrained: the carver at ``lr``, ``B`` below it.
+
+        §4: ``B`` "is pretrained, then given a lower learning rate while the
+        carver trains". ``boundary_lr_scale`` stays 1.0 when ``B`` starts from
+        scratch, because there is nothing to preserve.
+        """
+        if self.boundary is None or self.boundary_lr_scale == 1.0:
+            return [{"params": self.trainable_parameters(), "lr": lr}]
+        boundary = list(self.boundary.parameters())
+        held = {id(p) for p in boundary}
+        return [
+            {"params": [p for p in self.trainable_parameters() if id(p) not in held], "lr": lr},
+            {"params": boundary, "lr": lr * self.boundary_lr_scale},
+        ]
+
+    def load_segmenter(self, model: StageA) -> "StageB":
+        """Copy a trained Stage A's weights in, then re-freeze."""
+        if dict(model.config) != dict(self.config["segmenter"]):
+            raise ValueError(
+                f"segmenter architecture {dict(model.config)} does not match the one this "
+                f"Stage B was built for, {dict(self.config['segmenter'])}"
+            )
+        self.segmenter.load_state_dict(model.state_dict())
+        self.segmenter.requires_grad_(False).eval()
+        return self
+
+    @classmethod
+    def from_segmenter(cls, model: StageA, **kwargs) -> "StageB":
+        """Build around a trained Stage A and copy its weights in."""
+        return cls(dict(model.config), **kwargs).load_segmenter(model)
+
+    # -- the forward ------------------------------------------------------
+    def anchor_probability(self, image: Tensor, name_ids: Tensor) -> Tensor:
+        """``A_i = stop_gradient(sigmoid(anchor_logits_i))``, for those three names only.
+
+        No other mask is offered to the carver, and Stage A's features are
+        discarded here rather than passed on.
+        """
+        return self.segmenter.probability(image, name_ids).detach()
 
     def forward(
         self,
-        anchors: Tensor,
+        image: Tensor,
         direction_ids: Tensor,
         name_ids: Tensor,
-        occupancy: Tensor,
-        image: Tensor | None = None,
-        candidates: Tensor | None = None,
+        *,
+        anchors: Tensor | None = None,
+        boundary_image: Tensor | None = None,
     ) -> StageBOutput:
-        """``[B, A, D, H, W]`` anchors + ``[B, A]`` clause ids + occupancy -> logits."""
-        if anchors.shape[1] != self.n_anchors:
-            raise ValueError(f"expected {self.n_anchors} anchor channels, got {anchors.shape[1]}")
-        if self.image and image is None:
-            raise ValueError("this model was built with image=True; pass the intensity volume")
-        if image is not None and not self.image:
-            raise ValueError("this model was built with image=False; it has no channel for one")
-        anchors = anchors.to(torch.float32)
-        occupancy = occupancy.to(torch.float32) * (1 - anchors.amax(dim=1, keepdim=True))
+        """``[B, 1, D, H, W]`` + ``[B, A]`` directions + ``[B, A]`` names -> :class:`StageBOutput`.
 
-        features = self.encoder(anchors)
-        relations = self.prompt(direction_ids, name_ids)
-        structures = self.structure(anchors, features[-1], name_ids)
+        ``anchors`` substitutes the three detached soft masks that Stage A would
+        have produced - the precomputed-anchor cache, and the ground-truth
+        diagnostic. It is the *only* mask input this signature admits, it cannot
+        identify the target, and which source was used is recorded in the run.
 
-        maps, clauses = [], []
-        for slot in range(self.n_anchors):
-            evidence, clause = self.evidence(features[-1], relations[:, slot], structures[:, slot])
-            maps.append(evidence)
-            clauses.append(clause)
-        features[-1] = features[-1] + self.intersection(maps)
-        stages = self.decoder(
-            features, context=torch.cat(clauses, dim=-1), occupancy=occupancy,
-            image=None if image is None else image.to(torch.float32),
+        ``boundary_image`` is the §7 image-replacement test: the volume ``B``
+        reads, when it is not the one the anchors came from. The anchors and
+        every field stay this subject's.
+        """
+        if name_ids.shape[1] != self.n_anchors or direction_ids.shape != name_ids.shape:
+            raise ValueError(
+                f"expected [B, {self.n_anchors}] direction and name ids, got "
+                f"{tuple(direction_ids.shape)} and {tuple(name_ids.shape)}"
+            )
+        if anchors is None:
+            anchors = self.anchor_probability(image, name_ids)
+        anchors = anchors.detach().float()
+
+        # The mapper has no parameters and its inputs are detached, so nothing
+        # here is on the graph. Saying so keeps three full-volume intermediates
+        # from being held for a backward pass that will never read them.
+        with torch.no_grad():
+            field = self.mapper(anchors, direction_ids, self.spacing, self.center)
+        where = field.where_raw
+        log_where = where.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
+        log_mass = (
+            field.where_mass.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
+        ).reshape(-1, 1, 1, 1, 1).expand_as(where)
+
+        boundary = None
+        if self.boundary is not None:
+            source = image if boundary_image is None else boundary_image
+            boundary = self.boundary(source.to(torch.float32))
+        parts = [anchors, field.fields, where, log_where, log_mass]
+        # Under autocast the boundary features come back in the low-precision
+        # dtype while the geometry is float32; the concatenation has to agree,
+        # and matching the features is what keeps the 25-channel input at 128^3
+        # off the float32 path.
+        dtype = boundary.dtype if boundary is not None else torch.float32
+        logits, heatmap = self.carver(
+            torch.cat(([boundary] if boundary is not None else []) + [p.to(dtype) for p in parts], dim=1),
+            boundary,
         )
-        scores = None
-        if self.selector is not None and candidates is not None:
-            scores = self.selector(stages[-1], candidates)
-        return StageBOutput(logits=self.head(stages[-1]), evidence=maps, selection=scores)
+
+        if self.alpha is not None:
+            # The ablation: a weak explicit bias, one scalar, no other input.
+            logits = logits + self.alpha * torch.logit(where.clamp(1e-4, 1 - 1e-4))
+        # Anchor voxels are the given, not the answer. The exclusion uses the
+        # predicted soft mask, never the label volume, and it is not dilated.
+        logits = logits.masked_fill(anchors.amax(dim=1, keepdim=True) > 0.5, self.background_logit)
+
+        return StageBOutput(
+            logits=logits,
+            valid=self.null(field.where_mass, field.masses),
+            centroid=soft_argmax(heatmap, (self.resolution,) * 3, self.spacing),
+            where_raw=where,
+            where_mass=field.where_mass,
+            fields=field.fields,
+            anchors=anchors,
+            masses=field.masses,
+            anchor_centroids=field.centroids,
+        )

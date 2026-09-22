@@ -1,6 +1,6 @@
 """The corpus on disk, and the two datasets read from it.
 
-Layout, identical for synthetic and real data::
+Layout::
 
     <root>/
       meta.json                     shape, spacing, anchors per prompt, target split
@@ -19,14 +19,25 @@ on the accelerator from the one label volume the dataset returns. That keeps a
 sample small enough to stay cheap at 128^3 with a large vocabulary, and it makes
 it impossible for a stored mask to drift out of step with its label volume.
 
-Augmentation is one axis-aligned rotation of the octahedral group per item. It
-needs no "relation rewrite": the rotated volume is fed back through the same
-:func:`src.geometry.select_anchors` that built the corpus, so the clauses are
-re-derived rather than relabelled.
+Stage A augments with one axis-aligned rotation of the octahedral group per
+item. **Stage B does not rotate**, and that is a change from earlier branches:
+``docs/proposal/relational_architecture.md`` §5 gives it exactly one
+augmentation, the direction flip, and a rotated head is not a pose the boundary
+encoder will ever be asked about. Dropping it also makes Stage A's output a
+function of the scene alone, which is what lets it be computed once and cached.
+
+The flip is the interesting one. One clause is replaced by its opposite with
+probability ``train.stage_b.flip_probability``; the new clauses are then scored
+against the corpus's own rule, and a flip is **not assumed to be empty**:
+
+* exactly one structure -> that mask, that centroid, the null target ``valid``;
+* none -> the empty mask, the null target ``invalid``, heatmap still on the field;
+* more than one -> the example is dropped, and ``keep`` is how it is dropped.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import zlib
 from dataclasses import dataclass
@@ -39,8 +50,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from src.geometry import (
-    DIRECTIONS, anchor_first_examples, centroids_world, directions_for,
-    select_anchors, solutions_for, volume_center_world,
+    DIRECTIONS, OPPOSITE, anchor_first_examples, centroids_world, solutions_for,
+    volume_center_world,
 )
 from src.vocab import Vocabulary
 
@@ -74,7 +85,7 @@ def load_nifti(path: Path | str, dtype=np.float32) -> np.ndarray:
 def normalize(image: np.ndarray, mode: str = "none") -> np.ndarray:
     """Intensity normalisation: ``none`` or a per-volume ``zscore``.
 
-    ``none`` is the default because the synthetic generator already emits a
+    ``none`` is the default because a corpus may already be written with a
     bounded [0, 1] image and that is what the published runs were trained on.
     Real MRI has no such guarantee - set ``data.normalize: zscore`` for it, or
     replace this function with percentile clipping or a bias-field correction if
@@ -86,13 +97,6 @@ def normalize(image: np.ndarray, mode: str = "none") -> np.ndarray:
     if mode == "zscore":
         return (image - image.mean()) / (image.std() + 1e-6)
     if mode == "zscore-brain":
-        # `zscore` takes whole-volume statistics. With `mri.apply_brainmask`,
-        # 66.5% of an HCP volume is exact zero, which drags the mean to +1.35
-        # sigma and squeezes every real tissue contrast into ~0.52 sigma - and
-        # the offset moves per subject with head size and brainmask tightness.
-        # Measuring over the brain instead puts tissue at mean 0, std 1 for
-        # every subject. NOTE: `!= 0` is a proxy for "inside the brain" that
-        # holds only while the corpus was written with `apply_brainmask: true`.
         brain = image[image != 0]
         if brain.size == 0:
             return image
@@ -112,98 +116,49 @@ def build_examples(
     spacing: Sequence[float],
     n_anchors: int = 3,
     *,
-    pool: int | None = None,
     shuffle_clauses: bool = True,
-    selection: str = "target-first",
     triples: int = 300,
     locality: int = 8,
-    unique_only: bool = True,
     stats: dict[str, int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Every relational example a scene supports: one per structure, as target.
+    """Every relational example a scene supports, anchor-first.
 
-    A target is dropped - not repaired - when no set of ``n_anchors`` structures
-    with pairwise-distinct directions exists for it.
+    The landmark triple is fixed first and the targets follow, so one anchor set
+    serves several targets and only the direction words tell them apart. A triple
+    whose conjunction is not unique is dropped, which makes well-posedness hold by
+    construction rather than by luck.
 
-    Anchor order is randomised, from a generator seeded by ``(scene_id, target)``
-    so the manifest stays reproducible from the scene alone. Order must carry no
-    information: the anchors are ranked by distance to choose them, and storing
-    that ranking would make the slot index a proxy for proximity. The randomised
-    order is then shared by the prompt clauses and the mask channels - clause
-    ``i`` always describes channel ``i``.
+    Anchor order is randomised, from a generator seeded by ``scene_id`` so the
+    manifest stays reproducible from the scene alone. The randomised order is
+    then shared by the prompt clauses and the mask channels - clause ``i`` always
+    describes channel ``i`` (:func:`src.geometry.anchor_first_examples`).
     """
     present = [int(v) for v in np.unique(labels) if v != 0]
     centroids = centroids_world(labels, len(vocab), tuple(spacing))
     center = volume_center_world(labels.shape, tuple(spacing))
-    seed = zlib.crc32(scene_id.encode("utf-8"))
+    rng = np.random.default_rng([zlib.crc32(scene_id.encode("utf-8")), 0])
 
-    def record(index: int, target: int, anchors: Sequence[int], directions: Sequence[str]):
-        clauses = [{"direction": d, "anchor": vocab.name(a)} for a, d in zip(anchors, directions)]
-        return {
-            "scene": scene_id,
-            "id": f"{scene_id}__{vocab.name(target)}__{index}",
-            "target": int(target),
-            "anchors": [int(a) for a in anchors],
-            "directions": list(directions),
-            "prompt": vocab.render(clauses),
-        }
-
-    if selection == "anchor-first":
-        rng = np.random.default_rng([seed, 0])
-        found = anchor_first_examples(
-            centroids, present, center, n_anchors,
-            triples=triples, locality=locality, rng=rng, shuffle=shuffle_clauses,
-        )
-        counter: dict[int, int] = {}
-        examples = []
-        for anchors, directions, target in found:
-            counter[target] = counter.get(target, 0) + 1
-            examples.append(record(counter[target] - 1, target, anchors, directions))
-        if stats is not None:
-            stats["examples"] = stats.get("examples", 0) + len(examples)
-        return examples
-
-    if selection != "target-first":
-        raise ValueError(f"selection must be 'target-first' or 'anchor-first', got {selection!r}")
-
-    fallbacks: list[int] = []
+    counter: dict[int, int] = {}
     examples = []
-    for target in present:
-        rng = np.random.default_rng([seed, target])
-        chosen = select_anchors(
-            target, centroids, present, center, n_anchors,
-            pool=pool, rng=rng, shuffle=shuffle_clauses, fallbacks=fallbacks,
+    for anchors, directions, target in anchor_first_examples(
+        centroids, present, center, n_anchors,
+        triples=triples, locality=locality, rng=rng, shuffle=shuffle_clauses,
+    ):
+        counter[target] = counter.get(target, 0) + 1
+        clauses = [{"direction": d, "anchor": vocab.name(a)} for a, d in zip(anchors, directions)]
+        examples.append(
+            {
+                "scene": scene_id,
+                "id": f"{scene_id}__{vocab.name(target)}__{counter[target] - 1}",
+                "target": int(target),
+                "anchors": [int(a) for a in anchors],
+                "directions": list(directions),
+                "prompt": vocab.render(clauses),
+            }
         )
-        if chosen is None:
-            continue
-        anchors = [label for label, _ in chosen]
-        directions = [d for _, d in chosen]
-        # A prompt that describes more than one structure teaches the model to
-        # prefer one defensible reading over another. Drop it rather than
-        # supervise on it - well-posedness by construction, not by luck.
-        if unique_only and len(
-            solutions_for(anchors, directions, centroids, present, center)
-        ) != 1:
-            if stats is not None:
-                stats["dropped_ambiguous"] = stats.get("dropped_ambiguous", 0) + 1
-            continue
-        examples.append(record(0, target, anchors, directions))
     if stats is not None:
         stats["examples"] = stats.get("examples", 0) + len(examples)
-        stats["pool_fallbacks"] = stats.get("pool_fallbacks", 0) + len(fallbacks)
     return examples
-
-
-def check_scene(labels: np.ndarray, expected: int, margin: int) -> None:
-    """Fail fast on a malformed scene: missing structures, or one touching the border."""
-    present = {int(v) for v in np.unique(labels)} - {0}
-    if len(present) != expected:
-        raise ValueError(f"expected {expected} structures, found {sorted(present)}")
-    if margin > 0:
-        interior = np.zeros(labels.shape, dtype=bool)
-        interior[margin:-margin, margin:-margin, margin:-margin] = True
-        if np.any((labels != 0) & ~interior):
-            raise ValueError(f"a structure is closer than {margin} voxels to the border")
 
 
 def write_scene(root: Path | str, scene_id: str, image: np.ndarray, labels: np.ndarray, spacing) -> Path:
@@ -223,8 +178,6 @@ def write_corpus(
     spacing: Sequence[float],
     n_anchors: int,
     targets: Mapping[str, Sequence[str]],
-    anchor_pool: int | None = None,
-    selection: str = "target-first",
     shuffle_clauses: bool = True,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
@@ -243,8 +196,7 @@ def write_corpus(
         "shape": [int(v) for v in shape],
         "spacing": [float(v) for v in spacing],
         "n_anchors": int(n_anchors),
-        "anchor_pool": int(n_anchors if anchor_pool is None else anchor_pool),
-        "selection": str(selection),
+        "selection": "anchor-first",
         "shuffle_clauses": bool(shuffle_clauses),
         "targets": {split: list(names) for split, names in targets.items()},
         "examples": counts,
@@ -262,7 +214,6 @@ def import_corpus(
     *,
     spacing: Sequence[float] = (1.0, 1.0, 1.0),
     n_anchors: int = 3,
-    anchor_pool: int | None = None,
     targets: Mapping[str, Sequence[str]] | None = None,
     extra: Mapping[str, Any] | None = None,
 ) -> Path:
@@ -278,8 +229,8 @@ def import_corpus(
         targets: which structure names each split may supervise as a target;
             defaults to every name in every split.
 
-    This is the only entry point real MRI needs - see
-    ``docs/method/08_scaling.md``. ``scripts/import_mri.py`` is the HCP path.
+    This is the only entry point real MRI needs; ``scripts/import_mri.py`` is
+    the HCP path.
     """
     vocab = Vocabulary(tuple(label_names.values()))
     remap = np.zeros(max(label_names) + 1, dtype=np.uint16)
@@ -299,9 +250,7 @@ def import_corpus(
             labels = mapped
             shape = shape or labels.shape
             write_scene(root, scene_id, image, labels, spacing)
-            manifests[split] += build_examples(
-                scene_id, labels, vocab, spacing, n_anchors, pool=anchor_pool
-            )
+            manifests[split] += build_examples(scene_id, labels, vocab, spacing, n_anchors)
     if shape is None:
         raise ValueError("no scenes to import")
     return write_corpus(
@@ -312,9 +261,54 @@ def import_corpus(
         spacing=spacing,
         n_anchors=n_anchors,
         targets=targets or {split: list(vocab.names) for split in splits},
-        anchor_pool=anchor_pool,
         extra=extra,
     )
+
+
+# ---------------------------------------------------------------------------
+# The frozen segmenter's soft masks, precomputed
+# ---------------------------------------------------------------------------
+def anchor_cache_dir(root: Path | str, segmenter: Path | str) -> Path:
+    """Where ``scripts/cache_anchors.py`` writes one checkpoint's soft masks.
+
+    Keyed by the SHA-256 of the checkpoint file, so a different Stage A writes a
+    different directory. A stale cache cannot be picked up silently - it simply
+    is not there for the checkpoint being used.
+    """
+    digest = hashlib.sha256(Path(segmenter).read_bytes()).hexdigest()[:12]
+    return Path(root) / "anchors" / digest
+
+
+class AnchorCache:
+    """Read back one scene's soft masks, as bounding-box crops in float16.
+
+    Stage A is frozen and Stage B does not rotate, so its output for a scene is a
+    constant; this is that constant. ``take`` expands only the structures a
+    prompt names, which is three of a vocabulary of twenty-three.
+    """
+
+    def __init__(self, directory: Path | str, shape: Sequence[int]) -> None:
+        self.directory, self.shape = Path(directory), tuple(int(v) for v in shape)
+        self.store: dict[str, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    def _scene(self, scene_id: str):
+        if scene_id not in self.store:
+            with np.load(self.directory / f"{scene_id}.npz") as archive:
+                self.store[scene_id] = (archive["bbox"], archive["data"], archive["offset"])
+        return self.store[scene_id]
+
+    def take(self, scene_id: str, labels: Sequence[int]) -> np.ndarray:
+        """``[K, D, H, W]`` float16 soft masks for those label ids, in order."""
+        bbox, data, offset = self._scene(scene_id)
+        out = np.zeros((len(labels), *self.shape), dtype=np.float16)
+        for slot, label in enumerate(labels):
+            channel = int(label) - 1  # label id == vocabulary index + 1
+            z0, y0, x0, z1, y1, x1 = (int(v) for v in bbox[channel])
+            if z1 <= z0:
+                continue
+            crop = data[offset[channel]:offset[channel + 1]]
+            out[slot, z0:z1, y0:y1, x0:x1] = crop.reshape(z1 - z0, y1 - y0, x1 - x0)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +326,7 @@ class Corpus:
     def load(cls, root: Path | str) -> "Corpus":
         root = Path(root)
         if not (root / "meta.json").is_file():
-            raise FileNotFoundError(f"no corpus at {root}; run scripts/generate_data.py first")
+            raise FileNotFoundError(f"no corpus at {root}; run scripts/import_mri.py first")
         return cls(
             root=root,
             vocab=Vocabulary.load(root / "vocab.json"),
@@ -350,30 +344,6 @@ class Corpus:
     @property
     def n_anchors(self) -> int:
         return int(self.meta["n_anchors"])
-
-    @property
-    def selection(self) -> str:
-        """``target-first`` (anchors nearest the target) or ``anchor-first``.
-
-        Absent in corpora written before anchor-first existed, where it was
-        always target-first.
-        """
-        return str(self.meta.get("selection", "target-first"))
-
-    @property
-    def shuffle_clauses(self) -> bool:
-        """Whether slot order was randomised when the manifest was written."""
-        return bool(self.meta.get("shuffle_clauses", True))
-
-    @property
-    def anchor_pool(self) -> int:
-        """How many nearest candidates anchors were drawn from.
-
-        Stored so augmentation, which re-derives the clauses every epoch, samples
-        the same way the manifest was built. Absent in corpora written before the
-        knob existed, where it was the deterministic nearest-feasible set.
-        """
-        return int(self.meta.get("anchor_pool", self.n_anchors))
 
     def records(self, split: str, targets: Sequence[str] | None = None) -> list[dict[str, Any]]:
         """Manifest rows of a split, filtered to the target classes it supervises."""
@@ -504,13 +474,36 @@ class SceneDataset(Dataset):
 
 
 class ExampleDataset(Dataset):
-    """Stage B: three ordered anchors and a prompt in, one target mask out.
+    """Stage B: an image and three clauses in, one target mask out.
 
-    Under augmentation the volume is rotated and the clauses are *re-derived*
-    from the rotated geometry, so the prompt always describes the volume that is
-    actually in the tensor. A rotation for which no feasible anchor set exists is
-    skipped and the stored pose is used instead.
+    The prompt is the manifest's, except when the flip fires. Then one clause is
+    replaced by its opposite and the result is re-scored against the same rule
+    that built the corpus, using this scene's own geometry
+    (:func:`src.geometry.solutions_for`) - so a flip is *measured*, never assumed
+    to be empty:
+
+    ==============================  ===========================================
+    the new clauses name...         what the item carries
+    ==============================  ===========================================
+    exactly one structure           that target, ``valid = 1``, ``keep = 1``
+    none                            ``target = 0``, ``valid = 0``, ``keep = 1``
+    more than one                   ``keep = 0`` - in no loss and no metric
+    ==============================  ===========================================
+
+    ``keep = 0`` is how "dropped" is implemented. A ``Dataset`` has to return an
+    item, so the example is emitted and then excluded from every term by weight;
+    measured on ``data/mri``, a flip names two or more structures 33% of the
+    time, names none 66% and retargets 1%.
+
+    Flipping is training-only. A validation curve mixing retargeted and
+    empty-mask prompts would move ``best.pt`` for reasons that have nothing to do
+    with the model getting better, and an empty prediction against an empty
+    target scores Dice 1.0.
     """
+
+    #: What ``target_name`` says when the clauses name nothing. It is a group
+    #: label for the metric breakdown, never a vocabulary entry.
+    NONE = "<none>"
 
     def __init__(
         self,
@@ -519,7 +512,8 @@ class ExampleDataset(Dataset):
         *,
         targets: Sequence[str] | None = None,
         scenes: Sequence[str] | None = None,
-        augment: bool = False,
+        flip_probability: float = 0.0,
+        anchor_cache: Path | str | None = None,
         limit: int | None = None,
         sample: int | None = None,
         seed: int = 0,
@@ -540,9 +534,10 @@ class ExampleDataset(Dataset):
             picked = np.random.default_rng(seed).permutation(len(records))[:sample]
             records = [records[int(i)] for i in sorted(picked)]
         self.records = records[: limit or None]
-        self.augment = augment
+        self.flip_probability = float(flip_probability)
         self.epoch = torch.zeros((), dtype=torch.long).share_memory_()
         self._cache = _SceneCache(corpus.root, cache, normalize_mode)
+        self._anchors = None if anchor_cache is None else AnchorCache(anchor_cache, corpus.shape)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -557,54 +552,60 @@ class ExampleDataset(Dataset):
             counts[name] = counts.get(name, 0) + 1
         return dict(sorted(counts.items()))
 
-    def _augment(self, image, labels, record, rng):
-        """Rotate, then rebuild the clause list from the rotated geometry."""
-        sequence = ROTATIONS[rng.integers(len(ROTATIONS))]
-        rotated_labels = rotate(labels, sequence)
+    def flip(self, record, labels, rng) -> tuple[dict[str, Any], int]:
+        """One clause to its opposite, re-scored. ``(record, keep)``.
+
+        A retargeted flip carries the new target; an empty one carries
+        ``target = 0``, which is the background and therefore *not a structure*.
+        That is the single representation of "the clauses name nothing", and
+        ``__getitem__`` derives ``valid`` from it rather than tracking a second
+        flag that could disagree with it.
+        """
+        directions = list(record["directions"])
+        slot = int(rng.integers(len(directions)))
+        directions[slot] = OPPOSITE[directions[slot]]
+        if len(set(directions)) != len(directions):
+            return record, 0  # two clauses naming one side is not a prompt
         vocab, spacing = self.corpus.vocab, self.corpus.spacing
-        present = [int(v) for v in np.unique(rotated_labels) if v != 0]
-        centroids = centroids_world(rotated_labels, len(vocab), spacing)
-        center = volume_center_world(rotated_labels.shape, spacing)
-        if self.corpus.selection == "anchor-first":
-            # Keep the stored anchors and target; only re-derive the directions,
-            # which is all the rotation changed. Re-*selecting* here would draw a
-            # fresh triple nearest the target and quietly turn an anchor-first
-            # corpus back into a target-first one, one epoch at a time.
-            anchors = [int(a) for a in record["anchors"]]
-            if any(a not in present for a in anchors):
-                return image, labels, record
-            directions = directions_for(record["target"], anchors, centroids, center)
-            if directions is None:
-                return image, labels, record
-            if len(solutions_for(anchors, directions, centroids, present, center)) != 1:
-                return image, labels, record  # the rotation broke uniqueness
-            chosen = list(zip(anchors, directions))
-        else:
-            chosen = select_anchors(
-                record["target"], centroids, present, center,
-                self.corpus.n_anchors, pool=self.corpus.anchor_pool, rng=rng,
-                shuffle=self.corpus.shuffle_clauses,
-            )
-        if chosen is None:  # no feasible anchor set in this pose: keep the stored one
-            return image, labels, record
-        clauses = [{"direction": d, "anchor": vocab.name(label)} for label, d in chosen]
-        record = {
+        present = [int(v) for v in np.unique(labels) if v != 0]
+        centroids = centroids_world(labels, len(vocab), spacing)
+        center = volume_center_world(labels.shape, spacing)
+        solutions = solutions_for(record["anchors"], directions, centroids, present, center)
+        if len(solutions) > 1:
+            return record, 0
+        clauses = [
+            {"direction": d, "anchor": vocab.name(a)}
+            for a, d in zip(record["anchors"], directions)
+        ]
+        return {
             **record,
-            "anchors": [label for label, _ in chosen],
-            "directions": [d for _, d in chosen],
+            "directions": directions,
+            "target": int(solutions[0]) if solutions else 0,
             "prompt": vocab.render(clauses),
-        }
-        return rotate(image, sequence), rotated_labels, record
+        }, 1
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         image, labels = self._cache.get(record["scene"])
-        if self.augment:
-            image, labels, record = self._augment(
-                image, labels, record, np.random.default_rng([int(self.epoch), index])
-            )
+        keep = 1
+        if self.flip_probability > 0:
+            rng = np.random.default_rng([int(self.epoch), index])
+            if float(rng.random()) < self.flip_probability:
+                record, keep = self.flip(record, labels, rng)
+        # Label 0 is the background and is never a structure, so `target = 0`
+        # *is* "the clauses name nothing" - including for a population of empty
+        # prompts written straight into `records` (`scripts/evaluate.py`).
+        valid = int(record["target"] != 0)
         vocab = self.corpus.vocab
+        item = {}
+        if self._anchors is not None:
+            # Exactly the three detached probabilities Stage A would have
+            # produced. Nothing else about the cache reaches the model.
+            item["anchor_probability"] = torch.from_numpy(
+                self._anchors.take(record["scene"], record["anchors"])
+            )
         return {
+            **item,
             "image": torch.from_numpy(np.ascontiguousarray(image)).unsqueeze(0),
             "labels": torch.from_numpy(np.ascontiguousarray(labels)),
             "target": torch.tensor(record["target"], dtype=torch.long),
@@ -612,10 +613,12 @@ class ExampleDataset(Dataset):
             "direction_ids": torch.tensor(
                 [DIRECTIONS.index(d) for d in record["directions"]], dtype=torch.long
             ),
+            "valid": torch.tensor(valid, dtype=torch.long),
+            "keep": torch.tensor(keep, dtype=torch.long),
             "example_id": record["id"],
             "scene": record["scene"],
             "prompt": record["prompt"],
-            "target_name": vocab.name(record["target"]),
+            "target_name": vocab.name(record["target"]) if valid else self.NONE,
             "anchor_names": [vocab.name(label) for label in record["anchors"]],
             "directions": list(record["directions"]),
         }
