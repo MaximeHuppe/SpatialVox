@@ -4,8 +4,8 @@
 a set of structure names in, one mask per name out. It is trained beforehand on
 every name that may be an anchor, then frozen. Nothing below trains it.
 
-**Stage B** (:class:`StageB`) is the relational model of
-``docs/proposal/relational_architecture.md``. Its inputs are the MRI and three
+**Stage B** (:class:`StageB`) is the relational model documented in
+``documentation/SpatialVox.md``. Its inputs are the MRI and three
 clauses, each a direction and an anchor name, and it segments a structure the
 prompt never names::
 
@@ -511,7 +511,7 @@ class Carver(nn.Module):
     ``full_resolution_skip`` carries ``B(I)`` past that stem, so the final 1x1
     sees the boundary features at the resolution they were computed at. It
     defaults on, and it is a departure from the literal reading of §4 recorded in
-    ``docs/proposal/deviations.md``: a stride-2 stem otherwise destroys exactly
+    ``documentation/SpatialVox.md`` (Deviations): a stride-2 stem otherwise destroys exactly
     the full-resolution boundary detail the method claims the mask is drawn from,
     which would leave a trilinear upsample of a 2.5 mm grid as the only path to
     the output. It is a flag so the claim stays measurable.

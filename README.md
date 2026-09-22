@@ -25,11 +25,15 @@ clauses [B, 3] × {direction, name}
 no name, pair or slot embedding exists anywhere downstream. The direction words
 are consumed by a parameter-free geometric mapper and by nothing else.
 
-The architecture is [`docs/proposal/relational_architecture.md`](docs/proposal/relational_architecture.md);
-every place the implementation departs from it is recorded, with the measurement
-that justified it, in [`docs/proposal/deviations.md`](docs/proposal/deviations.md).
-`CLAUDE.md` is the short version: the invariants that make the claim mean
-something.
+The strategy, the method and the architecture, step by step from an HCP scan to a
+reported number, are in [`documentation/SpatialVox.md`](documentation/SpatialVox.md).
+That covers every departure from the original proposal, with the measurement that
+justified it. The model is drawn on one page in
+[`documentation/Flowchart.md`](documentation/Flowchart.md), and every experiment,
+its parent and what the change did to the score is in
+[`documentation/Result_tracker/`](documentation/Result_tracker/Result_tracker.md).
+`documentation/` is an Obsidian vault. `CLAUDE.md` is the short version: the
+invariants that make the claim mean something.
 
 ## The four pieces
 
@@ -61,7 +65,7 @@ Silicon).
 .venv/bin/python scripts/import_mri.py
 .venv/bin/python scripts/corpus_report.py            # the prompt-blind floor a Dice is read against
 
-# 2. the gate. §2 makes this a precondition, not a diagnostic.
+# 2. the gate: a precondition, not a diagnostic.
 .venv/bin/python scripts/gate_mapper.py --segmenter runs/phase-a/current/best.pt
 
 # 3. Stage A, then frozen
@@ -112,19 +116,22 @@ the Dice is the third:
 ## Layout
 
 ```text
-configs/config.yaml   every tunable, in one file
+configs/config.yaml   every tunable for the MRI corpus, in one file
+configs/synthetic*.yaml  the synthetic corpora (synthetic-hard.yaml now points at data/synthetic-mri)
 src/config.py         load it, override any leaf from the command line
 src/geometry.py       centroids, the direction rule, anchor-first generation
 src/vocab.py          structure names, and the prompt language over them
 src/mapper.py         PositionalMapper3D - the WHERE, with no parameters
 src/mri.py            HCP/FreeSurfer volumes -> this project's corpus
+src/synthetic.py      packed primitives with a controllable appearance (the synthetic corpora)
 src/data.py           corpus on disk, the datasets, the direction flip
 src/models.py         Stage A; the boundary encoder, carver and null head
-src/engine.py         the losses of §5, metrics, one training loop per stage
-scripts/              import_mri, rebuild_manifests, corpus_report, gate_mapper,
-                      cache_anchors, train, evaluate
+src/engine.py         the five losses, metrics, one training loop per stage
+scripts/              import_mri, generate_data, rebuild_manifests, corpus_report,
+                      gate_mapper, cache_anchors, train, evaluate
 tests/                the mapper, the model contracts, the losses, the corpus
-docs/proposal/        the architecture, the deviations, and the baseline it is not
+documentation/        Obsidian vault: SpatialVox (the document), Flowchart (+ .drawio), Result_tracker,
+                      Model Info (one note per module)
 ```
 
 ## Conventions

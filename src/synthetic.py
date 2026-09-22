@@ -3,7 +3,7 @@
 This module produces exactly what a real dataset produces - an intensity volume
 and an integer label volume - and nothing else. Everything downstream (relations,
 prompts, manifests, training) is written against that pair, so swapping this file
-for real MRI changes no other code. See ``docs/method/08_scaling.md``.
+for real MRI changes no other code. See ``documentation/SpatialVox.md`` (Synthetic corpora).
 
 A scene packs one instance of every primitive by rejection sampling: draw size
 and centre, voxelise, reject if empty, out of bounds or overlapping, retry. Sizes

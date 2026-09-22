@@ -1,7 +1,8 @@
 """The WHERE: the pyramid is ``classify``, and the product is not renormalised.
 
-``docs/proposal/relational_architecture.md`` §9 Step 1 lists what has to hold
-before the carver is trained on top of the mapper. Each of those is a test here.
+The proposal's §9 Step 1 (``documentation/SpatialVox.md``, Invariants and the tests that pin
+them) lists what has to hold before the carver is trained on top of the mapper. Each of those
+is a test here.
 """
 
 from __future__ import annotations

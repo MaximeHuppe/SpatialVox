@@ -1,0 +1,11 @@
+/* Obsidian code blocks */
+.markdown-rendered pre {
+    background-color: #ececdf !important;
+    border-radius: 8px;
+    padding: 12px;
+}
+
+.markdown-rendered pre code {
+    background-color: transparent !important;
+}
+

@@ -4,7 +4,7 @@
     .venv/bin/python scripts/gate_mapper.py
     .venv/bin/python scripts/gate_mapper.py --segmenter runs/phase-a/current/best.pt
 
-``docs/proposal/relational_architecture.md`` §2 makes this a precondition, not a
+The proposal's §2 (``documentation/SpatialVox.md``, The gate) makes this a precondition, not a
 diagnostic: *"A low fraction means the mapper disagrees with the prompts, and the
 carver is not trained on top of it."* Ground-truth anchors are used **only as a
 check** - they are never an input to anything this script decides.
@@ -233,7 +233,7 @@ def main() -> int:
     print("   centre err  distance from the FIELD's centre of mass to the target's centroid.")
     print("               Large even where the gate passes: the conjunction is an elongated")
     print("               wedge and the target sits near its apex, so the region CONTAINS the")
-    print("               target without POINTING at it. See deviations.md 3.1b - this is what")
+    print("               target without POINTING at it. See documentation/SpatialVox.md (Deviations) - this is what")
     print("               makes the field a poor heatmap target on a prompt that names one.")
     print(f"\n   margin per clause at the target centroid: {quantiles(base.reshape(-1))}")
     print(f"   worst clause of the three:                {quantiles(base.min(1))}")

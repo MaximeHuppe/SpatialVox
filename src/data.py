@@ -21,7 +21,7 @@ it impossible for a stored mask to drift out of step with its label volume.
 
 Stage A augments with one axis-aligned rotation of the octahedral group per
 item. **Stage B does not rotate**, and that is a change from earlier branches:
-``docs/proposal/relational_architecture.md`` §5 gives it exactly one
+``documentation/SpatialVox.md`` (the direction flip) gives it exactly one
 augmentation, the direction flip, and a rotated head is not a pose the boundary
 encoder will ever be asked about. Dropping it also makes Stage A's output a
 function of the scene alone, which is what lets it be computed once and cached.

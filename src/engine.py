@@ -10,8 +10,8 @@ checkpoint selection, metrics - is shared, which is why there is one
 for Stage A, the target's name for Stage B. It is what turns one accumulator into
 "per-class Dice" for one stage and "Dice on held-out target classes" for another.
 
-Stage B's losses are the table in ``docs/proposal/relational_architecture.md``
-§5, and its one structural consequence is that **every term is per-sample**: a
+Stage B's losses are the table in ``documentation/SpatialVox.md`` (Step 10 -
+Losses), and its one structural consequence is that **every term is per-sample**: a
 flipped prompt that names two structures is *dropped*, and a dropped example must
 contribute to no loss and to no metric. That is the ``keep`` weight, and it runs
 through :func:`segmentation_loss`, every relational term and :class:`Metrics`.

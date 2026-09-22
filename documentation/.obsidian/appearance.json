@@ -1,0 +1,7 @@
+{
+  "nativeMenus": true,
+  "enabledCssSnippets": [
+    "mermaid-strait",
+    "code-background"
+  ]
+}

@@ -8,7 +8,7 @@ The geometry is fixed by `src/synthetic.py`; what this script exists to vary is
 the **appearance**, because appearance is what decides whether the relational
 claim can be tested at all.
 
-`docs/proposal/relational_architecture.md` §4 is explicit about the limit:
+The proposal's §4 (`documentation/SpatialVox.md`, The claim) is explicit about the limit:
 *"An unseen structure is segmented where `B(I)` carries a boundary... Two nuclei
 that share an intensity are not."* On the original synthetic appearance a single
 global threshold recovers every structure at **IoU 0.9998**, so `B(I)` gets every

@@ -1,0 +1,93 @@
+filters:
+  and:
+    - file.inFolder("Result_tracker/Experiments")
+properties:
+  status:
+    displayName: Status
+  kind:
+    displayName: Kind
+  corpus:
+    displayName: Corpus
+  parent:
+    displayName: Parent
+  change:
+    displayName: Change
+  score:
+    displayName: Score
+  floor:
+    displayName: Floor
+  heldout_val:
+    displayName: Held-out val
+  heldout_test:
+    displayName: Held-out test
+  delta:
+    displayName: Δ vs parent
+  delta_on:
+    displayName: Δ measured on
+  benefit:
+    displayName: Benefit
+  verdict:
+    displayName: Verdict
+views:
+  - type: table
+    name: All experiments
+    order:
+      - file.name
+      - note.status
+      - note.corpus
+      - note.parent
+      - note.change
+      - note.score
+      - note.floor
+      - note.heldout_val
+      - note.heldout_test
+      - note.delta
+      - note.delta_on
+      - note.benefit
+      - note.verdict
+  - type: table
+    name: Stage B
+    filters:
+      and:
+        - 'kind == "stage-b"'
+    order:
+      - file.name
+      - note.status
+      - note.corpus
+      - note.parent
+      - note.change
+      - note.score
+      - note.floor
+      - note.heldout_val
+      - note.heldout_test
+      - note.delta
+      - note.delta_on
+      - note.benefit
+  - type: table
+    name: Stage A and pretraining
+    filters:
+      or:
+        - 'kind == "stage-a"'
+        - 'kind == "pretrain"'
+    order:
+      - file.name
+      - note.status
+      - note.corpus
+      - note.parent
+      - note.change
+      - note.score
+      - note.delta
+      - note.delta_on
+      - note.benefit
+  - type: table
+    name: Needs attention
+    filters:
+      or:
+        - 'status == "running"'
+        - 'status == "failed"'
+        - 'status == "invalid"'
+    order:
+      - file.name
+      - note.status
+      - note.change
+      - note.verdict

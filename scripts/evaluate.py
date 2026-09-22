@@ -5,7 +5,7 @@
     scripts/evaluate.py runs/stage_b/best.pt --split val --classes val
     scripts/evaluate.py runs/stage_b/best.pt --save-masks
 
-``docs/proposal/relational_architecture.md`` §7: *"A single Dice is not the
+The proposal's §7 (``documentation/SpatialVox.md``, Evaluation and reporting rules): *"A single Dice is not the
 result."* Six blocks come out, and the Dice is only the third.
 
 1. **Dice, with anchor Dice beside it.** A drop is either a worse outline or a
@@ -26,7 +26,7 @@ result."* Six blocks come out, and the Dice is only the third.
    that segments "the nearest thing that is not an anchor" scores well without
    reading a word. ``permute_channels``, ``permute_clauses`` and
    ``flip_direction`` must fall. ``permute_both`` preserves every relation and
-   must not move; see `deviations.md` §7.2 for how weak that control now is.
+   must not move; see ``documentation/SpatialVox.md`` (The four counterfactuals) for how weak that control now is.
 5. **Empty prompts.** A direction is flipped until the clauses name *nothing*,
    then: how often the null head says so, and how much mask is emitted anyway.
    This is the check that the tiny spike in ``where_raw`` was not renormalised

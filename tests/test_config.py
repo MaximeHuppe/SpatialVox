@@ -49,7 +49,7 @@ def test_the_shipped_config_builds_both_stages(cfg):
 
 
 def test_the_shipped_constants_are_the_measured_ones(cfg):
-    """`docs/proposal/deviations.md` §1: both differ from the proposal's start."""
+    """`documentation/SpatialVox.md` (Deviations): both differ from the proposal's start."""
     assert cfg.model.stage_b.mapper.tau == 0.5          # 2.0 fails §2's gate at 0.65
     assert cfg.model.stage_b.mapper.min_mass == 1e-6    # 1e-3 rejects every structure
     assert cfg.train.stage_b.flip_probability == 0.25

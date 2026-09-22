@@ -75,7 +75,7 @@ synthetic:
     # MEASURED FROM data/mri, not invented. Every amplitude below is quoted as a
     # multiple of `separation`, the grey->white gap, so the whole appearance
     # scales with one number. What was measured, in the model's own normalised
-    # view (scripts: see docs/proposal/deviations.md):
+    # view (summarised in documentation/SpatialVox.md, Synthetic corpora):
     #
     #   tissue      CSF -2.17 (11.2% of brain) | grey -0.37 (49.6%) | white +0.98 (39.2%)
     #   separation  grey->white 1.35

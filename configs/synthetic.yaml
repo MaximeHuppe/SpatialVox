@@ -12,8 +12,8 @@
 # the time, against 98.9% on fixed anatomy - the shortcut that made target-first
 # MRI prompts unreadable is simply not available here.
 #
-# What it does NOT buy: `docs/proposal/relational_architecture.md` §6's lesion
-# claim. The held-out classes are still in the vocabulary and still appear as
+# What it does NOT buy: the lesion claim (`documentation/SpatialVox.md`, The claim,
+# and what may not be claimed). The held-out classes are still in the vocabulary and still appear as
 # anchors, so Stage A has seen them. See `CLAUDE.md` §5.
 
 data:

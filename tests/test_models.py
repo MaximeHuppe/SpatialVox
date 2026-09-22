@@ -2,8 +2,8 @@
 
 These are the contract tests. Breaking one of them does not make a run crash -
 it makes the result mean something other than what the paper would claim, which
-is why each test says which line of
-``docs/proposal/relational_architecture.md`` it is holding.
+is why each test says which line of the architecture
+(``documentation/SpatialVox.md``) it is holding.
 """
 
 from __future__ import annotations

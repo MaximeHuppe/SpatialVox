@@ -7,9 +7,10 @@ that claim mean something. Breaking one does not fail a test; it quietly makes
 the results unpublishable. Read this before changing `src/models.py`,
 `src/mapper.py`, `src/engine.py` or `configs/config.yaml`.
 
-The architecture is `docs/proposal/relational_architecture.md`. Every departure
-from it, with the measurement that justified it, is
-`docs/proposal/deviations.md`. This file is constraints only.
+The strategy, method and architecture are `documentation/SpatialVox.md`. Every
+departure from the original proposal, with the measurement that justified it, is
+in its section "Deviations from the original proposal", and every experiment is in
+`documentation/Result_tracker/`. This file is constraints only.
 
 ---
 
@@ -226,7 +227,7 @@ parameter must appear there or old checkpoints break — including `segmenter`,
 the frozen Stage A's own config, which makes a Stage B checkpoint
 self-contained. `flip_probability` and the loss weights are training-schedule
 values and live in the checkpoint's `meta["config"]["stage"]`, mirrored into the
-`.json` sidecar; see `deviations.md` §3.6.
+`.json` sidecar; see "Where the specification was ambiguous" in `documentation/SpatialVox.md`.
 
 Checkpoints of the previous attention-based Stage B do not load here, and are
 not meant to.

@@ -1,0 +1,9 @@
+/* Forces all Mermaid flowchart lines to be straight lines (no curves) */
+.mermaid .flowchart-link {
+    stroke-linejoin: miter !important;
+    stroke-linecap: square !important;
+}
+
+svg[id^="m"] path.flowchart-link {
+    d: path(d) !important;
+}

@@ -2,9 +2,9 @@
 #   scripts/train.py b --set train.stage_b.optimizer.lr=1e-4
 #
 # Every key here is read by the code, and nothing in `src/` hard-codes a value
-# that lives here. The architecture is `docs/proposal/relational_architecture.md`;
-# every constant that departs from the value that document starts from is marked
-# "measured:" and is justified in `docs/proposal/deviations.md`.
+# that lives here. The architecture is documented in `documentation/SpatialVox.md`;
+# every constant that departs from the value the original proposal started from is
+# marked "measured:" and is justified there (Deviations from the original proposal).
 
 data:
   root: data/mri            # corpus directory: images, labels, manifests, vocabulary
