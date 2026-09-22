@@ -25,7 +25,7 @@
 # test.
 
 data:
-  root: data/synthetic-hard
+  root: data/synthetic-mri
   resolution: 64
   n_anchors: 3
   normalize: none            # the generator writes a bounded [0, 1] image
@@ -34,10 +34,24 @@ data:
   shuffle_clauses: true
 
 
+# 16 classes in 12 geometric families. The rule: a FAMILY is never split across
+# the boundary. The previous split held out `cuboid` while `cube` was supervised,
+# and those two are IoU 1.000 at canonical parameters - the identical shape under
+# a different name - which is why held-out Dice read 0.962 and meant nothing.
+# Measured max IoU from any held-out class to any supervised one is now 0.56.
+#
+#   supervised families : box{cube,cuboid} ellipsoid{sphere,ellipsoid}
+#                         tube{cylinder,capsule} tapered{cone,pyramid}
+#                         simplex{tetrahedron} torus{torus}
+#   held out            : every non-convex, concave, waisted, curved or bored shape
+#
+# `torus` stays supervised on purpose: it is the only trained class with a hole,
+# so `hollow_cylinder` in val is reachable and the holdout has a difficulty
+# gradient instead of being uniformly impossible.
 targets:
-  train: [cube, sphere, cylinder, cone, pyramid, torus, capsule]
-  val:   [cuboid, ellipsoid]
-  test:  [triangular_prism]
+  train: [cube, cuboid, sphere, ellipsoid, cylinder, capsule, cone, pyramid, tetrahedron, torus]
+  val:   [hollow_cylinder, cross, banana]
+  test:  [crescent, hourglass, triangular_prism]
 
 
 # What `scripts/generate_data.py` writes. The appearance IS the experiment.
@@ -58,27 +72,54 @@ synthetic:
                                # it learned a class-conditional size prior and predicted 93
                                # voxels where 2219 belonged. The ten classes stay within ~2x.
   appearance:
-    # EVERY class draws from the same band, so brightness carries no class
-    # information at all and the relational prompt is the only way to pick the
-    # target. It also makes `B(I)` genuinely class-agnostic - a held-out shape
-    # looks exactly like a trained one to it - which is the mechanism §4 claims.
-    # Replace `shared` with a number (e.g. 0.10) for the MRI-like regime, where
-    # each class gets its own narrower, overlapping range and intensity narrows
-    # identity down without fixing it.
-    structure: [0.45, 0.75]
-    class_spread: shared
-    noise: 0.035               # low ON PURPOSE - the edges must stay crisp
-    blur: 0.6                  # partial-volume edges
-    # The background is what makes this hard, not the noise. It is a slowly
-    # varying field that sweeps across the WHOLE structure range, so a structure
-    # is plainly visible against what immediately surrounds it while no single
-    # global threshold is right anywhere in the volume.
-    background: [0.45, 0.04]
-    texture: 0.90              # amplitude of the background variation
-    texture_scale: 12.0        # its spatial scale, in voxels: much larger than a structure,
-                               # so it does not masquerade as one
-    bias_field: 0.60           # a smooth multiplicative inhomogeneity on top
+    # MEASURED FROM data/mri, not invented. Every amplitude below is quoted as a
+    # multiple of `separation`, the grey->white gap, so the whole appearance
+    # scales with one number. What was measured, in the model's own normalised
+    # view (scripts: see docs/proposal/deviations.md):
+    #
+    #   tissue      CSF -2.17 (11.2% of brain) | grey -0.37 (49.6%) | white +0.98 (39.2%)
+    #   separation  grey->white 1.35
+    #   texture     a structure's INTERNAL spread is 0.525 = 0.39 x separation,
+    #               and the tissue around it carries the same
+    #   scale       autocorrelation 0.76 / 0.57 / 0.36 / 0.21 at 1 / 2 / 4 / 8
+    #               voxels - roughly exp(-d/4), i.e. structure at MANY scales,
+    #               which one Gaussian field cannot produce and octaves can
+    #   structures  class means span 1.03 sd and cross the tissue in both
+    #               directions: pallidum sits ABOVE white matter, amygdala below
+    #               grey, ventricles far below everything
+    separation: 0.28           # grey->white, in image units. CSF lands at 0.048.
+    grey: 0.42
+    tissue_fractions: [0.112, 0.496, 0.392]
+    tissue_offsets: [-1.33, 0.0, 1.0]   # in units of `separation`
+    texture_sd: 0.39           # x separation, for tissue AND structure interiors
+    tissue_length: 3.5         # base octave, tuned to the autocorrelation above
 
+    # Structures draw from a WIDE band spanning the tissue range, so a structure
+    # is as likely to be darker than what surrounds it as brighter - which is the
+    # single most MRI-like property of the whole appearance, and the one every
+    # earlier version missed by painting every structure above its background.
+    #
+    # `shared` keeps brightness free of class information, so the relational
+    # prompt stays the only way to pick the target. That is a DEPARTURE from the
+    # MRI, where a class mean is reproducible to 0.104 against a between-class
+    # spread of 1.033 and intensity nearly identifies the structure. Replacing
+    # `shared` with a number reproduces that regime; it is left off on purpose,
+    # because a corpus where brightness names the target cannot test §4.
+    structure: [0.10, 0.85]
+    class_spread: shared
+    noise: 0.010               # white noise only; the real variation is `texture_sd`
+    blur: 0.6                  # partial-volume edges
+
+    head: 1.0                  # a closed envelope with air outside: the global frame a
+    head_exponent: 4.0         # real volume has and a featureless cube does not
+    air: 0.03
+    bias_field: 0.30           # a smooth multiplicative inhomogeneity on top
+
+    # Superseded by the measured model above; kept at zero so older configs and
+    # the easy corpus still mean what they meant.
+    texture: 0.0               # random lumps at the STRUCTURE scale - these were
+                               # decoys, and they cost a full Stage A run
+    detail: 0.0
 
 model:
   stage_a:
@@ -137,7 +178,7 @@ train:
     epochs: 30
     optimizer: {name: adamw, lr: 0.0003, weight_decay: 0.00001}
     scheduler: {name: cosine, warmup_epochs: 2}
-    phase_a_checkpoint: runs/hard-stage-a/best.pt
+    phase_a_checkpoint: runs/mri-stage-a/best.pt
     boundary_checkpoint: null
     boundary_lr_scale: 0.1
     anchor_source: predicted

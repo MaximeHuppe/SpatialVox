@@ -148,11 +148,21 @@ def test_the_hard_appearance_keeps_the_structures_visible():
 
 
 def test_the_background_varies_across_the_volume_rather_than_being_flat():
-    """What kills the global threshold is a slow background, not a noisy one."""
-    image, labels = generate_scene(0, SHAPE, SPACING, 2, HARD, size=SIZE)
-    background = np.where(labels == 0, image, np.nan)
-    halves = [np.nanmean(background[: SHAPE[0] // 2]), np.nanmean(background[SHAPE[0] // 2 :])]
-    assert abs(halves[0] - halves[1]) > float(HARD["noise"])
+    """What kills the global threshold is a slow background, not a noisy one.
+
+    Measured as the spread of BLOCK means over the volume, not the difference
+    between two halves. Two halves test one arbitrary direction of a random
+    field, and a field can swing hard while its two half-means happen to
+    coincide: that statistic held for only 7 seeds in 10, so it failed the first
+    time a change upstream shifted which realisation seed 0 draws. The block
+    spread measures the same property - slow, spatially structured variation -
+    and stayed in 0.081-0.149 across every seed tried.
+    """
+    for seed in (0, 1, 2):
+        image, labels = generate_scene(seed, SHAPE, SPACING, 2, HARD, size=SIZE)
+        background = np.where(labels == 0, image, np.nan)
+        blocks = background.reshape(4, SHAPE[0] // 4, 4, SHAPE[1] // 4, 4, SHAPE[2] // 4)
+        assert float(np.nanstd(np.nanmean(blocks, axis=(1, 3, 5)))) > 2 * float(HARD["noise"])
 
 
 def test_the_bias_field_is_smooth_and_centred_on_one():
