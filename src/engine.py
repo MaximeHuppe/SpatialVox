@@ -182,6 +182,17 @@ def far_mass(probability: Tensor, where_raw: Tensor, epsilon: float, radius: int
     return (probability.float() * outside).flatten(1).sum(-1) / outside.flatten(1).sum(-1).clamp(min=1.0)
 
 
+def null_gated(probability: Tensor, valid: Tensor) -> Tensor:
+    """The model's answer: the carver's mask, emptied where the null head says the
+    clauses name nothing (``valid <= 0``, the threshold ``null_summary`` uses).
+
+    Under ``mask_on: valid`` this gate is the only place emptiness is decided, so
+    every Dice is reported with and without it (CLAUDE.md §7).
+    """
+    named = (valid > 0).to(probability.dtype).reshape(-1, *([1] * (probability.ndim - 1)))
+    return probability * named
+
+
 def dice_iou(prediction: Tensor, target: Tensor, threshold: float = 0.5) -> tuple[Tensor, Tensor]:
     """Per-sample, per-channel Dice and IoU on thresholded probabilities.
 
@@ -383,6 +394,16 @@ ANCHOR_SOURCES = ("predicted", "oracle")
 #: structure-centroid term pulling it back.
 FIELD_CENTROID_ON = ("always", "empty-only")
 
+#: Which prompts the MASK term supervises. ``all`` is §5's table read literally:
+#: a prompt that names nothing is trained towards the empty mask. Measured on
+#: ``data/mri``, that taught the carver a rejection of its own - silent on 94.5%
+#: of impossible prompts where the null head flags 63%, and on 75% of held-out
+#: prompts that do name a structure. ``valid`` supervises the mask only where
+#: the clauses name a structure, so an empty answer always costs the full Dice,
+#: and "names nothing" is the null head's decision alone (:func:`null_gated`).
+#: ``_update_ideas/2026-09-22-null-head-decides-emptiness.md``.
+MASK_ON = ("all", "valid")
+
 
 def roll_anchors(batch: Mapping[str, Any], shift: int) -> dict[str, Any]:
     """Rotate the anchor slots as a unit: ids, names, and any precomputed masks.
@@ -553,6 +574,7 @@ class StageBTask:
     far_epsilon: float = 0.05
     far_dilation: int = 8
     field_centroid_on: str = "always"
+    mask_on: str = "all"
     name: str = "stage_b"
     components: dict[str, float] = field(default_factory=dict)
 
@@ -563,6 +585,8 @@ class StageBTask:
             raise ValueError(
                 f"field_centroid_on must be one of {FIELD_CENTROID_ON}, got {self.field_centroid_on!r}"
             )
+        if self.mask_on not in MASK_ON:
+            raise ValueError(f"mask_on must be one of {MASK_ON}, got {self.mask_on!r}")
         self.model.segmenter.eval()
 
     def __call__(self, batch: Mapping[str, Any]) -> Prediction:
@@ -619,10 +643,13 @@ class StageBTask:
         # structure's own centroid when there is a structure, and the field's own
         # centre always - which is what keeps a centroid when the mask is empty.
         offset = lambda a, b: F.smooth_l1_loss(a.float(), b.float(), reduction="none", beta=2.0).sum(-1)
+        # Under `mask_on: valid` the carver is never rewarded for painting
+        # nothing: a prompt that names nothing trains the null head, not the mask.
+        mask_weight = keep * valid if self.mask_on == "valid" else keep
         terms = {
             "mask": segmentation_loss(
                 prediction.logits, prediction.target,
-                float(weights.get("dice", 1.0)), float(weights.get("bce", 1.0)), weight=keep,
+                float(weights.get("dice", 1.0)), float(weights.get("bce", 1.0)), weight=mask_weight,
             ),
             "null_bce": float(weights.get("null_bce", 0.2)) * weighted_mean(
                 F.binary_cross_entropy_with_logits(
@@ -639,7 +666,9 @@ class StageBTask:
                 * (1.0 if self.field_centroid_on == "always" else 1.0 - valid),
             ),
             # L_far is the only spatial penalty, and only on a valid prompt. On an
-            # impossible one the empty-mask loss is already the penalty everywhere.
+            # impossible one, `mask_on: all` makes the empty-mask loss the penalty
+            # everywhere; under `valid` nothing penalises the mask there - the null
+            # head's gate (`null_gated`) is what empties it.
             "far": float(weights.get("far", 0.2)) * weighted_mean(
                 far_mass(
                     torch.sigmoid(prediction.logits), prediction.where_raw,
@@ -910,6 +939,9 @@ class Trainer:
         percentile = float(self.evaluation.get("hausdorff_percentile", 95.0))
         anchor_dice: list[float] = []
         null_scores: list[tuple[float, float]] = []
+        gated_dice: list[float] = []
+        empty: list[bool] = []
+        threshold = float(self.cfg.get("threshold", 0.5))
         for raw in self._progress(loader, desc=desc):
             batch = self.to_device(raw)
             with self._autocast():
@@ -931,9 +963,21 @@ class Trainer:
                 null_scores += list(
                     zip(prediction.valid.float().tolist(), prediction.valid_target.tolist())
                 )
+                # The shy-painting trend, every epoch: how often a prompt that
+                # names a structure gets nothing back, and the Dice once the null
+                # head's gate is applied (CLAUDE.md §7).
+                probability = torch.sigmoid(prediction.logits.float())
+                kept = (prediction.keep > 0) if prediction.keep is not None else torch.ones_like(
+                    prediction.valid, dtype=torch.bool
+                )
+                gated = dice_iou(null_gated(probability, prediction.valid), prediction.target, threshold)[0]
+                gated_dice += gated.flatten()[kept].tolist()
+                named = kept & (prediction.target.flatten(1).sum(-1) > 0)
+                painted = (probability >= threshold).flatten(1).sum(-1) > 0
+                empty += (~painted)[named].tolist()
             metrics.update(
                 prediction.logits, prediction.target, prediction.groups,
-                strata=prediction.strata, threshold=float(self.cfg.get("threshold", 0.5)),
+                strata=prediction.strata, threshold=threshold,
                 spacing=self.spacing if with_hausdorff else None, percentile=percentile,
                 keep=prediction.keep, extra=extra or None,
             )
@@ -943,6 +987,10 @@ class Trainer:
             summary["anchor_dice"] = sum(anchor_dice) / len(anchor_dice)
         if null_scores:
             summary.update(null_summary(null_scores))
+        if gated_dice:
+            summary["dice_null_gated"] = sum(gated_dice) / len(gated_dice)
+        if empty:
+            summary["empty_rate"] = sum(empty) / len(empty)
         return summary
 
     @torch.no_grad()
@@ -1065,6 +1113,7 @@ class Trainer:
         ]
         for key, label, fmt in (
             ("centroid_error", "centr", "{:.2f}"), ("null_auc", "null", "{:.3f}"),
+            ("empty_rate", "empty", "{:.2f}"),
         ):
             if key in val:
                 parts.append(f"  {label} {fmt.format(val[key])}")
@@ -1074,6 +1123,8 @@ class Trainer:
         for name in self.extra_loaders:
             if name in record:
                 parts.append(f"  {name} {record[name].get('dice', 0.0):.4f}")
+                if "empty_rate" in record[name]:
+                    parts.append(f" (empty {record[name]['empty_rate']:.2f})")
         return "".join(parts) + f"  ({record['seconds']}s)"
 
     def _meta(self, epoch: int, metrics: Mapping[str, Any]) -> dict[str, Any]:

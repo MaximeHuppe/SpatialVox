@@ -7,9 +7,9 @@ tags:
 
 Every experiment gets one note in `Result_tracker/Experiments/`. Its properties record what was run and what was assumed, and above all its **`parent`** (the experiment it is compared against) and its **`delta`** (the change in score against that parent, on the metric named in `delta_on`). **`benefit`** records whether the change helped. The method and architecture are documented in [[SpatialVox]], and the model is drawn in [[Flowchart]].
 
-> [!warning] Needs attention (2026-09-22 21:55)
-> - [[B11 arm-noanchor]] is **invalid and still running**. It was meant to test `carver_sees_anchors: false`, but `--set …=false` is parsed as the *string* `"false"`, which is truthy, so it is re-running its parent. That is about 5 GPU-hours left. Relaunch with `False`.
-> - [[B10 arm-loo]] is **running** (13 of 30 epochs). So far it cannot be told apart from its parent.
+> [!warning] Needs attention (2026-09-23 00:10)
+> - [[B12 mask-valid-seed1]] **finished** (30 epochs), with `mask_on: valid`. Held-out empty rate 0%, and held-out Dice 0.727 / 0.774 at `best.pt` against B09's 0.368 / 0.460 (+0.15 / +0.18 at matched epochs). One seed: still to do are `scripts/evaluate.py` on its `best.pt` (per-class Dice, image replacement, impossible-prompt leak with and without the null gate) and a second seed.
+> - [[B10 arm-loo]] and [[B11 arm-noanchor]] were **killed at 17 of 30 epochs** on 2026-09-22, and their run folders were later deleted by another session's relaunch. Their notes still show epoch-10 snapshots. Leave-one-out showed no effect beyond the replicate noise. B11 was invalid (the flag never applied) and serves as B09's replicate. `carver_sees_anchors: False` has still never been run.
 > - [[B06 field-empty-only-seed1]] **produced no epoch**. Still to run.
 
 ## All experiments
@@ -48,8 +48,9 @@ flowchart LR
         A08 --> A09["A09 400 scenes<br/>0.923, Δ +0.640"]
         B07["B07 easy Stage B<br/>0.983, held-out 0.98"] --> B08["B08 hard Stage B<br/>0.876, held-out 0.71"]
         B08 --> B09["B09 synthetic-mri<br/>0.937, held-out 0.37 / 0.46"]
-        B09 --> B10["B10 leave-one-out<br/>running, not yet"]
-        B09 --> B11["B11 no-anchor<br/>INVALID"]
+        B09 --> B10["B10 leave-one-out<br/>killed at 17/30, no effect"]
+        B09 --> B11["B11 no-anchor<br/>INVALID, replicate of B09"]
+        B09 --> B12["B12 mask_on: valid<br/>0.962, held-out 0.73 / 0.77"]
     end
     B03 --> B07
     A01 -.-> B01
@@ -72,8 +73,8 @@ flowchart LR
     class B01,B02,B03,B04,B05,B07,B08,B09 stageB;
     class D01,D02,D03,P01 diag;
     class L01 legacy;
-    class B10 running;
     class B06,B11 bad;
+    class B10,B12 stageB;
 ```
 
 Keep this graph in step with the `parent` properties when you add a note. Obsidian's graph view draws the same edges from the `parent` and `stage_a` links.

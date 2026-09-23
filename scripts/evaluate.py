@@ -57,7 +57,8 @@ from src.config import load_config, parse_overrides
 from src.data import Corpus, ExampleDataset, anchor_cache_dir, load_nifti, loader, save_nifti
 from src.engine import (
     Metrics, StageBTask, dice_iou, format_table, load_model, mask_centroid_world,
-    null_summary, resolve_anchor_source, resolve_device, roll_anchors, segmentation_loss,
+    null_gated, null_summary, resolve_anchor_source, resolve_device, roll_anchors,
+    segmentation_loss,
 )
 from src.geometry import DIRECTIONS, OPPOSITE, centroids_world, solutions_for, volume_center_world
 
@@ -142,7 +143,7 @@ def score(task, batches, device, spacing, evaluation, *, threshold=0.5, save_to=
     wants_hausdorff = "hausdorff" in evaluation.get("metrics", ())
     percentile = float(evaluation.get("hausdorff_percentile", 95.0))
     scores: dict[str, list[float]] = {kind: [] for kind in probes}
-    gate, nulls, rows, volumes = [], [], [], []
+    gate, nulls, rows, volumes, gated_dice, gated_volumes = [], [], [], [], [], []
     for raw in batches:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
         prediction = task(batch)
@@ -172,10 +173,16 @@ def score(task, batches, device, spacing, evaluation, *, threshold=0.5, save_to=
         # Is a low Dice "drew the wrong thing" or "drew nothing"? On a class it
         # was never supervised on the carver can simply fall silent, and the two
         # failures have different fixes, so they are reported apart.
-        predicted = (torch.sigmoid(logits.float()) >= threshold).flatten(1).sum(-1)
+        probability = torch.sigmoid(logits.float())
+        predicted = (probability >= threshold).flatten(1).sum(-1)
         wanted = target.flatten(1).sum(-1)
         volumes += list(zip(predicted.tolist(), wanted.tolist()))
-        dice = dice_iou(torch.sigmoid(logits.float()), target)[0].flatten().tolist()
+        dice = dice_iou(probability, target)[0].flatten().tolist()
+        # The same answer after the null head's gate - the only place emptiness
+        # is decided under `mask_on: valid`, and reported beside the raw one (§7).
+        gated = null_gated(probability, prediction.valid)
+        gated_dice += dice_iou(gated, target, threshold)[0].flatten().tolist()
+        gated_volumes += list(zip((gated >= threshold).flatten(1).sum(-1).tolist(), wanted.tolist()))
         for kind in scores:
             perturbed = task(counterfactual(batch, kind)).logits
             scores[kind] += dice_iou(torch.sigmoid(perturbed.float()), target)[0].flatten().tolist()
@@ -200,22 +207,34 @@ def score(task, batches, device, spacing, evaluation, *, threshold=0.5, save_to=
         summary["empty_prediction_rate"] = float(np.mean([p == 0 for p, _ in kept])) if kept else 0.0
         summary["predicted_voxels"] = float(np.mean([p for p, _ in kept])) if kept else 0.0
         summary["target_voxels"] = float(np.mean([w for _, w in kept])) if kept else 0.0
+        kept = [p for p, w in gated_volumes if w > 0]
+        summary["empty_prediction_rate_null_gated"] = float(np.mean([p == 0 for p in kept])) if kept else 0.0
+        summary["dice_null_gated"] = float(np.mean(gated_dice))
     return summary, {k: sum(v) / len(v) for k, v in scores.items() if v}, rows
 
 
 @torch.no_grad()
 def empty_prompt_report(task, batches, device, threshold=0.5) -> dict[str, float]:
-    """How often the null head calls an impossible prompt empty, and what leaks out."""
-    nulls, volumes = [], []
+    """How often the null head calls an impossible prompt empty, and what leaks out.
+
+    Twice: from the carver alone, and after the null head's gate. Under
+    ``mask_on: valid`` the carver is no longer trained to fall silent here, so the
+    ungated leak rises by design and the gated one is the system's answer.
+    """
+    nulls, volumes, gated = [], [], []
     for raw in batches:
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in raw.items()}
         prediction = task(batch)
         nulls += list(zip(prediction.valid.float().tolist(), prediction.valid_target.tolist()))
-        volumes += (torch.sigmoid(prediction.logits.float()) >= threshold).flatten(1).sum(-1).tolist()
+        probability = torch.sigmoid(prediction.logits.float())
+        volumes += (probability >= threshold).flatten(1).sum(-1).tolist()
+        gated += (null_gated(probability, prediction.valid) >= threshold).flatten(1).sum(-1).tolist()
     return {
         "invalid_called_invalid": float(np.mean([s <= 0 for s, _ in nulls])),
         "false_positive_voxels": float(np.mean(volumes)),
         "false_positive_rate": float(np.mean([v > 0 for v in volumes])),
+        "false_positive_voxels_null_gated": float(np.mean(gated)),
+        "false_positive_rate_null_gated": float(np.mean([v > 0 for v in gated])),
     }
 
 
@@ -285,6 +304,7 @@ def main() -> int:
         far_epsilon=float(cfg.train.stage_b.far.epsilon),
         far_dilation=int(cfg.train.stage_b.far.dilation),
         field_centroid_on=str(cfg.train.stage_b.field_centroid_on),
+        mask_on=str(cfg.train.stage_b.mask_on),
     )
     checkpoint = Path(cfg.train.stage_b.phase_a_checkpoint)
     anchors = anchor_cache_dir(corpus.root, checkpoint) if checkpoint.is_file() else None
@@ -309,6 +329,8 @@ def main() -> int:
     print(f"  centroid error (mm)         {summary.get('centroid_error', float('nan')):.2f}")
     print(f"  emitted an EMPTY mask       {summary.get('empty_prediction_rate', float('nan')):.1%}"
           f"   (of prompts that do name a structure)")
+    print(f"  gated by the null head      dice {summary.get('dice_null_gated', float('nan')):.4f}"
+          f"   empty {summary.get('empty_prediction_rate_null_gated', float('nan')):.1%}")
     print(f"  voxels: predicted {summary.get('predicted_voxels', 0):.0f}"
           f" against a true {summary.get('target_voxels', 0):.0f}")
     gate_key = f"gate_fraction_{task.anchor_source}"
@@ -338,8 +360,10 @@ def main() -> int:
         )
         print(f"\n  prompts that name nothing ({len(impossible)})")
         print(f"    null head says invalid    {empty_report['invalid_called_invalid']:.4f}")
-        print(f"    emitted any mask          {empty_report['false_positive_rate']:.4f}")
-        print(f"    mean false-positive voxels {empty_report['false_positive_voxels']:.1f}")
+        print(f"    emitted any mask          {empty_report['false_positive_rate']:.4f}"
+              f"   gated {empty_report['false_positive_rate_null_gated']:.4f}")
+        print(f"    mean false-positive voxels {empty_report['false_positive_voxels']:.1f}"
+              f"   gated {empty_report['false_positive_voxels_null_gated']:.1f}")
 
     # A shuffled loader, so the neighbouring row is usually a different subject.
     swap = image_replacement(

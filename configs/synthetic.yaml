@@ -111,6 +111,7 @@ train:
       far: 0.2
     far: {epsilon: 0.05, dilation: 4}   # half the MRI radius, for half the cube side
     field_centroid_on: always
+    mask_on: valid                      # valid | all - see configs/config.yaml
 
 
 logging:

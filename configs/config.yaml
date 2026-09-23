@@ -197,6 +197,15 @@ train:
                                         # under `always` this term pulls the heatmap ~20 mm off on
                                         # every valid prompt. `empty-only` restricts it to prompts
                                         # that name nothing, where it is the only target there is.
+    mask_on: valid                      # valid | all. Which prompts the MASK term supervises.
+                                        # `all` also trains prompts that name nothing towards the
+                                        # empty mask. Measured (relational-seed1), that taught the
+                                        # carver to reject by itself: silent on 94.5% of impossible
+                                        # prompts and on 75% of held-out prompts that DO name a
+                                        # structure. `valid` never rewards an empty answer, and
+                                        # leaves "names nothing" to the null head, whose gate is
+                                        # reported beside every Dice. `all` reproduces runs before
+                                        # 2026-09-22; see _update_ideas/.
 
 
 logging:

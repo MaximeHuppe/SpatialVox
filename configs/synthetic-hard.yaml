@@ -198,6 +198,9 @@ train:
       far: 0.2
     far: {epsilon: 0.05, dilation: 4}
     field_centroid_on: always
+    # valid | all - see configs/config.yaml. `all` reproduces mri-stage-b and the
+    # two arms; `valid` leaves "names nothing" to the null head alone.
+    mask_on: valid
     # Withhold one supervised class from the loss each epoch, cycling. Makes the
     # recognise-and-recall route fail DURING training, which is the only pressure
     # that reaches it. `keep = 0` is the existing per-example drop.

@@ -226,6 +226,34 @@ def test_the_additive_prior_is_one_scalar_with_no_other_input():
     )
 
 
+@pytest.mark.parametrize("skip", [True, False])
+def test_the_split_mask_head_is_exactly_the_1x1_on_the_upsampled_concatenation(skip):
+    """The efficient head is the same function as the literal one, to rounding.
+
+    ``head(cat[up(f), B]) = up(W_f f + b) + W_B B`` because a 1x1 convolution and
+    a trilinear upsample are both linear and the upsample's weights sum to one.
+    Checked in float64 with a non-zero head, since the shipped head starts at zero
+    and would make the comparison vacuous.
+    """
+    torch.manual_seed(0)
+    boundary_channels = 4 if skip else 0
+    carver = Carver(boundary_channels + 9, boundary_channels, width=4, blocks=1,
+                    full_resolution_skip=skip).double().eval()
+    torch.nn.init.normal_(carver.head.weight, std=0.5)
+    torch.nn.init.normal_(carver.head.bias, std=0.5)
+    x = torch.randn(2, boundary_channels + 9, 10, 12, 14, dtype=torch.float64)
+    boundary = x[:, :boundary_channels] if skip else None
+    with torch.no_grad():
+        logits, heatmap = carver(x, boundary)
+        features = carver.blocks(carver.stem(x))
+        full = torch.nn.functional.interpolate(features, size=x.shape[2:], mode="trilinear",
+                                               align_corners=True)
+        reference = carver.head(torch.cat([full, boundary], dim=1) if skip else full)
+    assert logits.shape == (2, 1, 10, 12, 14)
+    assert torch.allclose(logits, reference, atol=1e-10)
+    assert torch.equal(heatmap, carver.heatmap(features))
+
+
 def test_the_heatmap_is_a_separate_head_not_a_reading_of_the_mask(model):
     """§4: "a separate 1x1, soft-argmax -> centroid"; §5: not trained through the mask."""
     assert model.carver.heatmap is not model.carver.head

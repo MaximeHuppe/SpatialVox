@@ -85,13 +85,13 @@
                 <mxCell id="HM" value="&lt;b&gt;heatmap&lt;/b&gt;: a separate 1×1 conv&lt;br&gt;[B,1,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="20" y="250" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="UP" value="trilinear upsample&lt;br&gt;[B,16,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="UP" value="head, feature half: 1×1 at 64³&lt;br&gt;then trilinear upsample of ONE channel, [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="450" y="50" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="SKIP" value="concat B(I): full_resolution_skip&lt;br&gt;[B,32,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="SKIP" value="plus head, B(I) half: 1×1 on B(I)&lt;br&gt;full_resolution_skip, [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="450" y="150" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="HEAD" value="&lt;b&gt;head&lt;/b&gt;: 1×1 conv, zero weight&lt;br&gt;bias = logit(0.0016), [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="HEAD" value="&lt;b&gt;logits&lt;/b&gt;: the one 1×1 head, in two exact halves&lt;br&gt;zero weight, bias = logit(0.0016), [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="450" y="250" width="390" height="70" as="geometry"/>
                 </mxCell>
                 <mxCell id="title" value="&lt;font style=&quot;&quot;&gt;&lt;font style=&quot;font-size: 24px;&quot;&gt;&lt;b style=&quot;&quot;&gt;SpatialVox: one relational forward, StageB.forward(image, direction_ids, name_ids), with the frozen Stage A drawn open&lt;/b&gt;&lt;br&gt;&lt;/font&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;Shapes for the MRI corpus: 128³ at 1.25 mm, 23 structures, batch size B. The note beside it: documentation/SpatialVox.md&lt;/span&gt;&lt;/font&gt;" style="text;html=1;strokeColor=default;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=15;fontColor=#1A1A1A;whiteSpace=wrap;strokeWidth=3;spacingLeft=17;" parent="1" vertex="1">

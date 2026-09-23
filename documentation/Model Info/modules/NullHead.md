@@ -94,4 +94,8 @@ Measured on `data/mri` at the end of training, the head reaches **0.626** on the
 
 #### It is also not what produces the empty output
 
-Of 382 prompts that name nothing, the model emits **any** mask only **5.5%** of the time. That behaviour comes from the **carver** and its empty-mask loss, not from this head. The null head is mandated by §3 and kept, but it is measurably close to redundant on `data/mri`: removing it would be a specification deviation, not a functional loss.
+Of 382 prompts that name nothing, the model emits **any** mask only **5.5%** of the time. That behaviour comes from the **carver** and its empty-mask loss, not from this head. Under `mask_on: all` (every run up to [[B11 arm-noanchor]]) the null head was therefore close to redundant on `data/mri`. The carver's own rejection also silenced 75% of held-out prompts that *do* name a structure.
+
+#### Since 2026-09-22 it is the only thing that decides "empty"
+
+With the shipped **`mask_on: valid`**, prompts that name nothing no longer train the mask, so the carver is not taught to fall silent. This head's logit becomes the system's answer to "names nothing": `null_gated` (in `src/engine.py`) zeroes the mask wherever `valid ≤ 0`. Every Dice and every empty-prompt leak is reported both gated and ungated (`dice_null_gated`, `empty_prediction_rate_null_gated`, `false_positive_rate_null_gated`). Expect the gated leak on impossible prompts to rise towards this head's miss rate: it flags 63% on `data/mri`, and its inputs cap it at an AUC of about 0.85. That is the price of an ambitious carver; see `_update_ideas/2026-09-22-null-head-decides-emptiness.md`.

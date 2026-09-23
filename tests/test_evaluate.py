@@ -148,9 +148,15 @@ def test_the_report_runs_end_to_end(corpus, tmp_path):
     assert len(rows) == len(dataset)
     assert {"centroid_error", "where_at_centroid", "valid_logit"} <= set(rows[0])
     assert (tmp_path / "masks" / rows[0]["id"] / "prediction.nii.gz").is_file()
+    # §7: every Dice is also reported through the null head's gate, which can
+    # only remove masks.
+    assert summary["dice_null_gated"] <= summary["dice"] + 1e-6
+    assert summary["empty_prediction_rate_null_gated"] >= summary["empty_prediction_rate"] - 1e-6
 
     empty = evaluate.empty_prompt_report(task, batches, "cpu")
-    assert set(empty) == {"invalid_called_invalid", "false_positive_voxels", "false_positive_rate"}
+    assert set(empty) == {"invalid_called_invalid", "false_positive_voxels", "false_positive_rate",
+                          "false_positive_voxels_null_gated", "false_positive_rate_null_gated"}
+    assert empty["false_positive_rate_null_gated"] <= empty["false_positive_rate"]
     # A shuffled loader, so the neighbouring row is usually a different scene;
     # same-scene pairs are skipped rather than compared with themselves.
     shuffled = list(loader(ExampleDataset(corpus, "val", normalize_mode="none"),

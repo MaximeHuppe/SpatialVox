@@ -63,7 +63,7 @@ def test_every_block_the_code_reads_is_present(cfg):
                 "alpha", "background_logit", "prior_foreground"):
         assert key in cfg.model.stage_b, key
     for key in ("epochs", "optimizer", "scheduler", "phase_a_checkpoint", "anchor_source",
-                "flip_probability", "loss", "far", "field_centroid_on",
+                "flip_probability", "loss", "far", "field_centroid_on", "mask_on",
                 "boundary_checkpoint", "boundary_lr_scale"):
         assert key in cfg.train.stage_b, key
     for term in ("dice", "bce", "null_bce", "centroid", "field_centroid", "far"):

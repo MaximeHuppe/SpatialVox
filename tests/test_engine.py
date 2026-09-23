@@ -12,7 +12,7 @@ from src.data import ExampleDataset, collate, loader
 from src.engine import (
     BoundaryTask, Metrics, Prediction, StageATask, StageBTask, Trainer,
     build_optimizer, build_scheduler, dice_iou, dilate, far_mass, hausdorff,
-    label_boundary, load_model, mask_centroid_world, masks_from, null_summary,
+    label_boundary, load_model, mask_centroid_world, masks_from, null_gated, null_summary,
     roll_anchors, save_checkpoint, segmentation_loss, weighted_mean,
 )
 from src.models import BoundaryPretrainer, StageA, StageB
@@ -215,6 +215,45 @@ def test_the_field_heatmap_target_can_be_restricted_to_empty_prompts(corpus):
         StageBTask(model, corpus.vocab, field_centroid_on="sometimes")
 
 
+def test_the_mask_term_can_be_restricted_to_prompts_that_name_a_structure(corpus):
+    """``mask_on: valid``: painting on a prompt that names nothing costs the mask nothing.
+
+    Under ``all`` it costs the full soft Dice, which is what taught the carver to
+    fall silent whenever it doubts - on impossible prompts and on unfamiliar
+    structures alike. Every other term must be untouched by the setting.
+    """
+    model = tiny_stage_b(corpus)
+    batch = batch_from(corpus, n=2)
+    batch["valid"] = torch.tensor([1, 0])
+    batch["target"] = torch.stack([batch["target"][0], torch.tensor(0)])
+    every = StageBTask(model, corpus.vocab, spacing=corpus.spacing, loss_weights=LOSS)
+    named = StageBTask(model, corpus.vocab, spacing=corpus.spacing, loss_weights=LOSS,
+                       mask_on="valid")
+    with torch.no_grad():
+        prediction = every(batch)
+    every.loss(prediction)
+    named.loss(prediction)
+    quiet_every, quiet_named = every.components["mask"], named.components["mask"]
+
+    prediction.logits[1] = 10.0  # the impossible prompt now paints everything
+    every.loss(prediction)
+    named.loss(prediction)
+    assert every.components["mask"] > quiet_every + 0.1
+    assert named.components["mask"] == pytest.approx(quiet_named, abs=1e-6)
+    for key in ("null_bce", "centroid", "field_centroid", "far"):
+        assert named.components[key] == pytest.approx(every.components[key], rel=1e-5)
+    with pytest.raises(ValueError, match="mask_on"):
+        StageBTask(model, corpus.vocab, mask_on="sometimes")
+
+
+def test_the_null_gate_empties_exactly_the_prompts_the_null_head_rejects():
+    """``valid <= 0`` is "names nothing", the same cut ``null_summary`` scores."""
+    probability = torch.full((3, 1, 2, 2, 2), 0.9)
+    gated = null_gated(probability, torch.tensor([2.0, 0.0, -1.0]))
+    assert torch.equal(gated[0], probability[0])
+    assert float(gated[1:].abs().sum()) == 0.0
+
+
 def test_rolling_the_anchor_slots_moves_ids_names_and_cached_masks_together():
     """A counterfactual that rolls only the ids is not the one it claims to be."""
     batch = {
@@ -258,8 +297,12 @@ def test_the_loop_trains_stage_b_and_writes_a_reloadable_checkpoint(corpus, tmp_
     history = trainer.fit()
     assert len(history) == 2
     assert torch.isfinite(torch.tensor(history[-1]["train"]["loss"]))
-    for key in ("dice", "centroid_error", "anchor_dice", "null_accuracy", "null_rate"):
+    for key in ("dice", "centroid_error", "anchor_dice", "null_accuracy", "null_rate",
+                "dice_null_gated", "empty_rate"):
         assert key in history[-1]["val"], key
+    # The gate can only remove masks, and the empty rate is a fraction.
+    assert history[-1]["val"]["dice_null_gated"] <= history[-1]["val"]["dice"] + 1e-6
+    assert 0.0 <= history[-1]["val"]["empty_rate"] <= 1.0
     # No `null_auc`: validation never flips, so it holds no invalid prompts and
     # an AUC has nothing to separate. That is the point of keeping flips out of
     # the selection curve - `scripts/evaluate.py` builds the negatives instead.

@@ -86,10 +86,12 @@ class Carver(nn.Module):
 
     def forward(self, x: Tensor, boundary: Tensor | None) -> tuple[Tensor, Tensor]:
         features = self.blocks(self.stem(x))
-        full = F.interpolate(features, size=x.shape[2:], mode="trilinear", align_corners=True)
-        if self.full_resolution_skip and boundary is not None:
-            full = torch.cat([full, boundary], dim=1)
-        return self.head(full), self.heatmap(features)
+        width = features.shape[1]
+        coarse = F.conv3d(features, self.head.weight[:, :width], self.head.bias)
+        logits = F.interpolate(coarse, size=x.shape[2:], mode="trilinear", align_corners=True)
+        if self.full_resolution_skip:
+            logits = logits + F.conv3d(boundary, self.head.weight[:, width:])
+        return logits, self.heatmap(features)
 ```
 
 ---
@@ -101,16 +103,24 @@ class Carver(nn.Module):
 | `x` | `[B,25,128³]` | concatenated in the *boundary features'* dtype, so the 25-channel tensor stays off the float32 path under autocast |
 | `stem` | `[B,16,64³]` | stride 2; what keeps 3×3×3 affordable on a 128³ volume |
 | `blocks` | `[B,16,64³]` | two residual blocks — §4's "two 16-channel blocks" |
-| `interpolate` | `[B,16,128³]` | trilinear, back to full |
-| `cat` w/ `B(I)` | `[B,32,128³]` | only when `full_resolution_skip` |
-| `head` | `[B,1,128³]` | logits |
+| `head`, feature half | `[B,1,64³]` | first 16 input weights of the 1×1, plus its bias, on the working grid |
+| `interpolate` | `[B,1,128³]` | trilinear, back to full — **one channel** |
+| `head`, `B(I)` half | `[B,1,128³]` | last 16 input weights on `B(I)`, added; only when `full_resolution_skip` |
 | `heatmap` | `[B,1,64³]` | from the **pre-upsample** features |
+
+#### The head runs in two exact halves (2026-09-22)
+
+Until 2026-09-22 the forward upsampled all 16 feature channels, concatenated `B(I)` into a `[B,32,128³]` tensor and applied the 1×1 there. A 1×1 convolution and a trilinear upsample are both linear, and the upsample's weights sum to one, so $\mathrm{head}(\mathrm{cat}[\mathrm{up}(f), B]) = \mathrm{up}(W_f f + b) + W_B B$ exactly. It is the same function with the same parameters, and old checkpoints load unchanged. Measured with forward and backward in bf16, the carver alone uses 40% less peak memory (3.6 → 2.1 GB at 128³ with batch 4) and runs 7–8% faster; the fp32 difference is 1.9e-6. Pinned by `test_the_split_mask_head_is_exactly_the_1x1_on_the_upsampled_concatenation`; see `_update_ideas/2026-09-22-null-head-decides-emptiness.md`.
+
+#### What the mask is trained on: `mask_on`
+
+Since 2026-09-22 the shipped setting is **`mask_on: valid`**. The mask term only supervises prompts that name a structure, and "names nothing" is left to [[NullHead]] through `null_gated`. Under the earlier `all`, flips that name nothing trained the mask towards empty. That made the carver its own image-based null detector: silent on 94.5% of impossible prompts, and also on 75% of held-out prompts that do name a structure ([[B03 relational-seed1]]). See [[SpatialVox#14. Step 10 — Losses]].
 
 #### `full_resolution_skip` — an addition, recorded
 
 §4 reads literally as *"stride-2 stem, then 1×1 up to 128³"*, which makes the stem the only path from `B(I)` to the output — every full-resolution boundary detail destroyed before the first convolution, leaving a trilinear upsample of a 2.5 mm grid. That defeats §4's own claim that the mask is drawn where `B(I)` carries a boundary, on a corpus whose targets are 300–4000 voxel nuclei.
 
-With the flag on, the final 1×1 reads `concat(upsample(residual), B(I))`: still one 1×1, still at 128³, but it sees boundaries at their own resolution. It is a **flag, not a silent change**, so the literal form stays runnable as an ablation ([[SpatialVox#20.4 Architectural additions]]).
+With the flag on, the final 1×1 reads `concat(upsample(residual), B(I))`, computed in the two exact halves above. It is still one 1×1 at 128³, but it sees boundaries at their own resolution. It is a **flag, not a silent change**, so the literal form stays runnable as an ablation ([[SpatialVox#20.4 Architectural additions]]).
 
 #### The heatmap is a separate head
 

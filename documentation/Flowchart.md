@@ -89,9 +89,9 @@ flowchart TB
         direction TB
         STEM["stem: ConvBlock 25 to 16, stride 2<br/>[B,16,64³]"]
         BLK["2 x ResBlock 16<br/>[B,16,64³]"]
-        UP["trilinear upsample<br/>[B,16,128³]"]
-        SKIP["concat B(I) - full_resolution_skip<br/>[B,32,128³]"]
-        HEAD["head: 1x1 conv, zero weight<br/>bias = logit of 0.0016<br/>[B,1,128³]"]
+        UP["head, feature half: 1x1 at 64³<br/>then trilinear upsample of ONE channel<br/>[B,1,128³]"]
+        SKIP["plus head, B(I) half: 1x1 on B(I)<br/>full_resolution_skip<br/>[B,1,128³]"]
+        HEAD["logits: the one 1x1 head, in two exact halves<br/>zero weight, bias = logit of 0.0016<br/>[B,1,128³]"]
         HM["heatmap: separate 1x1 conv<br/>[B,1,64³]"]
         STEM --> BLK --> UP --> SKIP --> HEAD
         BLK --> HM

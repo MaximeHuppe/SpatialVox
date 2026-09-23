@@ -1270,10 +1270,12 @@ Both logs are clamped at `LOG_FLOOR = 1e-9` and divided by $-\ln(10^{-9}) = 20.7
     def forward(self, x: Tensor, boundary: Tensor | None) -> tuple[Tensor, Tensor]:
         """``-> (logits [B, 1, D, H, W], heatmap logits [B, 1, D/2, H/2, W/2])``."""
         features = self.blocks(self.stem(x))
-        full = F.interpolate(features, size=x.shape[2:], mode="trilinear", align_corners=True)
-        if self.full_resolution_skip and boundary is not None:
-            full = torch.cat([full, boundary], dim=1)
-        return self.head(full), self.heatmap(features)
+        width = features.shape[1]
+        coarse = F.conv3d(features, self.head.weight[:, :width], self.head.bias)
+        logits = F.interpolate(coarse, size=x.shape[2:], mode="trilinear", align_corners=True)
+        if self.full_resolution_skip:
+            logits = logits + F.conv3d(boundary, self.head.weight[:, width:])
+        return logits, self.heatmap(features)
 ```
 
 | step | operation | shape | params |
@@ -1281,11 +1283,13 @@ Both logs are clamped at `LOG_FLOOR = 1e-9` and divided by $-\ln(10^{-9}) = 20.7
 | input | `x` (25 channels) | `[B,25,128³]` | — |
 | `stem` | `ConvBlock(25→16)`, stride 2. This is what makes 3×3×3 affordable at 128³ | `[B,16,64³]` | 10,800 |
 | `blocks` | 2 × `ResBlock(16)` | `[B,16,64³]` | 27,648 |
-| upsample | trilinear to 128³ | `[B,16,128³]` | — |
-| skip | concat `B(I)` (`full_resolution_skip`) | `[B,32,128³]` | — |
-| `head` | 1×1 conv, **zero weight**, bias $\log\frac{0.0016}{0.9984}$ | `[B,1,128³]` logits | 33 |
+| `head`, feature half | the first 16 input weights of the 1×1 and its bias, **on the working grid** | `[B,1,64³]` | 17 |
+| upsample | trilinear to 128³, **one channel** | `[B,1,128³]` | — |
+| `head`, `B(I)` half | the last 16 input weights, on `B(I)` at full resolution (`full_resolution_skip`), added | `[B,1,128³]` logits | 16 |
 | `heatmap` | a *separate* 1×1 conv on the **pre-upsample** features | `[B,1,64³]` | 17 |
 | **total** | | | **38,498** (37,202 without anchor channels) |
+
+The `head` is still one `Conv3d(32→1, 1×1)`, zero weight and bias $\log\frac{0.0016}{0.9984}$, applied in two halves. Up to 2026-09-22 the forward upsampled the 16 feature channels, concatenated `B(I)` into a `[B,32,128³]` tensor and ran the 1×1 on that. A 1×1 convolution and a trilinear upsample are both linear, and the upsample's weights sum to one, so $\mathrm{head}(\mathrm{cat}[\mathrm{up}(f), B]) = \mathrm{up}(W_f f + b) + W_B B$ exactly. The same function, parameters and checkpoints now cost 40% less carver peak memory and about 8% less carver time (measured: 1.9e-6 max difference in fp32 at 128³; `test_the_split_mask_head_is_exactly_the_1x1_on_the_upsampled_concatenation`; `_update_ideas/2026-09-22-null-head-decides-emptiness.md`).
 
 - **Zero-initialised head at the foreground prior.** An untrained carver predicts the base rate everywhere. Otherwise training would start by pushing two million background logits down before Dice carried any usable gradient.
 - **`full_resolution_skip`, an addition to the original specification.** Read literally, the spec's "stride-2 stem, two 16-channel blocks, then a 1×1 up to 128³" makes the stem the only path from `B(I)` to the output. Every full-resolution boundary detail would be destroyed before the first convolution, and the mask would be a trilinear upsample of a 2.5 mm grid, on a corpus whose targets are nuclei of 300–4000 voxels. With the flag on, the final 1×1 sees `B(I)` at the resolution it was computed at. It is a flag so the literal form stays measurable. That ablation has not been run.
@@ -1505,10 +1509,13 @@ Everything after `valid` is carried rather than recomputed, because it is a pure
         # structure's own centroid when there is a structure, and the field's own
         # centre always - which is what keeps a centroid when the mask is empty.
         offset = lambda a, b: F.smooth_l1_loss(a.float(), b.float(), reduction="none", beta=2.0).sum(-1)
+        # Under `mask_on: valid` the carver is never rewarded for painting
+        # nothing: a prompt that names nothing trains the null head, not the mask.
+        mask_weight = keep * valid if self.mask_on == "valid" else keep
         terms = {
             "mask": segmentation_loss(
                 prediction.logits, prediction.target,
-                float(weights.get("dice", 1.0)), float(weights.get("bce", 1.0)), weight=keep,
+                float(weights.get("dice", 1.0)), float(weights.get("bce", 1.0)), weight=mask_weight,
             ),
             "null_bce": float(weights.get("null_bce", 0.2)) * weighted_mean(
                 F.binary_cross_entropy_with_logits(
@@ -1525,7 +1532,9 @@ Everything after `valid` is carried rather than recomputed, because it is a pure
                 * (1.0 if self.field_centroid_on == "always" else 1.0 - valid),
             ),
             # L_far is the only spatial penalty, and only on a valid prompt. On an
-            # impossible one the empty-mask loss is already the penalty everywhere.
+            # impossible one, `mask_on: all` makes the empty-mask loss the penalty
+            # everywhere; under `valid` nothing penalises the mask there - the null
+            # head's gate (`null_gated`) is what empties it.
             "far": float(weights.get("far", 0.2)) * weighted_mean(
                 far_mass(
                     torch.sigmoid(prediction.logits), prediction.where_raw,
@@ -1540,13 +1549,18 @@ Everything after `valid` is carried rather than recomputed, because it is a pure
 
 | term | formula | weight | applies to | on a prompt that names none |
 |---|---|---|---|---|
-| `mask` | soft Dice + BCE on the full-resolution logits | 1.0 + 1.0 | every kept example | the **empty** mask everywhere |
+| `mask` | soft Dice + BCE on the full-resolution logits | 1.0 + 1.0 | `mask_on: valid` (shipped since 2026-09-22): kept **and** valid. `mask_on: all` (every earlier run): every kept example | `valid`: **nothing**, the null head's gate decides. `all`: the **empty** mask everywhere |
 | `null_bce` | BCE(`valid`, 1 if the clauses name one structure) | 0.2 | every kept example | target "invalid" |
 | `centroid` | smooth-L1 (β = 2 mm) of heatmap centroid − structure centroid, summed over x, y, z | 0.02 | kept **and** valid | — |
 | `field_centroid` | the same against `where_raw`'s first moment | 0.01 | kept, field has mass, and (`always`) every prompt, or (`empty-only`) invalid prompts only | the only localisation target there is |
-| `far` (`L_far`) | mean predicted probability **outside** `dilate(where_raw > 0.05, 8 voxels)` | 0.2 | kept **and** valid | — (the empty-mask loss already penalises everywhere) |
+| `far` (`L_far`) | mean predicted probability **outside** `dilate(where_raw > 0.05, 8 voxels)` | 0.2 | kept **and** valid | — (under `all`, the empty-mask loss already penalises everywhere) |
 
-Every term is **per sample**, and `keep = 0` removes a sample from all of them. The helpers:
+Every term is **per sample**, and `keep = 0` removes a sample from all of them.
+
+> [!important] `mask_on: valid` — the null head decides emptiness (2026-09-22)
+> Under `all`, about 16% of training prompts (the flips that name nothing) train the mask towards empty. The soft Dice of an empty target is $1 - 1/(\sum p + 1)$, so painting even one voxel's worth of probability costs half of it, and "when in doubt, say nothing" became the carver's own policy. [[B03 relational-seed1]] measured that rejection: the carver stays silent on 94.5% of impossible prompts where the null head flags 63%, and on 75% of held-out prompts that *do* name a structure, although the field contains the target 86–90% of the time. `valid` supervises the mask only where the clauses name a structure, so an empty answer always costs the full Dice. The null head, which already trains on every prompt, is then the only thing that decides "names nothing": `null_gated` empties the mask where `valid ≤ 0`, and every Dice is reported with and without that gate (CLAUDE.md §7). The price is that impossible prompts now leak through whenever the null head misses them, since it has only four inputs (AUC ≈ 0.85 on `data/mri`). Rationale, changes and the test that would refute it: `_update_ideas/2026-09-22-null-head-decides-emptiness.md`.
+
+The helpers:
 
 ```python
 def weighted_mean(values: Tensor, weight: Tensor | None) -> Tensor:
@@ -1686,10 +1700,10 @@ Per epoch the probes run on 200 examples as a trend line. The reported drops com
 ```
 
 1. **Dice, with anchor Dice beside it** (plus IoU, HD95, and per-class and per-stratum breakdowns by target, anchor, direction and slot). A drop is either a worse outline or a Stage A failure, and those are different problems.
-2. **Centroid error in mm**, from the heatmap, with the **empty-prediction rate** and **predicted against true voxel counts**. Dice fuses three failures: pointing at the wrong structure, outlining it badly, and saying nothing. Each needs a different fix.
+2. **Centroid error in mm**, from the heatmap, with the **empty-prediction rate** and **predicted against true voxel counts**. Dice fuses three failures: pointing at the wrong structure, outlining it badly, and saying nothing. Each needs a different fix. Since 2026-09-22 it also prints **`dice_null_gated`** and **`empty_prediction_rate_null_gated`**: the same answer after `null_gated` empties the mask wherever the null head's logit is ≤ 0. Under `mask_on: valid` that gate is the only place emptiness is decided.
 3. **The gate on this split**, `gate_fraction_<anchor source>`: `where_raw > 0.5` at the target's centroid, computed from the centroids the model actually used.
 4. **The four counterfactuals** over the whole population.
-5. **Prompts that name nothing.** `empty_prompts` rewrites up to 400 of the scored rows, flipping a clause up to 6 times, until `solutions_for` returns nothing. It reports how often the null head says invalid, how often *any* mask is emitted, and the mean false-positive voxel count. This is the check that the tiny spike in `where_raw` was not renormalised into a confident answer.
+5. **Prompts that name nothing.** `empty_prompts` rewrites up to 400 of the scored rows, flipping a clause up to 6 times, until `solutions_for` returns nothing. It reports how often the null head says invalid, how often *any* mask is emitted, and the mean false-positive voxel count, each also **gated** (`false_positive_rate_null_gated`, `false_positive_voxels_null_gated`). Under `mask_on: valid` the carver is no longer trained to fall silent here, so the ungated leak rises by design, and the gated one is the system's answer. This is the check that the tiny spike in `where_raw` was not renormalised into a confident answer.
 6. **Image replacement** (mandatory). Keep this subject's anchors and every field, and feed `B` the **neighbouring row's MRI** from a *shuffled* loader. Pairs from the same subject are **skipped and counted**: manifests are in scene order, so four consecutive rows are usually one volume, and swapping those would report a reassuring null for the wrong reason. The Dice should **fall** and the centroid should **hold**. That pattern is the signature that *the words placed the structure and the image drew it.*
 
 Next to the Dice it prints the **population's own anchor-set ceiling**, with a warning when that is ≥ 90%. It writes `report.json` and `predictions.jsonl`, and with `--save-masks` also every predicted mask. The other mandatory test, the **prompt-only carver**, is a training run: `scripts/train.py b --prompt-only`. If its Dice approaches the full model's, the mask is a spatial prior. One item on the original proposal's report list is not implemented as such: the **alternate-prompt switch rate** (a prompt that names a different structure should move the mask). `flip_direction` is its nearest proxy.
@@ -1762,7 +1776,8 @@ MRI corpus, `B = 4`, training step with the anchor cache.
 | 6 | `log_where`, `log_mass` | `[B,1,D,H,W]` | `[4,1,128,128,128]` | float32 → bf16 | in [−1, 0] |
 | 6 | carver input `x` | `[B,25,D,H,W]` | `[4,25,128,128,128]` | bf16 | 22 without anchors, 9 prompt-only |
 | 7 | carver `features` | `[B,16,D/2,H/2,W/2]` | `[4,16,64,64,64]` | bf16 | after the stem and blocks |
-| 7 | `full` | `[B,32,D,H,W]` | `[4,32,128,128,128]` | bf16 | upsample + `B(I)` skip |
+| 7 | `coarse` | `[B,1,D/2,H/2,W/2]` | `[4,1,64,64,64]` | bf16 | feature half of the 1×1 `head`, on the working grid |
+| 7 | upsampled `coarse` + `B(I)` half | `[B,1,D,H,W]` | `[4,1,128,128,128]` | bf16/float32 | one channel upsampled; replaces the old `[4,32,128³]` concatenation (§12.2) |
 | 7 | `logits` | `[B,1,D,H,W]` | `[4,1,128,128,128]` | bf16 | after the exclusion |
 | 7 | `heatmap` | `[B,1,D/2,H/2,W/2]` | `[4,1,64,64,64]` | bf16 | |
 | 8 | `centroid` | `[B,3]` | `[4,3]` | float32 | soft-argmax, mm |
@@ -1868,6 +1883,8 @@ This architecture was first specified as a proposal, together with a separate fi
 - **No residual block at full resolution in `B`**: 350 of the 530 ms of a step (§11.1).
 - **`carver_sees_anchors` (default on)**, a flag added later to remove the three anchor-mask channels from the carver (§12.1). It is an architectural parameter and is recorded in `StageB.config`.
 - **`train.stage_b.leave_one_out` (default off)**, episodic class withholding (§7.4). It is a training-schedule value.
+- **`train.stage_b.mask_on` (shipped `valid` since 2026-09-22; `all` reproduces every earlier run)**. The proposal's loss table trains a prompt that names nothing towards the empty mask. That turned the carver into a second, image-based null detector, and the detector also rejects unfamiliar valid targets: 75% of held-out masks come out empty on `data/mri` ([[B03 relational-seed1]]). `valid` trains the mask only on prompts that name a structure and leaves emptiness to the null head's gate (§14.2). It is a training-schedule value, recorded in `meta["config"]["stage"]`. It is untested; see `_update_ideas/2026-09-22-null-head-decides-emptiness.md`.
+- **The mask head is applied in two exact halves** (§12.2): 1×1 on the working grid, then one upsampled channel plus the `B(I)` half at full resolution. Same function and checkpoints; carver peak memory −40%.
 
 ### 20.5 Sequencing
 
@@ -1928,6 +1945,7 @@ Every tunable lives in a config file, and nothing in `src/` hard-codes a value f
 | `train.stage_b.loss` | dice 1, bce 1, null_bce 0.2, centroid 0.02, field_centroid 0.01, far 0.2 | same | §14.2 |
 | `train.stage_b.far` | ε 0.05, dilation 8 | ε 0.05, dilation 4 | `L_far` |
 | `train.stage_b.field_centroid_on` | `always` | `always` | or `empty-only` |
+| `train.stage_b.mask_on` | `valid` | `valid` | or `all`, which reproduces every run before 2026-09-22 (§14.2) |
 | `train.stage_b.leave_one_out` | *(absent → off)* | false | §7.4 |
 | `train.stage_a` | 50 epochs, lr 1e-3, warm-up 2, augment | same | |
 | `train.boundary` | 30 epochs, lr 5e-4, `mask_fraction` 0.5, `patch` 16, loss 1 / 1 / 0.5 | `patch` 8 | §11.2 |
@@ -1958,7 +1976,7 @@ Every row links to its experiment in [[Result_tracker]]. All runs are single-see
 | leave-one-class-out helps transfer | **not yet distinguishable** | running. Matched Δ over epochs 0–10 is inside the replicate noise ([[B10 arm-loo]]) |
 | removing the anchor masks from the carver helps | **untested** | the arm ran with the flag still on ([[B11 arm-noanchor]]) |
 
-**Open, in rough order of what they would decide.** Run `carver_sees_anchors: False` properly. Let `synthetic-mri` finish and add seeds, since held-out numbers cannot be read off a single seed with swings this large. Run `field_centroid_on: empty-only`. Try a `flip_probability` sweep: 16% of training examples are supervised to be empty, which makes "when in doubt, say nothing" a free policy on the training distribution. Then the α ablation and `full_resolution_skip: false`. The test split has not been touched.
+**Open, in rough order of what they would decide.** Run `carver_sees_anchors: False` properly. Let `synthetic-mri` finish and add seeds, since held-out numbers cannot be read off a single seed with swings this large. Run `field_centroid_on: empty-only`. Run the first `mask_on: valid` model against `mri-stage-b` (shipped 2026-09-22, untrained): 16% of training examples used to be supervised to be empty, which made "when in doubt, say nothing" a free policy on the training distribution. Then the α ablation and `full_resolution_skip: false`. The test split has not been touched.
 
 ---
 

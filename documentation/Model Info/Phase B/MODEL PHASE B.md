@@ -262,11 +262,13 @@ plus `where_raw`, `where_mass`, `fields`, `anchors`, `masses`, `anchor_centroids
 
 | term | weight | applies to |
 | --- | --- | --- |
-| Dice + BCE on the mask | 1.0 / 1.0 | every kept example |
+| Dice + BCE on the mask | 1.0 / 1.0 | kept **and** valid under the shipped `mask_on: valid`; every kept example under `all` (all runs before 2026-09-22) |
 | null BCE | 0.2 | every kept example |
 | heatmap vs the **structure's** centroid | 0.02 | kept **and** valid |
 | heatmap vs the **field's** centre | 0.01 | kept and the field has mass |
 | `L_far` | 0.2 | kept and valid |
+
+Under `mask_on: valid` a prompt that names nothing trains only the [[NullHead]]. At inference the null head's gate (`null_gated`) is what empties the mask, and every Dice is reported gated and ungated. The result table below comes from an `all` run: its 75% empty held-out masks are what the change targets ([[SpatialVox#14. Step 10 — Losses]]).
 
 Weights are in millimetres summed over three axes for the two offsets, so they are per-mm; at 0.1 the centroid term would be four times the Dice and the carver's trunk would be trained mostly to localise. Per-term losses are logged every epoch (`loss_*` in `metrics.jsonl`) because six terms on four scales cannot be balanced by reading the total.
 

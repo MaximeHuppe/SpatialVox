@@ -176,6 +176,7 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         far_epsilon=float(stage_cfg.far.epsilon),
         far_dilation=int(stage_cfg.far.dilation),
         field_centroid_on=str(stage_cfg.field_centroid_on),
+        mask_on=str(stage_cfg.mask_on),
     )
     return datasets, task, extra
 

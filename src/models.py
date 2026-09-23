@@ -518,6 +518,15 @@ class Carver(nn.Module):
 
     The heatmap is a *separate* 1x1 on the working grid, not a reading of the
     mask: it survives the prompt being empty, which the mask does not.
+
+    The mask head is applied in two halves that are *exactly* the 1x1 above
+    (``_update_ideas/2026-09-22-null-head-decides-emptiness.md``). A 1x1
+    convolution and a trilinear upsample are both linear, and the upsample's
+    weights sum to one, so ``head(cat[up(f), B]) = up(W_f f + b) + W_B B``: the
+    feature half runs on the working grid and a single channel is upsampled,
+    instead of upsampling ``width`` channels and concatenating them with ``B(I)``
+    into a ``(width + 16)``-channel tensor at full resolution. Same parameters,
+    same checkpoints, same function.
     """
 
     def __init__(
@@ -543,10 +552,12 @@ class Carver(nn.Module):
     def forward(self, x: Tensor, boundary: Tensor | None) -> tuple[Tensor, Tensor]:
         """``-> (logits [B, 1, D, H, W], heatmap logits [B, 1, D/2, H/2, W/2])``."""
         features = self.blocks(self.stem(x))
-        full = F.interpolate(features, size=x.shape[2:], mode="trilinear", align_corners=True)
-        if self.full_resolution_skip and boundary is not None:
-            full = torch.cat([full, boundary], dim=1)
-        return self.head(full), self.heatmap(features)
+        width = features.shape[1]
+        coarse = F.conv3d(features, self.head.weight[:, :width], self.head.bias)
+        logits = F.interpolate(coarse, size=x.shape[2:], mode="trilinear", align_corners=True)
+        if self.full_resolution_skip:
+            logits = logits + F.conv3d(boundary, self.head.weight[:, width:])
+        return logits, self.heatmap(features)
 
 
 def soft_argmax(
