@@ -30,7 +30,7 @@ tags:
 # B2 mri-mask-valid-seed1
 
 > [!abstract] Verdict
-> Running.
+> Running. Interim, epochs 0–9: trained 0.774, held-out 0.017 / 0.002 against floors of 0.110 / 0.063. The model now answers, but it paints a trained neighbour instead of the held-out target.
 
 ## Question
 Does the baseline's fix transfer to real MRI?
@@ -56,4 +56,15 @@ If the held-out masks come back but land on the wrong structure, the anchor-set 
 - **Floors:** trained 0.3067, held-out val 0.1097, held-out test 0.0630.
 
 ## Result
-To be filled when it ends.
+**Interim, epochs 0–9** (2026-09-23 14:30; `best.pt` = epoch 9):
+- trained **0.774** (B03 at epoch 9: 0.741);
+- held-out val **0.017** (floor 0.110; B03 0.009);
+- held-out test **0.002** (floor 0.063);
+- held-out empty rate 7–46% (B03 75%).
+
+**The diagnostic of `best.pt`:**
+- held-out masks are 12–22% of the target's volume;
+- 59–62% of the painted voxels land on another structure, almost always a trained one (caudate → accumbens or pallidum; hippocampus → thalamus, pallidum or amygdala);
+- the centroid is 22–28 mm off.
+
+The shyness is fixed, and it has been replaced by recognise-and-recall. The full analysis, with the candidate causes, is in `_update_ideas/2026-09-23-b2-mri-no-generalisation-analysis.md`.
