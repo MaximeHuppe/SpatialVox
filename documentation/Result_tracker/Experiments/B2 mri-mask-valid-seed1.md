@@ -1,7 +1,7 @@
 ---
 id: "B2"
 kind: "stage-b"
-status: "running"
+status: "done"
 date: "2026-09-23"
 run: "runs/mri-mask-valid-seed1"
 git: "32de4e3 (code identical to d14f201)"
@@ -10,17 +10,17 @@ stage_a: "[[A01 phase-a-current]]"
 parent: "[[B03 relational-seed1]]"
 change: "The baseline method (mask_on: valid) on real MRI. Also 30 epochs against B03's 20: compare at matched epochs 0–19"
 assumption: "If the shy carver was what blocked transfer on MRI too, the held-out empty rate falls from 75% towards 0 and held-out val Dice clears its 0.110 floor, where B03 had 0.005"
-epochs: "0 / 30 (running)"
+epochs: "30 / 30"
 seeds: 1
 metric: "val Dice, targets.train (8)"
-score:
+score: 0.7924
 floor: 0.3067
-heldout_val:
-heldout_test:
+heldout_val: 0.0218
+heldout_test: 0.0114
 delta:
 delta_on: "held-out val at matched epochs 0–19 against B03"
-benefit: "not yet"
-verdict:
+benefit: "no"
+verdict: "No transfer on real MRI: held-out 0.022 / 0.011 against floors of 0.110 / 0.063. Trained classes improve (0.792). The shyness is fixed, but it is replaced by painting a trained neighbour: the carver fine term encodes class identity"
 tags:
   - experiment
   - stage-b
@@ -30,7 +30,7 @@ tags:
 # B2 mri-mask-valid-seed1
 
 > [!abstract] Verdict
-> Running. Interim, epochs 0–9: trained 0.774, held-out 0.017 / 0.002 against floors of 0.110 / 0.063. The model now answers, but it paints a trained neighbour instead of the held-out target.
+> Done (30 epochs, `best.pt` epoch 17). Final evaluation: trained 0.792; held-out 0.022 / 0.011 against floors of 0.110 / 0.063; 10% / 4% empty masks; another subject's image *raises* held-out Dice. Interim, epochs 0–9: trained 0.774, held-out 0.017 / 0.002 against floors of 0.110 / 0.063. The model now answers, but it paints a trained neighbour instead of the held-out target.
 
 ## Question
 Does the baseline's fix transfer to real MRI?

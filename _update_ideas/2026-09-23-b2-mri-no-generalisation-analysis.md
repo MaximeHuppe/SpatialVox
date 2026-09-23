@@ -119,3 +119,22 @@ The structures painted instead:
    - more target-only classes (§4.2; corpus change).
 
    Two seeds each, read per class against the floors.
+
+### Final evaluation of B2 `best.pt` (epoch 17, `--split val`), 2026-09-23 18:34
+
+Reports are in `runs/mri-mask-valid-seed1/eval_val_*/`.
+
+| | trained | held-out val (caudate, putamen) | held-out test (hippocampus) |
+|---|---|---|---|
+| Dice (null-gated) | 0.792 (0.788) | 0.022 (0.021) | 0.011 (0.011) |
+| floor | 0.307 | 0.110 | 0.063 |
+| empty masks | 0% | 9.7% | 3.9% |
+| predicted / true volume | 1.01 | 0.12 | 0.31 |
+| centroid error | 1.9 mm | 25.3 mm | 28.5 mm |
+| region contains the centre (predicted anchors) | 80% | 86% | 90% |
+| another subject's image: Dice | 0.793 → 0.479 | **0.022 → 0.049** | **0.012 → 0.021** |
+| impossible prompts that get a mask, ungated / gated | 79% / 33% | 76% / 34% | 74% / 28% |
+
+- **Per class:** L-Caudate 0.036, R-Caudate 0.017, L-Putamen 0.019, R-Putamen 0.003, L-Hippocampus 0.014, R-Hippocampus 0.008.
+- **Reading:** as at epoch 9. On trained classes the image is used; on held-out ones a different image *raises* the Dice. This subject's own tissue is what suppresses the held-out target, which is consistent with the class-identity fine term of `2026-09-23-module-audit-boundary-carver-mapper.md` §2.4.
+
