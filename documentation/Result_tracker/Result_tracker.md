@@ -7,10 +7,18 @@ tags:
 
 Every experiment gets one note in `Result_tracker/Experiments/`. Its properties record what was run and what was assumed, and above all its **`parent`** (the experiment it is compared against) and its **`delta`** (the change in score against that parent, on the metric named in `delta_on`). **`benefit`** records whether the change helped. The method and architecture are documented in [[SpatialVox]], and the model is drawn in [[Flowchart]].
 
-> [!warning] Needs attention (2026-09-23 00:10)
-> - [[B12 mask-valid-seed1]] **finished** (30 epochs), with `mask_on: valid`. Held-out empty rate 0%, and held-out Dice 0.727 / 0.774 at `best.pt` against B09's 0.368 / 0.460 (+0.15 / +0.18 at matched epochs). One seed: still to do are `scripts/evaluate.py` on its `best.pt` (per-class Dice, image replacement, impossible-prompt leak with and without the null gate) and a second seed.
-> - [[B10 arm-loo]] and [[B11 arm-noanchor]] were **killed at 17 of 30 epochs** on 2026-09-22, and their run folders were later deleted by another session's relaunch. Their notes still show epoch-10 snapshots. Leave-one-out showed no effect beyond the replicate noise. B11 was invalid (the flag never applied) and serves as B09's replicate. `carver_sees_anchors: False` has still never been run.
-> - [[B06 field-empty-only-seed1]] **produced no epoch**. Still to run.
+> [!success] Baselines (2026-09-23)
+> - **Phase B baseline: [[B0 mask-valid-seed1]]** (`mask_on: valid`, commit `d14f201`, `runs/mask-valid-seed1`), on `data/synthetic-mri`. Evaluated at `best.pt`:
+>   - trained classes 0.962;
+>   - held-out val **0.724** (floor 0.247) and held-out test **0.775** (floor 0.162);
+>   - 0% empty held-out masks;
+>   - another scene's image drops held-out Dice 0.72 → 0.16;
+>   - after the null-head gate, 29–32% of impossible prompts still get a mask.
+>   Provisional: **one seed**.
+> - **Its Phase A:** [[A09 mri-stage-a]].
+> - **Easy-corpus sanity check:** [[B1 easy-mask-valid-seed1]] (running), on [[A03 synthetic-stage-a]].
+> - **Real MRI:** the only Phase B reference is still [[B03 relational-seed1]], trained under the old `mask_on: all` (held-out 0.005 against a 0.110 floor), on [[A01 phase-a-current]]. Rerunning it with `mask_on: valid` is the next milestone.
+> - **Archive:** every other run was moved to `SpatialVox-MRI/runs_archive_2026-09-23/` and its note deleted. The numbers they contributed are kept in `_update_ideas/` and in the noise table below.
 
 ## All experiments
 
@@ -25,56 +33,27 @@ A solid arrow means *parent → child* (the comparison). A dotted arrow means *u
 ```mermaid
 flowchart LR
     subgraph MRI["data/mri - HCP, 23 structures, 128³ at 1.25 mm"]
-        direction LR
-        A01["A01 Stage A<br/>0.8158 - shipped"] --> A02["A02 16³ bottleneck<br/>0.8018, Δ -0.014"]
-        L01["L01 legacy attention B<br/>best 0.706, not comparable"]
-        P01["P01 B(I) pretraining<br/>boundary Dice 0.633"]
-        B01["B01 overfit 1 scene<br/>0.788, 1.20 mm"] --> B02["B02 oracle anchors<br/>Δ -0.007 ± 0.054"]
-        L01 --> B03["B03 relational baseline<br/>0.781 vs floor 0.307<br/>held-out 0.005 vs 0.110"]
-        B03 --> B04["B04 prompt-only<br/>Δ -0.258, held-out +0.112"]
-        B03 --> B05["B05 pretrained B<br/>Δ -0.010, held-out +0.001"]
-        B03 --> B06["B06 field empty-only<br/>0 epochs"]
-        D01["D01 anchor-first prompts"]
-        D02["D02 gate, tau 0.5"]
-        D03["D03 zscore-brain"]
+        A01["A01 Stage A<br/>0.816"]
+        B03["B03 relational, mask_on: all<br/>0.781, held-out 0.005 vs floor 0.110"]
     end
-    subgraph SYN["synthetic corpora - 64³"]
-        direction LR
-        A03["A03 easy Stage A<br/>0.9976"] --> A04["A04 hard Stage A<br/>0.8831"]
-        A04 --> A05["A05 gate, 14 epochs<br/>0.065"]
-        A05 --> A06["A06 control, 14 epochs<br/>0.065 then collapse"]
-        A05 --> A07["A07 gate, 50 epochs<br/>0.243, Δ +0.178"]
-        A07 --> A08["A08 MRI-measured look<br/>0.283"]
-        A08 --> A09["A09 400 scenes<br/>0.923, Δ +0.640"]
-        B07["B07 easy Stage B<br/>0.983, held-out 0.98"] --> B08["B08 hard Stage B<br/>0.876, held-out 0.71"]
-        B08 --> B09["B09 synthetic-mri<br/>0.937, held-out 0.37 / 0.46"]
-        B09 --> B10["B10 leave-one-out<br/>killed at 17/30, no effect"]
-        B09 --> B11["B11 no-anchor<br/>INVALID, replicate of B09"]
-        B09 --> B12["B12 mask_on: valid<br/>0.962, held-out 0.73 / 0.77"]
+    subgraph SYN["synthetic corpora, 64³"]
+        A09["A09 Stage A, synthetic-mri<br/>0.923"]
+        B0["<b>B0 BASELINE</b>, mask_on: valid<br/>0.962, held-out 0.72 / 0.78"]
+        A03["A03 Stage A, easy<br/>0.998"]
+        B1["B1 easy, mask_on: valid<br/>running"]
     end
-    B03 --> B07
-    A01 -.-> B01
     A01 -.-> B03
-    P01 -.-> B05
-    A03 -.-> B07
-    A04 -.-> B08
-    A09 -.-> B09
-    D01 -.-> B03
-    D02 -.-> B03
-    D03 -.-> A01
-
+    A09 -.-> B0
+    A03 -.-> B1
+    B0 --> B1
     classDef stageA fill:#e1f5fe,stroke:#0288d1,color:#1a1a1a;
     classDef stageB fill:#fbe9e7,stroke:#e64a19,color:#1a1a1a;
-    classDef diag fill:#f3e5f5,stroke:#7b1fa2,color:#1a1a1a;
-    classDef legacy fill:#eeeeee,stroke:#9e9e9e,color:#1a1a1a;
+    classDef base fill:#e8f5e9,stroke:#2e7d32,stroke-width:3px,color:#1a1a1a;
     classDef running fill:#fff8e1,stroke:#f9a825,stroke-width:2px,color:#1a1a1a;
-    classDef bad fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#1a1a1a;
-    class A01,A02,A03,A04,A05,A06,A07,A08,A09 stageA;
-    class B01,B02,B03,B04,B05,B07,B08,B09 stageB;
-    class D01,D02,D03,P01 diag;
-    class L01 legacy;
-    class B06,B11 bad;
-    class B10,B12 stageB;
+    class A01,A03,A09 stageA;
+    class B03 stageB;
+    class B0 base;
+    class B1 running;
 ```
 
 Keep this graph in step with the `parent` properties when you add a note. Obsidian's graph view draws the same edges from the `parent` and `stage_a` links.
@@ -112,16 +91,16 @@ Nothing sets `cudnn.deterministic`, so the same config and seed do not reproduce
 
 | estimate | supervised | held-out val | held-out test |
 |---|---|---|---|
-| `synthetic-mri` replicate ([[B11 arm-noanchor]] vs [[B09 mri-stage-b]], epochs 0–10): mean \|Δ\| per epoch | 0.022 | 0.091 | 0.065 |
+| `synthetic-mri` replicate (`B11 arm-noanchor` (archived) vs `B09 mri-stage-b` (archived), epochs 0–10): mean \|Δ\| per epoch | 0.022 | 0.091 | 0.065 |
 | the same, max \|Δ\| | 0.134 | 0.223 | 0.200 |
-| within one run: mean \|Δ\| between consecutive epochs ([[B09 mri-stage-b]]) | — | 0.144 | — |
+| within one run: mean \|Δ\| between consecutive epochs (`B09 mri-stage-b` (archived)) | — | 0.144 | — |
 | earlier MRI runs (non-determinism alone) | ~0.01 typical, ~0.03 worst | — | — |
 
 These are **lower bounds** on seed spread. A held-out Δ smaller than about 0.1 at a single epoch is not evidence on `synthetic-mri`.
 
 ## Adding an experiment
 
-1. Copy [[Experiment template]] into `Experiments/` as `<ID> <run-name>.md`. The ID prefix is the kind: `A` Stage A, `B` Stage B, `P` pretraining, `D` diagnostic or decision, `L` legacy. Zero-pad: `B12`.
+1. Copy [[Experiment template]] into `Experiments/` as `<ID> <run-name>.md`. The ID prefix is the kind: `A` Stage A, `B` Stage B, `P` pretraining, `D` diagnostic or decision, `L` legacy. The next Stage B is `B2`.
 2. Set `parent` to the run it should be compared against, and write down the single `change` and the `assumption` **before** launching.
 3. Launch with `True`/`False` for booleans, then open `runs/<name>/best.json` and confirm that the changed key reads what you intended (in `model` for architecture, in `meta.config.stage` for the schedule).
 4. When it ends, fill in `score`, `floor`, `heldout_*`, `delta` (only if comparable) and `delta_on`, and set `benefit` against the noise table. Then write the verdict.

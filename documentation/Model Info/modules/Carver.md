@@ -61,7 +61,7 @@ flowchart LR
 | 1 | `log(where_raw)`, clamped and normalised | ” |
 | 1 | `log(where_mass)`, broadcast across space | ” |
 
-With `carver_sees_anchors: false` the three `A_i` rows drop out: 22 channels, a 9,504-parameter stem, 37,202 parameters in all. The anchor exclusion is unchanged. That arm has not yet run with the flag actually off ([[B11 arm-noanchor]]).
+With `carver_sees_anchors: false` the three `A_i` rows drop out: 22 channels, a 9,504-parameter stem, 37,202 parameters in all. The anchor exclusion is unchanged. That arm has not yet run with the flag actually off (`B11 arm-noanchor` (archived)).
 
 `tests/test_models.py::test_the_carver_takes_exactly_the_ten_declared_channels` counts this off `stem[0].in_channels`, so a smuggled coordinate grid changes the number and fails.
 
@@ -152,4 +152,4 @@ The anchors are the given, not the answer. It uses the **predicted soft mask**, 
 
 Not capacity, as an earlier reading of the overfit suggested. Memorising a *single scene* reached 0.7877, but by epoch 11 of the real run the same 38.5k-parameter carver passes that on **training** Dice (0.8048) with 160 subjects. The overfit is a wiring check — it says the channel order, the world coordinates and the prompt indices are right — and nothing more.
 
-What does limit it is what the image gives it. On a class it was never supervised to draw, the carver **falls silent**: 75% empty masks, and 93 predicted voxels where 2219 belong, while the anchors are as good as ever (0.8046) and the field points at the target slightly *more* often (gate 0.857 vs 0.827). Nothing upstream failed; the carver simply does not answer. Since 16% of its training examples are supervised to be empty (a flip that names nothing), "when in doubt, say nothing" costs it nothing on the training distribution. On the synthetic series, where the image carries more class-agnostic contrast, the same carver stays above its held-out floor ([[B09 mri-stage-b]]).
+What does limit it is what the image gives it. On a class it was never supervised to draw, the carver **falls silent**: 75% empty masks, and 93 predicted voxels where 2219 belong, while the anchors are as good as ever (0.8046) and the field points at the target slightly *more* often (gate 0.857 vs 0.827). Nothing upstream failed; the carver simply does not answer. Since 16% of its training examples are supervised to be empty (a flip that names nothing), "when in doubt, say nothing" costs it nothing on the training distribution. On the synthetic series, where the image carries more class-agnostic contrast, the same carver stays above its held-out floor (`B09 mri-stage-b` (archived)).

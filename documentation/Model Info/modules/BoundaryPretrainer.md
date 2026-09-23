@@ -7,7 +7,7 @@ tags:
 - owns a [[BoundaryEncoder]] as `self.encoder`, plus three 1×1 heads
 - its trained `encoder` weights are loaded into `StageB.boundary` and given 0.1× the carver's learning rate
 - trained by `scripts/train.py boundary`; **not** part of the relational forward
-- documented in [[SpatialVox#11. Step 7 — Boundary encoder B(I), the WHAT]]; runs [[P01 boundary-seed1]] and [[B05 pretrained-b-seed1]]
+- documented in [[SpatialVox#11. Step 7 — Boundary encoder B(I), the WHAT]]; runs `P01 boundary-seed1` (archived) and `B05 pretrained-b-seed1` (archived)
 
 > §N in this note is a section of the original proposal; [[SpatialVox#20. Deviations from the original proposal]] maps each one to the document.
 

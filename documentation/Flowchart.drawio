@@ -73,7 +73,7 @@
                 <mxCell id="U1" value="upsample, concat skip&lt;br&gt;ConvBlock 48→16 at 128³" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="BE" vertex="1">
                     <mxGeometry x="20" y="450" width="360" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="CV" value="Carver (38,498 params)" style="swimlane;whiteSpace=wrap;html=1;rounded=1;arcSize=2;startSize=32;fontStyle=1;fontSize=14;fontFamily=Helvetica;fontColor=#1A1A1A;container=1;collapsible=0;swimlaneFillColor=#FEF7F5;fillColor=#FEF7F5;strokeColor=#E64A19;" parent="1" vertex="1">
+                <mxCell id="CV" value="Carver (38,498 params) · mask trained on valid prompts only (mask_on: valid)" style="swimlane;whiteSpace=wrap;html=1;rounded=1;arcSize=2;startSize=32;fontStyle=1;fontSize=14;fontFamily=Helvetica;fontColor=#1A1A1A;container=1;collapsible=0;swimlaneFillColor=#FEF7F5;fillColor=#FEF7F5;strokeColor=#E64A19;" parent="1" vertex="1">
                     <mxGeometry x="1080" y="1270" width="860" height="340" as="geometry"/>
                 </mxCell>
                 <mxCell id="STEM" value="&lt;b&gt;stem&lt;/b&gt;: ConvBlock 25→16, stride 2&lt;br&gt;[B,16,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
@@ -112,7 +112,7 @@
                 <mxCell id="ANCH" value="&lt;b&gt;A_0, A_1, A_2&lt;/b&gt;&lt;br&gt;soft anchor masks&lt;br&gt;[B,3,128³]&lt;br&gt;detached probabilities,&lt;br&gt;not thresholds&lt;br&gt;&lt;b&gt;NAMES STOP HERE&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FFFDE7;strokeColor=#F9A825;fontColor=#1A1A1A;" parent="1" vertex="1">
                     <mxGeometry x="800" y="520" width="240" height="190" as="geometry"/>
                 </mxCell>
-                <mxCell id="NULL" value="&lt;b&gt;NullHead&lt;/b&gt; (1,249 params)&lt;br&gt;log10 of where_mass + 3 masses&lt;br&gt;MLP 4→32→32→1, no pixels" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="1" vertex="1">
+                <mxCell id="NULL" value="&lt;b&gt;NullHead&lt;/b&gt; (1,249 params)&lt;br&gt;log10 of where_mass + 3 masses&lt;br&gt;MLP 4→32→32→1, no pixels&lt;br&gt;&lt;b&gt;the only judge of names-nothing: gates the mask&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="1" vertex="1">
                     <mxGeometry x="1180" y="920" width="320" height="90" as="geometry"/>
                 </mxCell>
                 <mxCell id="VALID" value="&lt;b&gt;valid&lt;/b&gt; [B]: one logit,&lt;br&gt;do the clauses name a structure" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#E8F5E9;strokeColor=#388E3C;strokeWidth=2;fontColor=#1A1A1A;" parent="1" vertex="1">

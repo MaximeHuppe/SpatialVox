@@ -94,7 +94,7 @@ Measured on `data/mri` at the end of training, the head reaches **0.626** on the
 
 #### It is also not what produces the empty output
 
-Of 382 prompts that name nothing, the model emits **any** mask only **5.5%** of the time. That behaviour comes from the **carver** and its empty-mask loss, not from this head. Under `mask_on: all` (every run up to [[B11 arm-noanchor]]) the null head was therefore close to redundant on `data/mri`. The carver's own rejection also silenced 75% of held-out prompts that *do* name a structure.
+Of 382 prompts that name nothing, the model emits **any** mask only **5.5%** of the time. That behaviour comes from the **carver** and its empty-mask loss, not from this head. Under `mask_on: all` (every run up to `B11 arm-noanchor` (archived)) the null head was therefore close to redundant on `data/mri`. The carver's own rejection also silenced 75% of held-out prompts that *do* name a structure.
 
 #### Since 2026-09-22 it is the only thing that decides "empty"
 

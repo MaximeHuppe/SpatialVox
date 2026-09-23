@@ -6,7 +6,7 @@ date: "2026-09-22"
 run: "runs/mri-stage-a"
 git: "c143832"
 corpus: "data/synthetic-mri"
-parent: "[[A08 gate-mri-like]]"
+parent: "`A08 gate-mri-like` (archived)"
 change: "60 to 400 training scenes (and 20 to 50 val scenes), same appearance; the first 60 / 20 scenes are identical to A08's"
 assumption: "The gate corpus was limited by data, not by its appearance"
 epochs: "50 / 50"
@@ -25,7 +25,7 @@ tags:
 # A09 mri-stage-a
 
 > [!abstract] Verdict
-> **Benefit shown: +0.6402** over [[A08 gate-mri-like]] from more scenes alone (same appearance, same first 60 / 20 scenes). Stage A of the current synthetic series: [[B09 mri-stage-b]], [[B10 arm-loo]], [[B11 arm-noanchor]].
+> **Benefit shown: +0.6402** over `A08 gate-mri-like` (archived) from more scenes alone (same appearance, same first 60 / 20 scenes). Stage A of the current synthetic series: `B09 mri-stage-b` (archived), `B10 arm-loo` (archived), `B11 arm-noanchor` (archived).
 
 ## Setup
 `scripts/train.py a --config configs/synthetic-hard.yaml`, which now points at `data/synthetic-mri`: 400 / 50 / 50 scenes, 16 classes, threshold IoU 0.2065, 64³. 8,023,299 parameters. 50 epochs, batch 16, about 10 s per epoch.

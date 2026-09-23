@@ -10,7 +10,7 @@ aliases:
 The one document for this project: what the model is for, why it is built this way, and what happens to the data at each step from an HCP scan to a reported number. It describes the code at commit `f11b02f` (branch `dev-SpatialVox-V1`, 2026-09-22). Companion notes sit beside it: [[Flowchart]] (the model on one page, with an editable `Flowchart.drawio`), [[Result_tracker]] (every experiment, its parent and what it changed), and `Model Info/`, one note per module ([[MODEL PHASE A]], [[MODEL PHASE B]], and a note for each block below). `CLAUDE.md` at the repository root is the short list of constraints; this note explains them.
 
 > [!summary] 0. Overview
-> SpatialVox segments a brain structure that the prompt never names. The prompt is three clauses, each a direction and a named anchor, for example *"superior to the Left-Thalamus, medial to the Right-Putamen, and anterior to the Brain-Stem"*, and only their conjunction picks out one structure. A frozen promptable segmenter (**Stage A**) turns the three anchor names into three soft masks, and the names go no further than that. A parameter-free mapper turns those masks and the three direction words into three 45° pyramid fields and their product, `where_raw`. A boundary encoder `B(I)` reads the MRI without seeing the prompt. A small **carver** combines `B(I)` with the geometry to produce the target mask and a centroid, and a null head that reads four scalars says whether the clauses name anything. The mask is painted from the image rather than picked from Stage A's proposals, so in principle the target does not have to be a structure Stage A can draw. That is the lesion claim, and the evaluation machinery (prompt-blind floors, counterfactuals, image replacement, the prompt-only carver) exists to test whether the model lives up to it. On MRI the model reads the prompt and uses the image for the eight classes it is supervised on: Dice 0.794 against a 0.307 floor. It does not transfer to target classes held out of supervision: 0.005 against a 0.110 floor. The synthetic series in [[Result_tracker]] is working out why.
+> SpatialVox segments a brain structure that the prompt never names. The prompt is three clauses, each a direction and a named anchor, for example *"superior to the Left-Thalamus, medial to the Right-Putamen, and anterior to the Brain-Stem"*, and only their conjunction picks out one structure. A frozen promptable segmenter (**Stage A**) turns the three anchor names into three soft masks, and the names go no further than that. A parameter-free mapper turns those masks and the three direction words into three 45° pyramid fields and their product, `where_raw`. A boundary encoder `B(I)` reads the MRI without seeing the prompt. A small **carver** combines `B(I)` with the geometry to produce the target mask and a centroid, and a null head that reads four scalars says whether the clauses name anything. The mask is painted from the image rather than picked from Stage A's proposals, so in principle the target does not have to be a structure Stage A can draw. That is the lesion claim, and the evaluation machinery (prompt-blind floors, counterfactuals, image replacement, the prompt-only carver) exists to test whether the model lives up to it. On the MRI-like synthetic corpus the baseline, [[B0 mask-valid-seed1]] (commit `d14f201`), reaches 0.962 on trained classes. It also reaches **0.724 / 0.775 on target classes never supervised as targets**, against floors of 0.247 / 0.162, with one seed. What unlocked it was `mask_on: valid`: the mask is no longer trained to be empty, and the null head alone decides "names nothing". On real MRI the only reference is still the older `mask_on: all` model: 0.794 on supervised classes, and 0.005 held out against a 0.110 floor.
 
 **Contents**
 [[#1. The task]]
@@ -102,7 +102,7 @@ So the correct description is **"never supervised as a relational target"**, nev
 
 The blueprint's language is also a different one. It uses `left/right` unit vectors where this project uses *medial/lateral as distances to the mid-sagittal plane*, it has six independent predicates where this project has one dominant axis per clause, and it allows repeated anchors. It also registers scans to canonical template coordinates, and on fixed anatomy a template centroid is close to a class name. None of it is carried over: no anonymous queries, no geometry MLP scoring candidates, no learned residual on the field, no selector softmax or null class, no dense pairwise relation loss, and no SSL, surface or SDF heads.
 
-**Not the attention Stage B it replaced.** The previous Stage B had `RelationPrompt`, `StructureEncoder`, `Evidence`, `Intersection`, a FiLM decoder, `SelectionHead`, world-coordinate grids and an `occupancy_mode`. That last one fed the decoder the target's own outline. All of it was deleted (it is recoverable from git), together with target-first prompt generation. Its runs are summarised, as not comparable, in [[L01 legacy attention Stage B]].
+**Not the attention Stage B it replaced.** The previous Stage B had `RelationPrompt`, `StructureEncoder`, `Evidence`, `Intersection`, a FiLM decoder, `SelectionHead`, world-coordinate grids and an `occupancy_mode`. That last one fed the decoder the target's own outline. All of it was deleted (it is recoverable from git), together with target-first prompt generation. Its runs are summarised, as not comparable, in `L01 legacy attention Stage B` (archived).
 
 **Not a query head through Stage A.** A `QueryHead` sketch that pooled the relational evidence into one query token and pushed it back through Stage A's attention and `MaskHead` was dropped for the same reason as the selector: whatever comes out of `MaskHead` is a structure Stage A already knows how to draw.
 
@@ -448,7 +448,7 @@ def anchor_first_examples(
 
 ### 6.5 Why anchor-first — the measured leak
 
-The generator this replaced was **target-first**: it chose the anchors *nearest the target*. On fixed anatomy the three nearest neighbours of a structure are the same in every subject, so the unordered anchor set alone recovered the target **98.9%** of the time, while solving the conjunction was right only **94.5%** of the time. Ignoring the prompt strictly beat reading it, and its prompt-blind floor was 0.775–1.000. No pool width fixes that, because the selection rule itself was the leak. Anchor-first brought the anchor-set ceiling down to **42.3%** and the floor to **0.2017** over all classes ([[D01 anchor-first prompt generation]]).
+The generator this replaced was **target-first**: it chose the anchors *nearest the target*. On fixed anatomy the three nearest neighbours of a structure are the same in every subject, so the unordered anchor set alone recovered the target **98.9%** of the time, while solving the conjunction was right only **94.5%** of the time. Ignoring the prompt strictly beat reading it, and its prompt-blind floor was 0.775–1.000. No pool width fixes that, because the selection rule itself was the leak. Anchor-first brought the anchor-set ceiling down to **42.3%** and the floor to **0.2017** over all classes (`D01 anchor-first prompt generation` (archived)).
 
 Two further leaks were closed along the way:
 - **Slot order.** Storing the distance ranking made the slot index a perfect proxy for proximity, readable without parsing a single direction word. `shuffle_clauses: false` was worth about 0.11 Dice, and it must never be used for a real run.
@@ -460,7 +460,7 @@ Two further leaks were closed along the way:
 
 ### 7.1 Normalisation
 
-`data.normalize: zscore-brain` computes mean and standard deviation over the non-zero voxels only. With `mri.apply_brainmask` about 66.5% of an HCP volume is exact zero, and plain `zscore` over the whole volume put brain tissue at mean +1.348 with sd 0.523, an offset that drifted per subject (spread 0.097) with head size. `zscore-brain` puts tissue at mean 0 and sd 1 for every subject ([[D03 zscore over the brain]]). Treating `!= 0` as "inside the brain" is valid only because the corpus was written with `apply_brainmask: true`. The synthetic corpora use `normalize: none`, since their images are already bounded to [0, 1].
+`data.normalize: zscore-brain` computes mean and standard deviation over the non-zero voxels only. With `mri.apply_brainmask` about 66.5% of an HCP volume is exact zero, and plain `zscore` over the whole volume put brain tissue at mean +1.348 with sd 0.523, an offset that drifted per subject (spread 0.097) with head size. `zscore-brain` puts tissue at mean 0 and sd 1 for every subject (`D03 zscore over the brain` (archived)). Treating `!= 0` as "inside the brain" is valid only because the corpus was written with `apply_brainmask: true`. The synthetic corpora use `normalize: none`, since their images are already bounded to [0, 1].
 
 ### 7.2 `ExampleDataset.__getitem__`
 
@@ -572,7 +572,7 @@ At `p = 0.25` about 8% of training items are therefore dropped and 16% carry an 
 
 ### 7.4 Episodic leave-one-class-out (`train.stage_b.leave_one_out`)
 
-When on, each epoch withholds one **supervised** class from the loss (`keep = 0` for rows whose target is `targets.train[epoch % len]`), cycling through all of them. The idea: a model trained on every class at once learns to *recognise* which one the prompt is asking for and paint that class's remembered shape, and rotating a class out makes that route fail *during training*. It never touches validation. The flip is applied after the withholding, so a withheld row whose flip empties or retargets it is kept with its new target, which is necessarily a different structure. Off by default. Tested as [[B10 arm-loo]].
+When on, each epoch withholds one **supervised** class from the loss (`keep = 0` for rows whose target is `targets.train[epoch % len]`), cycling through all of them. The idea: a model trained on every class at once learns to *recognise* which one the prompt is asking for and paint that class's remembered shape, and rotating a class out makes that route fail *during training*. It never touches validation. The flip is applied after the withholding, so a withheld row whose flip empties or retargets it is kept with its new target, which is necessarily a different structure. Off by default. Tested as `B10 arm-loo` (archived).
 
 ### 7.5 The anchor cache
 
@@ -834,9 +834,9 @@ Upsampling is trilinear, sized from the skip rather than by a factor. Every stag
 | run | corpus | val Dice (all classes) | tracker |
 |---|---|---|---|
 | `runs/phase-a/current` (**shipped**) | `data/mri`, 23 classes, 8³ bottleneck | **0.8158** | [[A01 phase-a-current]] |
-| `runs/phase-a/new-model` | `data/mri`, 4 widths, 16³ bottleneck | 0.8018 | [[A02 phase-a-new-model]] |
+| `runs/phase-a/new-model` | `data/mri`, 4 widths, 16³ bottleneck | 0.8018 | `A02 phase-a-new-model` (archived) |
 | `runs/synthetic-stage-a` | easy synthetic | 0.9976 | [[A03 synthetic-stage-a]] |
-| `runs/hard-stage-a` | `synthetic-hard` | 0.8831 | [[A04 hard-stage-a]] |
+| `runs/hard-stage-a` | `synthetic-hard` | 0.8831 | `A04 hard-stage-a` (archived) |
 | `runs/mri-stage-a` | `synthetic-mri`, 16 classes | 0.9233 | [[A09 mri-stage-a]] |
 
 ### 8.7 Frozen inside Stage B
@@ -877,7 +877,7 @@ Three mechanisms keep it frozen: no gradient (`requires_grad_(False)`, `@torch.n
 | easy synthetic | 0.998 | 0.10 / 0.28 / 2.67 voxels |
 | `synthetic-hard` | 0.889 | 0.67 / **25.6** / 36.2 voxels |
 
-On `data/mri` the median error is sub-voxel, so `anchor_source: oracle` and `predicted` are **currently non-discriminating**: over 33 matched epochs an oracle-anchor overfit differed by −0.0072 ± 0.0542 ([[B02 overfit1-oracle]]). The distinction only becomes real where segmentation is hard.
+On `data/mri` the median error is sub-voxel, so `anchor_source: oracle` and `predicted` are **currently non-discriminating**: over 33 matched epochs an oracle-anchor overfit differed by −0.0072 ± 0.0542 (`B02 overfit1-oracle` (archived)). The distinction only becomes real where segmentation is hard.
 
 ---
 
@@ -1044,7 +1044,7 @@ $$F_i(p) = \sigma\!\left(\frac{\mathrm{margin}_i(p)}{\tau}\right)\cdot\big[\math
 
 ### 9.5 What the field is, and what it is not (measured)
 
-`scripts/gate_mapper.py` on `data/mri`, using ground-truth centroids only as a check ([[D02 mapper gate and tau sweep]]):
+`scripts/gate_mapper.py` on `data/mri`, using ground-truth centroids only as a check (`D02 mapper gate and tau sweep` (archived)):
 
 | `tau` (mm) | gate: target centroid with `where_raw > 0.5` | same after one flipped clause | field volume (`> 0.05`) | its 8-voxel dilation | target voxels inside field | inside dilation | null AUC of `where_mass` |
 |---|---|---|---|---|---|---|---|
@@ -1207,7 +1207,7 @@ def label_boundary(labels: Tensor) -> Tensor:
 
 Cubes are blanked rather than scattered voxels, because a voxel-wise mask is filled in from its own neighbours and teaches nothing about structure. The boundary target covers about 1.63% of voxels. The three heads total 51 parameters and are discarded afterwards: only `encoder` transfers. The optional contrastive term from the original proposal is **not implemented**. To use a pretrained `B`, set `train.stage_b.boundary_checkpoint` to the run's `best.pt`. `B` then gets `boundary_lr_scale = 0.1` of the carver's learning rate through `StageB.parameter_groups` (228,528 parameters at 3e-5 against 39,747 at 3e-4).
 
-Measured ([[P01 boundary-seed1]]): 30 epochs in about 10 minutes, boundary-map Dice 0.0041 → 0.6290 on train and 0.0163 → 0.6258 on val (best 0.6327 at epoch 28). Train and val land on the same number, so `B` learns edges rather than memorising subjects. **What this does and does not test:** the label-adjacency target covers all 23 structures, including the held-out ones, so pretraining tests whether a class-agnostic edge prior restores *relational transfer*. It does not test the lesion claim. It did not restore transfer ([[B05 pretrained-b-seed1]]).
+Measured (`P01 boundary-seed1` (archived)): 30 epochs in about 10 minutes, boundary-map Dice 0.0041 → 0.6290 on train and 0.0163 → 0.6258 on val (best 0.6327 at epoch 28). Train and val land on the same number, so `B` learns edges rather than memorising subjects. **What this does and does not test:** the label-adjacency target covers all 23 structures, including the held-out ones, so pretraining tests whether a class-agnostic edge prior restores *relational transfer*. It does not test the lesion claim. It did not restore transfer (`B05 pretrained-b-seed1` (archived)).
 
 ---
 
@@ -1242,7 +1242,7 @@ Measured ([[P01 boundary-seed1]]): 30 epochs in about 10 minutes, boundary-map D
 Both logs are clamped at `LOG_FLOOR = 1e-9` and divided by $-\ln(10^{-9}) = 20.72$. The other channels live in [0, 1], a raw `where_mass` of 1e-3 is indistinguishable from zero after one convolution, and a raw log reaching −21 would dominate every other channel. The `where_mass` channel is the one number that tells the carver the conjunction has no mass, without renormalising the map. `test_the_carver_takes_exactly_the_ten_declared_channels` counts this off `stem[0].in_channels`, so a smuggled coordinate grid would change the count and fail.
 
 > [!note] `carver_sees_anchors` (default on)
-> The three anchor *masks* are Stage A outputs, so their shapes identify the anchor classes. The unordered anchor set alone recovers the target 67.8% of the time on the supervised MRI population, which gives the carver a channel through which to *name* the target instead of solving for it. The geometry it actually needs is already in `F_i` and `where_raw`. Turning the flag off removes the three mask channels (25 → 22) and leaves the anchor **exclusion** (§12.3) unchanged. `configs/config.yaml` does not set the flag, so it defaults to on. It has not yet been tested: the arm meant to test it ran with the flag on ([[B11 arm-noanchor]]).
+> The three anchor *masks* are Stage A outputs, so their shapes identify the anchor classes. The unordered anchor set alone recovers the target 67.8% of the time on the supervised MRI population, which gives the carver a channel through which to *name* the target instead of solving for it. The geometry it actually needs is already in `F_i` and `where_raw`. Turning the flag off removes the three mask channels (25 → 22) and leaves the anchor **exclusion** (§12.3) unchanged. `configs/config.yaml` does not set the flag, so it defaults to on. It has not yet been tested: the arm meant to test it ran with the flag on (`B11 arm-noanchor` (archived)).
 
 ### 12.2 `Carver`
 
@@ -1735,7 +1735,7 @@ The synthetic structures never overlap, so the prompt-blind Dice there is exactl
 
 Nothing sets `cudnn.deterministic`, so two runs of the same config and seed differ.
 - On earlier MRI runs, non-determinism alone moved val Dice by about 0.01 typically and 0.03 at worst.
-- On `synthetic-mri`, a same-config, same-seed replicate ([[B11 arm-noanchor]] against [[B09 mri-stage-b]], epochs 0–10) differs by a mean |Δ| per epoch of **0.022** on the supervised curve (max 0.134), **0.091** on `val:targets.val` (max 0.223) and **0.065** on `val:targets.test` (max 0.200). Within one run the held-out curves move by 0.08–0.14 between consecutive epochs.
+- On `synthetic-mri`, a same-config, same-seed replicate (`B11 arm-noanchor` (archived) against `B09 mri-stage-b` (archived), epochs 0–10) differs by a mean |Δ| per epoch of **0.022** on the supervised curve (max 0.134), **0.091** on `val:targets.val` (max 0.223) and **0.065** on `val:targets.test` (max 0.200). Within one run the held-out curves move by 0.08–0.14 between consecutive epochs.
 
 These are **lower bounds** on seed spread. **A single-seed number is not a result**, so say explicitly when only one seed was run. Every run in [[Result_tracker]] so far is single-seed.
 
@@ -1870,7 +1870,7 @@ This architecture was first specified as a proposal, together with a separate fi
 ### 20.3 Where the specification was ambiguous
 
 - **"The peak of `where_raw`" is its first moment, not its argmax.** At the gate's `tau` the field is near-binary, so its maximum is a plateau of thousands of voxels, and argmax returns whichever comes first in raster order. The first moment is the unique point a plateau designates. "If that peak exists" is implemented as `sum(where_raw) > 0`, which is false exactly when `min_mass` rejected a channel.
-- **Both heatmap targets apply on a valid prompt (`field_centroid_on: always`), and that is measurably costly.** The proposal's loss table puts "peak of `where_raw`" in both the *names one* and the *names none* columns. The two targets are about **20 mm apart** (the wedge, §9.5), so on every valid prompt the field term pulls the heatmap off target while the centroid term pulls it back. On the overfit run `centroid` fell to 0.008 while `field_centroid` plateaued at 0.32, about 40% of the total loss. On the full run it is 23% at epoch 0. `field_centroid_on: empty-only` is the other reading. It is a setting, not an opinion. Its run has not produced an epoch yet ([[B06 field-empty-only-seed1]]).
+- **Both heatmap targets apply on a valid prompt (`field_centroid_on: always`), and that is measurably costly.** The proposal's loss table puts "peak of `where_raw`" in both the *names one* and the *names none* columns. The two targets are about **20 mm apart** (the wedge, §9.5), so on every valid prompt the field term pulls the heatmap off target while the centroid term pulls it back. On the overfit run `centroid` fell to 0.008 while `field_centroid` plateaued at 0.32, about 40% of the total loss. On the full run it is 23% at epoch 0. `field_centroid_on: empty-only` is the other reading. It is a setting, not an opinion. Its run has not produced an epoch yet (`B06 field-empty-only-seed1` (archived)).
 - **The heatmap lives on the carver's 64³ working grid.** Soft-argmax is an expectation, so the coordinate is continuous and is compared in mm against a full-resolution label centroid.
 - **"Background where `A_i > 0.5`" writes −10, not −∞** (§12.3).
 - **`L_far`'s dilation is a cube, not a ball** (§14.2).
@@ -1888,7 +1888,7 @@ This architecture was first specified as a proposal, together with a separate fi
 
 ### 20.5 Sequencing
 
-- `B` was specified as pretrained and then fine-tuned at a lower learning rate. The first end-to-end run trained it **from scratch** jointly, on the grounds that the two mandatory tests establish whether the image is used at all and would therefore turn pretraining into a measured improvement rather than an assumption. The pretrained arm was then run and made no difference ([[B05 pretrained-b-seed1]]).
+- `B` was specified as pretrained and then fine-tuned at a lower learning rate. The first end-to-end run trained it **from scratch** jointly, on the grounds that the two mandatory tests establish whether the image is used at all and would therefore turn pretraining into a measured improvement rather than an assumption. The pretrained arm was then run and made no difference (`B05 pretrained-b-seed1` (archived)).
 - The optional contrastive pretraining term is not implemented. The other three pretext objectives are.
 
 ### 20.6 Removed from the previous branch, and what came back
@@ -1914,7 +1914,7 @@ This architecture was first specified as a proposal, together with a separate fi
 Every tunable lives in a config file, and nothing in `src/` hard-codes a value from one. Any leaf can be overridden: `scripts/train.py b --set train.stage_b.epochs=5 --set model.stage_b.mapper.tau=1.0`.
 
 > [!warning] Booleans on the command line
-> `--set` parses values with `ast.literal_eval`, and anything that is not a Python literal is **kept as a string**. `--set model.stage_b.carver_sees_anchors=false` therefore passes the string `"false"`, and `bool("false")` is **True**. Write **`False` / `True`**, capitalised. This silently turned [[B11 arm-noanchor]] into a replicate of its parent (its checkpoint records `carver_sees_anchors: true`), and it is also the only reason `leave_one_out=true` worked in [[B10 arm-loo]]: the string `"true"` happens to be truthy. After launching any arm, check `best.json → model` and `meta.config.stage`.
+> `--set` parses values with `ast.literal_eval`, and anything that is not a Python literal is **kept as a string**. `--set model.stage_b.carver_sees_anchors=false` therefore passes the string `"false"`, and `bool("false")` is **True**. Write **`False` / `True`**, capitalised. This silently turned `B11 arm-noanchor` (archived) into a replicate of its parent (its checkpoint records `carver_sees_anchors: true`), and it is also the only reason `leave_one_out=true` worked in `B10 arm-loo` (archived): the string `"true"` happens to be truthy. After launching any arm, check `best.json → model` and `meta.config.stage`.
 
 | config file | corpus (`data.root`) | notes |
 |---|---|---|
@@ -1956,27 +1956,36 @@ Every tunable lives in a config file, and nothing in `src/` hard-codes a value f
 
 ## 22. Where the evidence stands
 
-Every row links to its experiment in [[Result_tracker]]. All runs are single-seed.
+> [!success] The baseline (2026-09-23): [[B0 mask-valid-seed1]]
+> - **Method:** this document's architecture with `mask_on: valid`, trained on `data/synthetic-mri` from Stage A [[A09 mri-stage-a]].
+> - **Replicate it with:** commit `d14f201`, `configs/synthetic-hard.yaml`, seed 20260915, 30 epochs, `best.pt` at epoch 22.
+> - **Evaluated on val-split subjects:**
+>   - trained classes **0.962** (floor 0.138);
+>   - held-out val **0.724** (floor 0.247): banana 0.82, cross 0.80, hollow_cylinder 0.53;
+>   - held-out test **0.775** (floor 0.162): crescent 0.77, hourglass 0.68, triangular_prism 0.89.
+> - **One seed.** Real MRI has not yet been trained under this method.
+
+Every row links to its experiment in [[Result_tracker]]. Runs marked *archived* were moved to `SpatialVox-MRI/runs_archive_2026-09-23/`. All runs are single-seed.
 
 | claim | verdict | evidence |
 |---|---|---|
-| the mapper agrees with the prompts | **yes** at `tau = 0.5` | gate 0.974 from ground truth, 0.83–0.90 from predicted anchors. A flip moves the centroid off the region 100% of the time ([[D02 mapper gate and tau sweep]]) |
-| the model reads the prompt, not a shortcut | **yes** | `permute_channels` and `permute_clauses` take Dice to exactly 0.0000, and `permute_both` moves it by 0.0009. Dice 0.7943 against a 0.3067 floor ([[B03 relational-seed1]]) |
-| the mask is drawn from the image | **yes** | another subject's MRI into `B`: Dice 0.7922 → 0.4747 while the centroid goes 1.72 → 5.47 mm (the field alone manages 19.2 mm). Removing `B(I)` costs 0.258 ([[B04 prompt-only-seed1]]) |
-| an impossible prompt produces nothing | **yes** | of 382 prompts that name nothing, 5.5% emit any mask |
-| the null head does that work | **no** | it calls 62.6% of them invalid. The carver and its empty-mask loss produce the empty output |
-| the field *locates* the target | **no** | its centre of mass is 20.2 mm from the target's centroid |
-| relational transfer on MRI | **no** | 0.0052 against a 0.1097 floor. The carver emits nothing 75% of the time and draws 93 voxels where 2,219 belong, while the anchors (0.8046) and the gate (0.857) are as good as on the supervised classes |
-| …and the image is part of why | **yes**, unanticipated | the prompt-only carver scores 0.1171 on the held-out four against the full model's 0.0053 (22×), the only MRI arm above that population's floor |
-| a class-agnostic edge prior restores transfer | **no** | pretrained `B`: held-out Δ +0.0012 ± 0.0109 over 14 matched epochs ([[B05 pretrained-b-seed1]]) |
-| Stage A's anchors cap the overfit | **no** | oracle anchors: −0.0072 ± 0.0542 over 33 matched epochs ([[B02 overfit1-oracle]]) |
-| transfer on the easy synthetic corpus | perfect and **meaningless** | 0.98 held out after 3 epochs, threshold IoU ≈ 0.994 ([[B07 synthetic-stage-b]]) |
-| transfer on `synthetic-hard` | above floor, but **inflated** | held-out-2 0.71 against 0.15, but `cuboid`/`ellipsoid` are twins of supervised shapes ([[B08 hard-stage-b]]) |
-| transfer on `synthetic-mri` (family split, MRI-measured appearance) | **above floor, unstable** | at epoch 10 of 30 (the run stopped there): held-out-val 0.368 against 0.247, held-out-test 0.460 against 0.162. The curves swing 0.006–0.448 between epochs ([[B09 mri-stage-b]]) |
-| leave-one-class-out helps transfer | **not yet distinguishable** | running. Matched Δ over epochs 0–10 is inside the replicate noise ([[B10 arm-loo]]) |
-| removing the anchor masks from the carver helps | **untested** | the arm ran with the flag still on ([[B11 arm-noanchor]]) |
+| the mapper agrees with the prompts | **yes** at `tau = 0.5` | gate 0.974 from ground truth, and 0.86–0.87 from predicted anchors in B0's evaluation |
+| the model reads the prompt, not a shortcut | **yes** | B0: `permute_channels` and `permute_clauses` take held-out Dice to 0.008–0.015, `flip_direction` to 0.08–0.11, and `permute_both` leaves it unchanged |
+| the mask is drawn from the image | **yes** | B0: another scene's image drops Dice 0.96 → 0.17 on trained classes and 0.72 → 0.16 on held-out ones |
+| **relational transfer to never-supervised targets** | **yes, on `synthetic-mri`** (one seed) | B0: held-out 0.724 / 0.775, 2.9× and 4.8× the floor, with 0% empty masks. The gain is broad: five of six held-out shapes rose by 0.14–0.51 over the `mask_on: all` model. Held-out Dice rises through training instead of decaying |
+| what unlocked it | **the mask is no longer trained to be empty** | under `mask_on: all` (the archived `B09`), 16–18% of training prompts rewarded silence. The carver learned to reject anything unfamiliar: 25% empty held-out masks on `synthetic-mri`, 75% on MRI ([[B03 relational-seed1]]). The rationale and the matched-epoch test are in `_update_ideas/2026-09-22-null-head-decides-emptiness.md` |
+| an impossible prompt produces nothing | **partly: the price of the baseline** | B0: the carver paints on every impossible prompt. After the null-head gate, 29–32% still get a mask (about 300 voxels). The null head's four scalars cap it; the old `mask_on: all` carver kept that figure at 5.5% on MRI, but only by rejecting real targets too |
+| relational transfer on real MRI | **not yet tested under the baseline method** | the `mask_on: all` reference [[B03 relational-seed1]] reaches 0.005 against a 0.110 floor |
+| the field *locates* the target | **no** | its centre of mass is 20.2 mm from the target's centroid; the heatmap does that job (5 mm held-out in B0) |
+| easy-corpus sanity check | *running* | [[B1 easy-mask-valid-seed1]] |
 
-**Open, in rough order of what they would decide.** Run `carver_sees_anchors: False` properly. Let `synthetic-mri` finish and add seeds, since held-out numbers cannot be read off a single seed with swings this large. Run `field_centroid_on: empty-only`. Run the first `mask_on: valid` model against `mri-stage-b` (shipped 2026-09-22, untrained): 16% of training examples used to be supervised to be empty, which made "when in doubt, say nothing" a free policy on the training distribution. Then the α ablation and `full_resolution_skip: false`. The test split has not been touched.
+**Open, in order.**
+1. A second seed of B0.
+2. The same method on real MRI (`configs/config.yaml`, parent [[B03 relational-seed1]]).
+3. Lowering the impossible-prompt leak without letting the null head see the image.
+4. `carver_sees_anchors: False`, `field_centroid_on: empty-only`, and more target shapes for the weakest class, `hollow_cylinder`.
+
+The test split has not been touched.
 
 ---
 

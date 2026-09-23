@@ -1,13 +1,13 @@
 ---
-id: "B12"
+id: "B0"
 kind: "stage-b"
-status: "done"
+status: "adopted"
 date: "2026-09-23"
 run: "runs/mask-valid-seed1"
-git: "f2067a6 + the uncommitted change set of _update_ideas/2026-09-22-null-head-decides-emptiness.md"
+git: "d14f201"
 corpus: "data/synthetic-mri"
 stage_a: "[[A09 mri-stage-a]]"
-parent: "[[B09 mri-stage-b]]"
+parent:
 change: "train.stage_b.mask_on: valid — the mask term supervises only prompts that name a structure; the null head alone decides emptiness"
 assumption: "If the empty-target supervision is what makes the carver shy, the held-out empty rate falls towards 0 and held-out Dice rises above B09's at matched epochs by more than the replicate noise"
 epochs: "30 / 30"
@@ -23,13 +23,16 @@ benefit: "yes"
 verdict: "The shy painting is gone: held-out empty rate 0% at every epoch. Held-out Dice RISES through training, to 0.727 / 0.774 at best.pt (epoch 22), where B09 reached 0.368 / 0.460. +0.15 / +0.18 at matched epochs 0–10 against 0.09 / 0.07 of noise. Trained classes 0.962. One seed; the impossible-prompt leak and the per-class held-out Dice are not measured yet"
 tags:
   - experiment
+  - baseline
   - stage-b
   - synthetic
   - transfer
 ---
-# B12 mask-valid-seed1
+# B0 mask-valid-seed1 — the Phase B baseline
 
 > [!abstract] Verdict
+> **Adopted as the Phase B baseline on 2026-09-23** (provisional: one seed). The code that trained it is commit `d14f201`. Its run folder is `runs/mask-valid-seed1`. It was compared against `B09 mri-stage-b`, now archived in `SpatialVox-MRI/runs_archive_2026-09-23/`.
+>
 > **`mask_on: valid` removed the shy painting and reversed the transfer curve.**
 > - Held-out masks are never empty; B09's `best.pt` had about 25% empty.
 > - Held-out Dice now rises through training instead of peaking at epoch 0: 0.727 on val and 0.774 on test at `best.pt` (epoch 22), where B09 reached 0.368 and 0.460, and 0.738 / 0.796 at the end.

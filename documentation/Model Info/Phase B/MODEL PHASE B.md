@@ -122,7 +122,7 @@ With probability `train.stage_b.flip_probability` (0.25) one clause is replaced 
 
 Training only. A validation curve mixing retargeted and empty prompts would move `best.pt` for reasons unrelated to the model, and an empty prediction against an empty target scores Dice 1.0.
 
-There is a second source of `keep = 0`. With `train.stage_b.leave_one_out: true`, one supervised class per epoch is withheld from the loss, cycling through `targets.train`. It is off by default and tested as [[B10 arm-loo]]. The flip is applied after the withholding, so a withheld row that a flip empties or retargets is kept with its new target.
+There is a second source of `keep = 0`. With `train.stage_b.leave_one_out: true`, one supervised class per epoch is withheld from the loss, cycling through `targets.train`. It is off by default and tested as `B10 arm-loo` (archived). The flip is applied after the withholding, so a withheld row that a flip empties or retargets is kept with its new target.
 
 ---
 
@@ -292,7 +292,17 @@ Weights are in millimetres summed over three axes for the two offsets, so they a
 
 A bare Dice is not interpretable here. Two numbers must travel with it — the population's **prompt-blind floor** and its **anchor-set shortcut ceiling** — and `scripts/evaluate.py` prints both beside it.
 
-Measured on `data/mri`, 20 epochs, one seed:
+**The baseline is [[B0 mask-valid-seed1]]** (commit `d14f201`, `mask_on: valid`, `data/synthetic-mri`, one seed):
+
+| | trained 10 | held-out val 3 | held-out test 3 |
+| --- | --- | --- | --- |
+| Dice (null-gated) | 0.962 (0.950) | 0.724 (0.714) | 0.775 (0.763) |
+| its floor | 0.138 | 0.247 | 0.162 |
+| emitted an empty mask | 0.0% | 0.0% | 0.0% |
+| another scene's image | 0.962 → 0.174 | 0.723 → 0.161 | 0.777 → 0.156 |
+| impossible prompts that get a mask after the gate | 30.5% | 32.3% | 29.0% |
+
+The older real-MRI reference, trained under `mask_on: all` ([[B03 relational-seed1]]); measured on `data/mri`, 20 epochs, one seed:
 
 | | supervised 8 | held-out 4 |
 | --- | --- | --- |
@@ -313,7 +323,7 @@ Measured on `data/mri`, 20 epochs, one seed:
 
 And the two mandatory §7 tests: swapping in another subject's MRI costs 40% of the Dice (0.7922 → 0.4747) while the centroid holds (1.72 → 5.47 mm); removing `B(I)` entirely costs 0.258.
 
-So the model does the relational task and does it **from the image**. What it does not do is transfer to a class it was never supervised to draw — and the failure is *silence*, not error: the anchors and the field are as good there as anywhere, and the carver simply does not answer. [[Result_tracker]] has the arms that narrow the cause, including the two that went against the hypothesis ([[B04 prompt-only-seed1]], [[B05 pretrained-b-seed1]]), and the synthetic series built to separate the image from the architecture ([[B07 synthetic-stage-b]] → [[B08 hard-stage-b]] → [[B09 mri-stage-b]]): on the MRI-measured, family-split corpus transfer is above its floor but unstable.
+So the model does the relational task and does it **from the image**. What it does not do is transfer to a class it was never supervised to draw — and the failure is *silence*, not error: the anchors and the field are as good there as anywhere, and the carver simply does not answer. [[Result_tracker]] has the arms that narrow the cause, including the two that went against the hypothesis (`B04 prompt-only-seed1` (archived), `B05 pretrained-b-seed1` (archived)), and the synthetic series built to separate the image from the architecture (`B07 synthetic-stage-b` (archived) → `B08 hard-stage-b` (archived) → `B09 mri-stage-b` (archived)): on the MRI-measured, family-split corpus transfer is above its floor but unstable.
 
 > `permute_both` is a **weaker control than it looks**. `where_raw` is a product and therefore exactly permutation-invariant, so the only order dependence left anywhere is the carver's `cat`. A flat control no longer means what it meant under the attention architecture.
 

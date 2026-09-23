@@ -54,7 +54,7 @@ Per class at the best epoch: Brain-Stem 0.918, Thalami 0.893 / 0.893, Putamen 0.
 |---|---|
 | anchor Dice (as consumed by Stage B) | 0.80–0.82 (0.8172 on the selection curve) |
 | centroid error, median / p95 / worst | **0.84 mm** / 2.13 mm / 8.14 mm (the voxel is 1.25 mm) |
-| smallest predicted anchor mass | 3.2e-6 of the volume, which is why `min_mass = 1e-6` (see [[D02 mapper gate and tau sweep]]) |
+| smallest predicted anchor mass | 3.2e-6 of the volume, which is why `min_mass = 1e-6` (see `D02 mapper gate and tau sweep` (archived)) |
 
 ## Reading
-The mapper reads centroids, so anchor *Dice* is the wrong summary. With a sub-voxel median error, `anchor_source: oracle` and `predicted` are currently non-discriminating on MRI ([[B02 overfit1-oracle]]). The error tail is still real: from predicted anchors the gate falls to 0.83 against 0.97 from ground truth. Re-measure with `gate_mapper.py --segmenter` whenever Stage A is retrained.
+The mapper reads centroids, so anchor *Dice* is the wrong summary. With a sub-voxel median error, `anchor_source: oracle` and `predicted` are currently non-discriminating on MRI (`B02 overfit1-oracle` (archived)). The error tail is still real: from predicted anchors the gate falls to 0.83 against 0.97 from ground truth. Re-measure with `gate_mapper.py --segmenter` whenever Stage A is retrained.

@@ -7,7 +7,7 @@ run: "runs/relational-seed1"
 git: "008da30"
 corpus: "data/mri"
 stage_a: "[[A01 phase-a-current]]"
-parent: "[[L01 legacy attention Stage B]]"
+parent: "`L01 legacy attention Stage B` (archived)"
 change: "The relational architecture replaces the attention Stage B: frozen Stage A, detached soft masks, parameter-free mapper, then B(I), carver and null head. B from scratch, predicted anchors from the cache"
 assumption: "The model does the relational task from the image, and transfers to target classes it was never supervised on"
 epochs: "20 / 20"
@@ -94,8 +94,8 @@ Training Dice ends at 0.8385 (a gap of about 0.06), and the selection curve has 
 
 ## Reading
 - **The prompt is read.** Moving the masks against the words, or the words against the masks, gives exactly zero overlap, while moving both moves it by 0.0009. That control is weak by construction ([[SpatialVox#16.1 The four counterfactuals]]).
-- **The image is used.** Swapping the MRI costs 40% of the Dice while the centroid stays close, which is the signature that the words placed the structure and the image drew it. The prompt-only ablation is [[B04 prompt-only-seed1]].
+- **The image is used.** Swapping the MRI costs 40% of the Dice while the centroid stays close, which is the signature that the words placed the structure and the image drew it. The prompt-only ablation is `B04 prompt-only-seed1` (archived).
 - **Transfer fails by silence, not by error.** On held-out classes the anchors (0.8046) and the gate (0.857) are as good as on supervised ones, so nothing upstream failed. The carver has learned a class-conditional size and shape prior and defaults to empty outside it. 16% of its training examples *are* empty (flips that name nothing), so "when in doubt, say nothing" costs nothing on the training distribution.
 - It falls from 0.1375 at epoch 0 to 0.0099 by epoch 3: early on the carver puts a generic blob near the field, and it stops once it specialises.
-- **The localiser is not what fails.** On the held-out four the heatmap's centroid error is 14.6–25.9 mm across epochs (24.9 mm at the end), against **26.8 mm** for the field's own centre of mass on that population ([[D02 mapper gate and tau sweep]]). The model is no worse than the geometry it is given, and that geometry is the ceiling.
+- **The localiser is not what fails.** On the held-out four the heatmap's centroid error is 14.6–25.9 mm across epochs (24.9 mm at the end), against **26.8 mm** for the field's own centre of mass on that population (`D02 mapper gate and tau sweep` (archived)). The model is no worse than the geometry it is given, and that geometry is the ceiling.
 - **Single seed.**

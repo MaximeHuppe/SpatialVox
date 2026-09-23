@@ -55,7 +55,7 @@ flowchart TB
     ANCH --> CEN
     DID --> MAR
 
-    NULL["NullHead - 1,249 params<br/>log10 of where_mass and 3 masses<br/>MLP 4 / 32 / 32 / 1, no pixels"]
+    NULL["NullHead - 1,249 params<br/>log10 of where_mass and 3 masses<br/>MLP 4 / 32 / 32 / 1, no pixels<br/>the ONLY judge of names-nothing: gates the mask"]
     WMS --> NULL
     CEN -->|"mass_i"| NULL
 
@@ -85,7 +85,7 @@ flowchart TB
     PRD --> CAT
     RES --> CAT
 
-    subgraph CV["Carver - 38,498 params"]
+    subgraph CV["Carver - 38,498 params - mask trained on valid prompts only (mask_on: valid)"]
         direction TB
         STEM["stem: ConvBlock 25 to 16, stride 2<br/>[B,16,64³]"]
         BLK["2 x ResBlock 16<br/>[B,16,64³]"]
@@ -130,6 +130,8 @@ flowchart TB
     class ANCH,BI,CAT tensor;
     class LOGITS,CENTROID,VALID out;
 ```
+
+**Baseline:** [[B0 mask-valid-seed1]], commit `d14f201`, on `data/synthetic-mri`. Trained classes 0.962; held-out 0.724 / 0.775 against floors of 0.247 / 0.162; one seed.
 
 **Legend.** Blue boxes are frozen: Stage A never trains here. Purple boxes are parameter-free and carry no gradient: the mapper, the rescaling, the exclusion, the soft-argmax. Orange boxes are the 268,275 trainable parameters: `B(I)`, the carver and the null head. Yellow boxes are tensors that cross a module boundary. Dashed boxes are optional inputs or ablations.
 

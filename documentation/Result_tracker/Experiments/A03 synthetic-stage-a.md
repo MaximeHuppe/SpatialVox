@@ -25,7 +25,7 @@ tags:
 # A03 synthetic-stage-a
 
 > [!abstract] Verdict
-> 0.9976, and meaningless as a test of Stage A: the easy appearance lets a single global intensity threshold recover every structure (threshold IoU ≈ 0.994). It is the Stage A of [[B07 synthetic-stage-b]].
+> 0.9976, and meaningless as a test of Stage A: the easy appearance lets a single global intensity threshold recover every structure (threshold IoU ≈ 0.994). It is the Stage A of `B07 synthetic-stage-b` (archived).
 
 ## Setup
 `scripts/train.py a --config configs/synthetic.yaml`: `data/synthetic`, 400 / 50 / 50 scenes, 10 classes (`cube, cuboid, sphere, ellipsoid, cylinder, cone, pyramid, triangular_prism, torus, capsule`), batch 16, about 9 s per epoch.
@@ -39,4 +39,4 @@ tags:
 Every class ≥ 0.994. Anchor centroid error: median 0.10 / p95 0.28 / worst 2.67 voxels (anchor Dice 0.998).
 
 ## Reading
-This is the easy end of the separability axis. Any transfer result built on it inherits the same triviality ([[B07 synthetic-stage-b]]).
+This is the easy end of the separability axis. Any transfer result built on it inherits the same triviality (`B07 synthetic-stage-b` (archived)).

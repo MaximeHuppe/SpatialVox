@@ -7,7 +7,7 @@ tags:
 - consumes the detached soft masks [[MODEL PHASE A]] produced, and the three `direction_ids`
 - feeds [[Carver]] (the fields and their product) and [[NullHead]] (two scalars)
 - it is the **only** consumer of `direction_ids` anywhere in Stage B
-- documented in [[SpatialVox#9. Step 5 — PositionalMapper3D, the WHERE]]; the tau sweep is [[D02 mapper gate and tau sweep]]
+- documented in [[SpatialVox#9. Step 5 — PositionalMapper3D, the WHERE]]; the tau sweep is `D02 mapper gate and tau sweep` (archived)
 
 > §N in this note is a section of the original proposal; [[SpatialVox#20. Deviations from the original proposal]] maps each one to the document.
 

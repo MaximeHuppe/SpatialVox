@@ -118,7 +118,7 @@ One argument. `tests/test_models.py::test_the_boundary_encoder_sees_the_image_an
 
 ### What it does and does not buy — measured
 
-`B(I)` is the difference between the model reading the image and redrawing a spatial prior. The prompt-only ablation ([[B04 prompt-only-seed1]]) removes it and keeps everything else:
+`B(I)` is the difference between the model reading the image and redrawing a spatial prior. The prompt-only ablation (`B04 prompt-only-seed1` (archived)) removes it and keeps everything else:
 
 | | supervised classes | held-out classes |
 | --- | --- | --- |
@@ -130,4 +130,4 @@ Removing it costs **0.258 Dice** — so the mask is not a shape redrawn from the
 
 **But the two rows cross.** On classes never supervised as a target, removing `B(I)` *improves* transfer 22×. A carver with `B(I)` can learn what each of its supervised classes looks like, so it does, and then has nothing to say about a new one; a carver without it can only put a blob where the field points, so it stays class-agnostic. The image is what makes the supervised number good and the transfer number bad.
 
-Whether that is the image's fault or the corpus's is what the synthetic series measures ([[Result_tracker]]). A single global threshold recovers `labels > 0` at IoU **0.0796** on `data/mri`. On the easy synthetic corpus (IoU ≈ 0.994) transfer is perfect and meaningless, 0.98 ([[B07 synthetic-stage-b]]). On the hard one (0.27) it holds at 0.71 against a 0.15 floor, but the held-out shapes are twins of trained ones ([[B08 hard-stage-b]]). On the MRI-measured, family-split corpus (0.21) it is above floor but unstable, 0.37 / 0.46 against 0.25 / 0.16 ([[B09 mri-stage-b]]). The working hypothesis, that `B(I)` generalises when the image carries a class-agnostic boundary, is not settled yet: every run is single-seed, and a same-config replicate differs by 0.09 on the held-out curves.
+Whether that is the image's fault or the corpus's is what the synthetic series measures ([[Result_tracker]]). A single global threshold recovers `labels > 0` at IoU **0.0796** on `data/mri`. On the easy synthetic corpus (IoU ≈ 0.994) transfer is perfect and meaningless, 0.98 (`B07 synthetic-stage-b` (archived)). On the hard one (0.27) it holds at 0.71 against a 0.15 floor, but the held-out shapes are twins of trained ones (`B08 hard-stage-b` (archived)). On the MRI-measured, family-split corpus (0.21) it is above floor but unstable, 0.37 / 0.46 against 0.25 / 0.16 (`B09 mri-stage-b` (archived)). The working hypothesis, that `B(I)` generalises when the image carries a class-agnostic boundary, is not settled yet: every run is single-seed, and a same-config replicate differs by 0.09 on the held-out curves.

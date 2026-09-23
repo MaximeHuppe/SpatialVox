@@ -10,7 +10,7 @@ tags:
 - [[PosEnc3D]] — `self.pos`; added to the attention *keys*
 - becomes a **frozen submodule** of [[MODEL PHASE B]]
 - documented step by step in [[SpatialVox#8. Step 4 — Stage A, the frozen segmenter]], and drawn open in [[Flowchart]]
-- runs: [[A01 phase-a-current]] (shipped), [[A02 phase-a-new-model]], and the synthetic Stage A runs in [[Result_tracker]]
+- runs: [[A01 phase-a-current]] (shipped), `A02 phase-a-new-model` (archived), and the synthetic Stage A runs in [[Result_tracker]]
 
 A promptable segmenter: an intensity volume and a set of structure names in, **one mask per name** out. Trained beforehand on every name that may be an anchor, then frozen. Nothing in Stage B trains it.
 
@@ -80,7 +80,7 @@ The head bias starts at `log(p/(1−p))` with `p = 0.0016` so an untrained model
 | --- | --- | --- |
 | `data/mri`, 23 structures | **0.8158** | the shipped `runs/phase-a/current` |
 | synthetic, easy appearance | **0.9976** | foreground trivially separable — one threshold gives IoU 0.994 |
-| synthetic, hard appearance | **0.8831** | threshold IoU 0.27; cube and cuboid confuse each other, [[A04 hard-stage-a]] |
+| synthetic, hard appearance | **0.8831** | threshold IoU 0.27; cube and cuboid confuse each other, `A04 hard-stage-a` (archived) |
 | `synthetic-mri`, 16 classes, MRI-measured appearance | **0.9233** | threshold IoU 0.21; the Stage A of the current synthetic series, [[A09 mri-stage-a]] |
 
 ---

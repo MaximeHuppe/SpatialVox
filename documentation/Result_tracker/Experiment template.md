@@ -54,7 +54,7 @@ Fields
   id        A = Stage A, B = Stage B, P = pretraining, D = diagnostic or decision, L = legacy. Zero-pad: B12.
   kind      stage-a | stage-b | pretrain | diagnostic | legacy
   status    done | running | stopped | killed | failed | invalid | adopted | superseded
-  parent    "[[B09 mri-stage-b]]", the run this one is compared to. Empty for a root.
+  parent    "`B09 mri-stage-b` (archived)", the run this one is compared to. Empty for a root.
   stage_a   "[[A09 mri-stage-a]]", the frozen Stage A this run uses (Stage B only).
   score     the `metric` value, a bare number, at the epoch named in delta_on or in the note.
   floor     the prompt-blind floor of that population (Stage B only).
