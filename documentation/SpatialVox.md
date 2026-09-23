@@ -1977,7 +1977,7 @@ Every row links to its experiment in [[Result_tracker]]. Runs marked *archived* 
 | an impossible prompt produces nothing | **partly: the price of the baseline** | B0: the carver paints on every impossible prompt. After the null-head gate, 29–32% still get a mask (about 300 voxels). The null head's four scalars cap it; the old `mask_on: all` carver kept that figure at 5.5% on MRI, but only by rejecting real targets too |
 | relational transfer on real MRI | **not yet tested under the baseline method** | the `mask_on: all` reference [[B03 relational-seed1]] reaches 0.005 against a 0.110 floor |
 | the field *locates* the target | **no** | its centre of mass is 20.2 mm from the target's centroid; the heatmap does that job (5 mm held-out in B0) |
-| easy-corpus sanity check | *running* | [[B1 easy-mask-valid-seed1]] |
+| the method holds on the easy corpus | **yes** (sanity check only) | [[B1 easy-mask-valid-seed1]]: 0.994 / 0.997 / 0.998, 0% empty masks, and a gated leak of 26–29%. The corpus is threshold-separable, so this is not evidence of transfer |
 
 **Open, in order.**
 1. A second seed of B0.

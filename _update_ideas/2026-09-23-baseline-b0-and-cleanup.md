@@ -65,3 +65,13 @@ The user asked for it to become the baseline, for obsolete runs to go, and for t
 - No second seed of B0, as asked.
 - No real-MRI run under the new method; it is named as the next milestone.
 - No change to the code.
+
+## Log
+
+### 2026-09-23 11:11 — B1 (easy-corpus rerun) finished
+
+- **Scores:** 30 epochs, `best.pt` epoch 23. Trained 0.994; held-out val 0.997 and held-out test 0.998. 0% empty masks.
+- **Probes:** they all collapse as they should, and `permute_both` holds.
+- **Image replacement:** another scene's image drops Dice from 0.99 to 0.02.
+- **Leak on impossible prompts:** 26–29% after the null gate.
+- **Reading:** the baseline method does not break the trivial corpus, and its leak matches B0's. The tracker, §22 and slide 15 are updated.

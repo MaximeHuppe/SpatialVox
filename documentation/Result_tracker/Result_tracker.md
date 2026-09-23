@@ -16,7 +16,7 @@ Every experiment gets one note in `Result_tracker/Experiments/`. Its properties 
 >   - after the null-head gate, 29–32% of impossible prompts still get a mask.
 >   Provisional: **one seed**.
 > - **Its Phase A:** [[A09 mri-stage-a]].
-> - **Easy-corpus sanity check:** [[B1 easy-mask-valid-seed1]] (running), on [[A03 synthetic-stage-a]].
+> - **Easy-corpus sanity check:** [[B1 easy-mask-valid-seed1]] passed: 0.994 / 0.997 / 0.998 on the trivial corpus, 0% empty masks, and a gated leak of 26–29% on impossible prompts. Stage A is [[A03 synthetic-stage-a]].
 > - **Real MRI:** the only Phase B reference is still [[B03 relational-seed1]], trained under the old `mask_on: all` (held-out 0.005 against a 0.110 floor), on [[A01 phase-a-current]]. Rerunning it with `mask_on: valid` is the next milestone.
 > - **Archive:** every other run was moved to `SpatialVox-MRI/runs_archive_2026-09-23/` and its note deleted. The numbers they contributed are kept in `_update_ideas/` and in the noise table below.
 
@@ -40,7 +40,7 @@ flowchart LR
         A09["A09 Stage A, synthetic-mri<br/>0.923"]
         B0["<b>B0 BASELINE</b>, mask_on: valid<br/>0.962, held-out 0.72 / 0.78"]
         A03["A03 Stage A, easy<br/>0.998"]
-        B1["B1 easy, mask_on: valid<br/>running"]
+        B1["B1 easy, mask_on: valid<br/>0.994, held-out 0.997 / 0.998"]
     end
     A01 -.-> B03
     A09 -.-> B0
@@ -53,7 +53,7 @@ flowchart LR
     class A01,A03,A09 stageA;
     class B03 stageB;
     class B0 base;
-    class B1 running;
+    class B1 stageB;
 ```
 
 Keep this graph in step with the `parent` properties when you add a note. Obsidian's graph view draws the same edges from the `parent` and `stage_a` links.
