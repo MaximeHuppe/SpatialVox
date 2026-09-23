@@ -75,3 +75,11 @@ The user asked for it to become the baseline, for obsolete runs to go, and for t
 - **Image replacement:** another scene's image drops Dice from 0.99 to 0.02.
 - **Leak on impossible prompts:** 26–29% after the null gate.
 - **Reading:** the baseline method does not break the trivial corpus, and its leak matches B0's. The tracker, §22 and slide 15 are updated.
+
+### 2026-09-23 — B2 launched: the baseline method on real MRI
+
+- **Run:** `runs/mri-mask-valid-seed1`, main PID 246221, detached; wandb `stageb-mri-mask-valid-s1` (https://wandb.ai/imag2/spatial-vox-mri/runs/lg7ecx78).
+- **Setup:** code `32de4e3`, identical to `d14f201`. Config `configs/config.yaml` (`mask_on: valid`), Stage A `runs/phase-a/current/best.pt` from its anchor cache, 30 epochs, warmup 2 set by override, seed 20260915.
+- **Stage A choice:** the 5-stage one, confirmed with the user. It scores 0.816 against 0.802 for the 4-stage alternative, it is the Stage A the parent B03 used, and at 128³ its 8³ bottleneck matches B0's Stage A at 64³.
+- **Parent:** B03 (`mask_on: all`, 20 epochs). Compare at matched epochs 0–19.
+- **Tracker note:** `B2 mri-mask-valid-seed1`, written before the launch with its prediction.
