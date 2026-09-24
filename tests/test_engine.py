@@ -246,6 +246,26 @@ def test_the_mask_term_can_be_restricted_to_prompts_that_name_a_structure(corpus
         StageBTask(model, corpus.vocab, mask_on="sometimes")
 
 
+def test_ignore_labels_zero_the_mask_loss_on_those_voxels(corpus):
+    """``never_supervise_heldout`` plumbing: held-out tissue is not a negative."""
+    model = tiny_stage_b(corpus)
+    batch = batch_from(corpus, n=1)
+    held = corpus.vocab.label(list(corpus.meta["targets"]["val"])[0])
+    task = StageBTask(
+        model, corpus.vocab, spacing=corpus.spacing, loss_weights=LOSS, ignore_labels=(held,),
+    )
+    prediction = task(batch)
+    assert prediction.voxel_weight is not None
+    assert float((prediction.voxel_weight * (batch["labels"] == held).unsqueeze(1)).sum()) == 0.0
+    # Painting on an ignored label must not raise the mask term.
+    task.loss(prediction)
+    quiet = task.components["mask"]
+    prediction.logits = prediction.logits.clone()
+    prediction.logits[(batch["labels"] == held).unsqueeze(1)] = 20.0
+    task.loss(prediction)
+    assert task.components["mask"] == pytest.approx(quiet, abs=1e-5)
+
+
 def test_the_null_gate_empties_exactly_the_prompts_the_null_head_rejects():
     """``valid <= 0`` is "names nothing", the same cut ``null_summary`` scores."""
     probability = torch.full((3, 1, 2, 2, 2), 0.9)

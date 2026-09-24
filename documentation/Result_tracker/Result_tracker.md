@@ -72,7 +72,7 @@ Keep this graph in step with the `parent` properties when you add a note. Obsidi
 | `benefit` | `yes` / `no` / `mixed` / `not yet` (inside the noise) / `n/a` / `invalid` (the change did not apply) |
 | `status` | `done` / `running` / `stopped` / `killed` / `failed` / `invalid` / `adopted` / `superseded` |
 
-**A Dice is not a result by itself.** Before calling a Δ a benefit, check it against the four counterfactuals, the prompt-only and image-replacement tests, and the replicate noise below ([[SpatialVox#16.6 Before a Dice is quoted]]).
+**A Dice is not a result by itself.** Before calling a Δ a benefit, check it against the four counterfactuals, image replacement, and the replicate noise below ([[SpatialVox#16.6 Before a Dice is quoted]]).
 
 ## Floors and ceilings
 

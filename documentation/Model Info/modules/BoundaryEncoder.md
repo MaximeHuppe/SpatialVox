@@ -4,9 +4,9 @@ tags:
 ---
 
 ### Relations
-- `StageB.boundary`, built only when `use_image=True`
+- `StageB.boundary`, always built. There is no prompt-only carver
 - pretrained by [[BoundaryPretrainer]], then given 0.1× the carver's learning rate
-- feeds [[Carver]] twice: as stem input, and again at full resolution through the final 1×1
+- feeds [[Carver]] as keys and values only. It is not a stem channel
 - documented in [[SpatialVox#11. Step 7 — Boundary encoder B(I), the WHAT]]
 
 `B(I)` — the WHAT. Generic boundary features from the MRI, and **nothing else**. `forward` takes one argument and it is the image: no prompt, no name, no direction, no coordinate grid, no label.
@@ -38,7 +38,7 @@ flowchart LR
 | | `up.1` | `ConvBlock(32+16 → 16)` @128³ | 20,736 |
 | **total** | | | **228,528** |
 
-**85% of Stage B's trainable parameters** (228,528 of 268,275) — `B` is the large half, the carver the small one. Small beside the frozen Stage A's 17.0M.
+**87.3% of Stage B's trainable parameters** (228,528 of 261,748) — `B` is the large half, the carver the small one. Small beside the frozen Stage A's 17.0M.
 
 #### No residual block at full resolution — measured
 
@@ -110,7 +110,7 @@ One argument. `tests/test_models.py::test_the_boundary_encoder_sees_the_image_an
 ### Invariants
 
 1. **The image, and only the image.** No prompt, name, direction, coordinate grid or label.
-2. **Full-resolution output.** The carver's skip depends on it.
+2. **Full-resolution output.** `K` and `V` are read at that resolution.
 3. **Trained without class ids.** The label-adjacency map used in pretraining carries no class channel and no target indicator, and is a *pretraining target*, never an inference input.
 4. **Not Stage A's pyramid.** Those features carry named-structure semantics; these must not.
 

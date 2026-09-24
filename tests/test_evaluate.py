@@ -40,9 +40,9 @@ def tiny_model(corpus) -> StageB:
         segmenter, spacing=corpus.spacing, n_anchors=corpus.n_anchors,
         boundary_widths=(4, 8), carver_width=4, carver_blocks=1,
     ).eval()
-    # The mask head is zero-initialised, so nothing can move the logits until it
-    # has a weight; a probe test would otherwise pass vacuously.
-    torch.nn.init.normal_(model.carver.head.weight, std=0.05)
+    # ``coarse`` is zero-initialised, so a geometry probe cannot move the logits
+    # until it has a weight. ``refine`` stays zero: these probes do not touch ``B``.
+    torch.nn.init.normal_(model.carver.coarse.weight, std=0.05)
     return model
 
 

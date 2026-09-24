@@ -39,8 +39,7 @@ def test_the_shipped_config_builds_both_stages(cfg):
         tau=block.mapper.tau, min_mass=block.mapper.min_mass,
         boundary_widths=tuple(block.boundary_widths), carver_width=block.carver.width,
         carver_blocks=block.carver.blocks,
-        full_resolution_skip=block.carver.full_resolution_skip,
-        use_image=block.use_image, additive_prior=block.additive_prior, alpha=block.alpha,
+        additive_prior=block.additive_prior, alpha=block.alpha,
         background_logit=block.background_logit, prior_foreground=block.prior_foreground,
     )
     # The relational half is meant to be small beside the frozen segmenter.
@@ -59,19 +58,48 @@ def test_the_shipped_constants_are_the_measured_ones(cfg):
 def test_every_block_the_code_reads_is_present(cfg):
     for block in ("data", "targets", "mri", "model", "train", "logging", "evaluation"):
         assert block in cfg
-    for key in ("mapper", "boundary_widths", "carver", "use_image", "additive_prior",
+    for key in ("mapper", "boundary_widths", "carver", "carver_sees_anchors", "additive_prior",
                 "alpha", "background_logit", "prior_foreground"):
         assert key in cfg.model.stage_b, key
+    assert cfg.model.stage_b.carver_sees_anchors is False
+    assert cfg.model.stage_b.carver.attention_resolution == 64
+    assert "use_image" not in cfg.model.stage_b
+    assert "full_resolution_skip" not in cfg.model.stage_b.carver
     for key in ("epochs", "optimizer", "scheduler", "phase_a_checkpoint", "anchor_source",
-                "flip_probability", "loss", "far", "field_centroid_on", "mask_on",
+                "flip_probability", "retarget_only_to", "never_supervise_heldout",
+                "loss", "far", "field_centroid_on", "mask_on",
                 "boundary_checkpoint", "boundary_lr_scale"):
         assert key in cfg.train.stage_b, key
+    assert cfg.train.stage_b.retarget_only_to == "train"
+    assert cfg.train.stage_b.never_supervise_heldout is False
+    assert cfg.train.stage_b.field_centroid_on == "empty-only"
     for term in ("dice", "bce", "null_bce", "centroid", "field_centroid", "far"):
         assert term in cfg.train.stage_b.loss, term
     # Anything the architecture no longer has must be gone from the config too.
     for gone in ("occupancy_mode", "mode", "selection_weight"):
         assert gone not in cfg.train.stage_b, gone
     assert "stage_b_selection" not in cfg.model and "stage_b_image" not in cfg.model
+
+
+def test_overrides_parse_false_and_null_as_bools_and_none():
+    """``--set x=false`` must not become the truthy string ``'false'``."""
+    from src.config import require_bool
+
+    parsed = parse_overrides([
+        "model.stage_b.carver_sees_anchors=false",
+        "train.stage_b.never_supervise_heldout=true",
+        "train.stage_b.boundary_checkpoint=null",
+        "model.stage_b.carver.attention_resolution=null",
+    ])
+    assert parsed["model.stage_b.carver_sees_anchors"] is False
+    assert parsed["train.stage_b.never_supervise_heldout"] is True
+    assert parsed["train.stage_b.boundary_checkpoint"] is None
+    assert parsed["model.stage_b.carver.attention_resolution"] is None
+    cfg = load_config(overrides=parsed)
+    assert cfg.model.stage_b.carver_sees_anchors is False
+    assert require_bool(cfg.model.stage_b.carver_sees_anchors, "carver_sees_anchors") is False
+    with pytest.raises(TypeError, match="must be a bool"):
+        require_bool("false", "carver_sees_anchors")
 
 
 def test_overrides_reach_a_nested_leaf():

@@ -180,44 +180,79 @@ def relational_triple_key(row: Mapping[str, Any], vocab: Vocabulary) -> frozense
 def stabilize_relational_manifests(
     manifests: Mapping[str, Sequence[Mapping[str, Any]]],
     vocab: Vocabulary,
+    *,
+    define_on: str = "train",
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
-    """Drop triples that name different targets on different subjects.
+    """Drop triples that name different targets across subjects.
 
     Per-scene uniqueness (``solutions_for`` length 1) is not enough on real MRI:
     the same ``(anchor, direction)`` set can uniquely mean Left-Thalamus on one
     subject and Left-Caudate on another. Training then teaches "this sentence →
     paint a trained class", and held-out eval of the same sentence fails.
 
-    This pass keeps a row only when **every** use of its triple across the whole
-    corpus (all splits) names the **same** target structure. Unstable triples are
-    removed entirely. That guarantees a held-out-target prompt never reuses a
-    triple that supervised a trained target (and the converse).
+    ``define_on`` controls whose labels decide stability:
+
+    * ``"train"`` (default): collect keys from the train split only, and drop
+      unstable rows from **train** only. Val/test rows are kept intact so the
+      stratum where the same words mean a held-out class stays measurable.
+    * ``"all"``: the original global pass over every split (legacy; val/test
+      labels then decide which training rows exist).
 
     Returns ``(filtered_manifests, stats)`` with counts of kept / dropped rows
-    and how many distinct triples were stable vs colliding.
+    and how many distinct triples were stable vs colliding. Stats also report
+    how many non-define rows share a triple with a train target (exposure
+    stratum), without dropping them.
     """
+    if define_on not in ("train", "all"):
+        raise ValueError(f"define_on must be 'train' or 'all', got {define_on!r}")
+
+    if define_on == "all":
+        source_splits = list(manifests)
+    else:
+        if "train" not in manifests:
+            raise ValueError("define_on='train' needs a 'train' split in manifests")
+        source_splits = ["train"]
+
     by_key: dict[frozenset[tuple[str, str]], set[str]] = {}
-    for rows in manifests.values():
-        for row in rows:
+    for split in source_splits:
+        for row in manifests[split]:
             key = relational_triple_key(row, vocab)
             by_key.setdefault(key, set()).add(vocab.name(int(row["target"])))
     stable = {key for key, names in by_key.items() if len(names) == 1}
 
+    # Train-target name per stable key (for the exposure stratum on other splits).
+    train_target_of: dict[frozenset[tuple[str, str]], str] = {}
+    for row in manifests.get("train", ()):
+        key = relational_triple_key(row, vocab)
+        if key in stable and key not in train_target_of:
+            train_target_of[key] = vocab.name(int(row["target"]))
+
     filtered: dict[str, list[dict[str, Any]]] = {split: [] for split in manifests}
-    kept = dropped = 0
+    kept = dropped = exposure = 0
     for split, rows in manifests.items():
         for row in rows:
-            if relational_triple_key(row, vocab) in stable:
+            key = relational_triple_key(row, vocab)
+            if define_on == "all" or split == "train":
+                if key in stable:
+                    filtered[split].append(dict(row))
+                    kept += 1
+                else:
+                    dropped += 1
+            else:
+                # Hold-out splits: keep every row; count exposure to a train target.
                 filtered[split].append(dict(row))
                 kept += 1
-            else:
-                dropped += 1
+                train_name = train_target_of.get(key)
+                if train_name is not None and vocab.name(int(row["target"])) != train_name:
+                    exposure += 1
     stats = {
         "examples_kept": kept,
         "examples_dropped_unstable_triple": dropped,
         "triples_stable": len(stable),
         "triples_colliding": len(by_key) - len(stable),
         "triples_total": len(by_key),
+        "define_on": define_on,
+        "exposure_rows_kept": exposure,
     }
     return filtered, stats
 
@@ -317,7 +352,7 @@ def import_corpus(
     manifests, stab = stabilize_relational_manifests(manifests, vocab)
     meta_extra = {
         **dict(extra or {}),
-        "triple_stability": "global-unique-target",
+        "triple_stability": "train-unique-target",
         "triple_stability_stats": stab,
     }
     return write_corpus(
@@ -581,6 +616,7 @@ class ExampleDataset(Dataset):
         leave_out: Sequence[str] | None = None,
         scenes: Sequence[str] | None = None,
         flip_probability: float = 0.0,
+        retarget_only_to: Sequence[str] | None = None,
         anchor_cache: Path | str | None = None,
         limit: int | None = None,
         sample: int | None = None,
@@ -603,6 +639,13 @@ class ExampleDataset(Dataset):
             records = [records[int(i)] for i in sorted(picked)]
         self.records = records[: limit or None]
         self.flip_probability = float(flip_probability)
+        # When set, a flip that would name a single structure outside this set is
+        # dropped (`keep = 0`) instead of becoming a supervised target. Default
+        # in training is the trained-class list (S), so held-out classes stay
+        # never-supervised-as-target under the flip. ``None`` is unrestricted.
+        self.retarget_only_to = (
+            None if retarget_only_to is None else {str(n) for n in retarget_only_to}
+        )
         # Episodic leave-one-class-out. Each epoch one supervised class is
         # withheld from the loss, so the model is asked, DURING TRAINING, to
         # segment a class it is not being supervised on this epoch.
@@ -644,6 +687,9 @@ class ExampleDataset(Dataset):
         That is the single representation of "the clauses name nothing", and
         ``__getitem__`` derives ``valid`` from it rather than tracking a second
         flag that could disagree with it.
+
+        When :attr:`retarget_only_to` is set, a flip that would name a single
+        structure outside that whitelist is dropped instead of supervised.
         """
         directions = list(record["directions"])
         slot = int(rng.integers(len(directions)))
@@ -657,6 +703,9 @@ class ExampleDataset(Dataset):
         solutions = solutions_for(record["anchors"], directions, centroids, present, center)
         if len(solutions) > 1:
             return record, 0
+        if len(solutions) == 1 and self.retarget_only_to is not None:
+            if vocab.name(int(solutions[0])) not in self.retarget_only_to:
+                return record, 0
         clauses = [
             {"direction": d, "anchor": vocab.name(a)}
             for a, d in zip(record["anchors"], directions)

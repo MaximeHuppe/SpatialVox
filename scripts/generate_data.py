@@ -137,7 +137,7 @@ def main() -> int:
             "source": "synthetic",
             "appearance": appearance,
             "threshold_iou": round(iou, 4),
-            "triple_stability": "global-unique-target",
+            "triple_stability": "train-unique-target",
             "triple_stability_stats": stab,
         },
     )
