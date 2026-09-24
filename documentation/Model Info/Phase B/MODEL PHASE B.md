@@ -48,14 +48,13 @@ flowchart TB
     IMG --> BI["BoundaryEncoder B(I) 🔥<br/>228.5k — **no prompt, no names**"]
     BI --> BF["boundary features [B,16,128³]"]
 
-    BF --> CAT{{"concat → [B,25,128³]<br/>22 if carver_sees_anchors is off"}}
+    CAT["geometry concat [B,8,128³]<br/>5 if carver_sees_anchors is off"]
     ANC -->|"if carver_sees_anchors"| CAT
     FLD --> CAT
-    WHR --> CAT
-    MSS -->|"log, broadcast"| CAT
+    WHR -->|"raw and log"| CAT
 
-    CAT --> CRV["Carver 🔥 38.5k<br/>stride-2 stem → 2×ResBlock(16)"]
-    BF -->|"full-resolution skip"| CRV
+    CAT --> CRV["Carver 🔥 32.0k<br/>geometry stem → geometry_features"]
+    BF -->|"K, V"| CRV
     CRV --> LOG["logits [B,1,128³]"]
     CRV --> HM["heatmap [B,1,64³]"]
 
@@ -149,7 +148,7 @@ The label volume is read **in the task**, to build a training target and to scor
 
 ### 03 / params
 
-`StageB(segmenter, *, spacing, n_anchors=3, tau=0.5, min_mass=1e-6, boundary_widths=(16,32,32), carver_width=16, carver_blocks=2, full_resolution_skip=True, use_image=True, carver_sees_anchors=True, additive_prior=False, alpha=0.35, background_logit=-10.0, prior_foreground=0.0016)`
+`StageB(segmenter, *, spacing, n_anchors=3, tau=0.5, min_mass=1e-6, boundary_widths=(16,32,32), carver_width=16, carver_blocks=2, carver_sees_anchors=True, additive_prior=False, alpha=0.35, background_logit=-10.0, prior_foreground=0.0016)`
 
 | param | source | shipped | note |
 | --- | --- | --- | --- |
@@ -159,9 +158,7 @@ The label volume is read **in the task**, to build a training target and to scor
 | `min_mass` | `…mapper.min_mass` | `1e-6` | ” |
 | `boundary_widths` | `…boundary_widths` | `[16,32,32]` | |
 | `carver_width` / `_blocks` | `…carver.*` | `16` / `2` | |
-| `full_resolution_skip` | `…carver.*` | `True` | an addition, [[SpatialVox#20.4 Architectural additions]] |
-| `carver_sees_anchors` | `…carver_sees_anchors` | `True` | the three anchor masks into the carver; `False` gives 22 channels. Not set in `config.yaml`, so it defaults on |
-| `use_image` | `…use_image` | `True` | `False` is §7's prompt-only ablation |
+| `carver_sees_anchors` | `…carver_sees_anchors` | `True` | the three anchor masks into the stem; `False` gives 5 channels. Not set in `config.yaml`, so it defaults on |
 | `additive_prior`, `alpha` | `…` | `False`, `0.35` | §4's ablation; one scalar, no other input |
 | `background_logit` | `…` | `-10.0` | finite on purpose |
 
@@ -169,10 +166,10 @@ The label volume is read **in the task**, to build a training target and to scor
 | -------------- | ----------- | ------------------- |
 | `segmenter` ❄️ | 17,004,292  | — (frozen)          |
 | `mapper`       | **0**       | —                   |
-| `boundary` 🔥  | 228,528     | 85.2%               |
-| `carver` 🔥    | 38,498      | 14.3%               |
+| `boundary` 🔥  | 228,528     | 87.3%               |
+| `carver` 🔥    | 31,971      | 12.2%               |
 | `null` 🔥      | 1,249       | 0.5%                |
-| **trainable**  | **268,275** | of 17,272,567 total |
+| **trainable**  | **261,748** | of 17,266,040 total |
 
 Every *architectural* parameter lives in `self.config`, because `load_model` rebuilds from the checkpoint dict and never from the YAML. `flip_probability` and the loss weights are training-schedule values and live in the checkpoint's `meta`, mirrored to a `.json` sidecar ([[SpatialVox#20.3 Where the specification was ambiguous]]).
 
@@ -203,14 +200,13 @@ with torch.no_grad():
 
 The mapper has no parameters and its inputs are detached, so nothing here is on the graph. Saying so keeps three full-volume intermediates from being held for a backward that would never read them.
 
-#### 3. Rescale the two quantities that span decades
+#### 3. Rescale `where_raw`
 
 ```python
 log_where = where.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
-log_mass  = (field.where_mass.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)).reshape(-1,1,1,1,1).expand_as(where)
 ```
 
-Both map onto `[-1, 0]`. The other nine channels are probabilities in `[0,1]`, and a raw `where_mass` of 1e-3 is indistinguishable from zero after one convolution.
+That maps onto `[-1, 0]`. `log(where_mass)` is not a stem channel: it is one scalar, and InstanceNorm would erase it. The null head still reads the scalar.
 
 #### 4. The image, read blind
 
@@ -219,22 +215,19 @@ source = image if boundary_image is None else boundary_image
 boundary = self.boundary(source.to(torch.float32))
 ```
 
-`B` knows nothing of steps 1–3.
+`B` knows nothing of steps 1–3. It is always built.
 
-#### 5. Concatenate and carve
+#### 5. Geometry into the stem, boundary as keys and values
 
 ```python
 parts = ([anchors] if self.carver_sees_anchors else []) + [
-    field.fields, where, log_where, log_mass
+    field.fields, where, log_where
 ]
-dtype = boundary.dtype if boundary is not None else torch.float32
-logits, heatmap = self.carver(
-    torch.cat(([boundary] if boundary is not None else []) + [p.to(dtype) for p in parts], dim=1),
-    boundary,
-)
+geometry = torch.cat([part.to(dtype=boundary.dtype) for part in parts], dim=1)
+logits, heatmap = self.carver(geometry, boundary)
 ```
 
-Cast to the boundary features' dtype: under autocast they come back in low precision while the geometry is float32, and matching them is what keeps a 25-channel 128³ tensor off the float32 path.
+The stem concat is cast to the boundary features' dtype under autocast. `boundary` is not one of its channels. Inside the carver, `logits = upsample(coarse) + refine(retrieved)`.
 
 #### 6. Anchors become background
 

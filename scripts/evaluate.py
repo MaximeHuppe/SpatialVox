@@ -34,11 +34,8 @@ result."* Six blocks come out, and the Dice is only the third.
 6. **The image-replacement test** (§7, mandatory). The anchors and every field
    stay this subject's; the volume ``B`` reads is another subject's. The centroid
    should hold and the Dice should fall. That pattern is the signature that the
-   words placed the structure and the image drew it.
-
-The other mandatory test, the prompt-only carver, is a *training* run:
-``scripts/train.py b --prompt-only``. If its Dice approaches the full model's,
-the carver is redrawing a shape from the spatial prior.
+   words placed the structure and the image drew it. ``B`` is required: there is
+   no prompt-only carver.
 """
 
 from __future__ import annotations
@@ -371,7 +368,7 @@ def main() -> int:
         loader(dataset, batch_size=max(cfg.train.batch_size, 2), shuffle=True,
                workers=cfg.train.workers, seed=int(cfg.train.seed)),
         device,
-    ) if model.use_image else {}
+    )
     if swap:
         print(f"\n  image replacement, {swap['n']} pairs of different subjects"
               f" ({swap['same_subject_pairs_skipped']} same-subject pairs skipped)")
@@ -383,7 +380,6 @@ def main() -> int:
         "checkpoint": str(args.checkpoint),
         "anchor_source": task.anchor_source,
         "anchor_cache": str(anchors) if anchors else None,
-        "use_image": bool(model.use_image),
         "split": args.split,
         "classes": classes,
         "metrics": summary,

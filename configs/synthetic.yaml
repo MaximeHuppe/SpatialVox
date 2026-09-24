@@ -57,8 +57,6 @@ model:
     carver:
       width: 16
       blocks: 2
-      full_resolution_skip: true
-    use_image: true
     additive_prior: false
     alpha: 0.35
     background_logit: -10.0

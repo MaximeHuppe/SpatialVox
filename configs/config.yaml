@@ -111,13 +111,7 @@ model:
     boundary_widths: [16, 32, 32]   # B(I): three stages at 128/64/32 and back. Image only.
     carver:
       width: 16                   # "two 16-channel blocks, stride-2 stem"
-      blocks: 2
-      full_resolution_skip: true  # let the final 1x1 see B(I) at 128^3. Off = the literal
-                                  # reading of §4, where the stride-2 stem is the only path
-                                  # and the mask is a trilinear upsample of a 64^3 map.
-    use_image: true               # the method. false is the §7 prompt-only carver - B(I) removed,
-                                  # anchors and fields kept - which `scripts/train.py b
-                                  # --prompt-only` sets for that ablation.
+      blocks: 2                   # stem is geometry only; B(I) is channel attention, not a concat
     additive_prior: false         # the ablation `logits = residual + alpha * logit(where_raw)`
     alpha: 0.35                   # its one scalar, with no other input
     background_logit: -10.0       # what "logits = background where A_i > 0.5" writes. Finite,

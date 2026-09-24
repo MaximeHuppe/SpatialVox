@@ -73,25 +73,25 @@
                 <mxCell id="U1" value="upsample, concat skip&lt;br&gt;ConvBlock 48→16 at 128³" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="BE" vertex="1">
                     <mxGeometry x="20" y="450" width="360" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="CV" value="Carver (38,498 params) · mask trained on valid prompts only (mask_on: valid)" style="swimlane;whiteSpace=wrap;html=1;rounded=1;arcSize=2;startSize=32;fontStyle=1;fontSize=14;fontFamily=Helvetica;fontColor=#1A1A1A;container=1;collapsible=0;swimlaneFillColor=#FEF7F5;fillColor=#FEF7F5;strokeColor=#E64A19;" parent="1" vertex="1">
+                <mxCell id="CV" value="Carver (31,971 params) · mask trained on valid prompts only (mask_on: valid)" style="swimlane;whiteSpace=wrap;html=1;rounded=1;arcSize=2;startSize=32;fontStyle=1;fontSize=14;fontFamily=Helvetica;fontColor=#1A1A1A;container=1;collapsible=0;swimlaneFillColor=#FEF7F5;fillColor=#FEF7F5;strokeColor=#E64A19;" parent="1" vertex="1">
                     <mxGeometry x="1080" y="1270" width="860" height="340" as="geometry"/>
                 </mxCell>
-                <mxCell id="STEM" value="&lt;b&gt;stem&lt;/b&gt;: ConvBlock 25→16, stride 2&lt;br&gt;[B,16,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="STEM" value="&lt;b&gt;stem&lt;/b&gt;: ConvBlock 8→16, stride 2&lt;br&gt;[B,16,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="20" y="50" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="BLK" value="&lt;b&gt;2 × ResBlock&lt;/b&gt;(16)&lt;br&gt;[B,16,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="BLK" value="&lt;b&gt;2 × ResBlock&lt;/b&gt;(16)&lt;br&gt;geometry_features [B,16,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="20" y="150" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="HM" value="&lt;b&gt;heatmap&lt;/b&gt;: a separate 1×1 conv&lt;br&gt;[B,1,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="HM" value="&lt;b&gt;heatmap&lt;/b&gt;: a separate 1×1 on geometry_features&lt;br&gt;does not read B(I), [B,1,64³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="20" y="250" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="UP" value="head, feature half: 1×1 at 64³&lt;br&gt;then trilinear upsample of ONE channel, [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="UP" value="coarse: 1×1 at 64³, zero weight&lt;br&gt;bias = logit(0.0016), then one upsampled channel, [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="450" y="50" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="SKIP" value="plus head, B(I) half: 1×1 on B(I)&lt;br&gt;full_resolution_skip, [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="SKIP" value="channel attention at 128³&lt;br&gt;Q from geometry_features; K, V from B(I)&lt;br&gt;refine 1×1, weight and bias 0" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="450" y="150" width="390" height="70" as="geometry"/>
                 </mxCell>
-                <mxCell id="HEAD" value="&lt;b&gt;logits&lt;/b&gt;: the one 1×1 head, in two exact halves&lt;br&gt;zero weight, bias = logit(0.0016), [B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
+                <mxCell id="HEAD" value="&lt;b&gt;logits&lt;/b&gt; = upsampled coarse + refine&lt;br&gt;[B,1,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="CV" vertex="1">
                     <mxGeometry x="450" y="250" width="390" height="70" as="geometry"/>
                 </mxCell>
                 <mxCell id="title" value="&lt;font style=&quot;&quot;&gt;&lt;font style=&quot;font-size: 24px;&quot;&gt;&lt;b style=&quot;&quot;&gt;SpatialVox: one relational forward, StageB.forward(image, direction_ids, name_ids), with the frozen Stage A drawn open&lt;/b&gt;&lt;br&gt;&lt;/font&gt;&lt;span style=&quot;font-size: 18px;&quot;&gt;Shapes for the MRI corpus: 128³ at 1.25 mm, 23 structures, batch size B. The note beside it: documentation/SpatialVox.md&lt;/span&gt;&lt;/font&gt;" style="text;html=1;strokeColor=default;fillColor=none;align=left;verticalAlign=middle;fontFamily=Helvetica;fontSize=15;fontColor=#1A1A1A;whiteSpace=wrap;strokeWidth=3;spacingLeft=17;" parent="1" vertex="1">
@@ -121,10 +121,10 @@
                 <mxCell id="BI" value="&lt;b&gt;B(I)&lt;/b&gt; [B,16,128³]" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FFFDE7;strokeColor=#F9A825;fontColor=#1A1A1A;" parent="1" vertex="1">
                     <mxGeometry x="1540" y="890" width="400" height="60" as="geometry"/>
                 </mxCell>
-                <mxCell id="RES" value="&lt;b&gt;geometry channels&lt;/b&gt; (6): F_0..2, where_raw,&lt;br&gt;log where_raw and log where_mass, each clamped&lt;br&gt;at 1e-9 and divided by 20.7, onto −1..0" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#F3E5F5;strokeColor=#7B1FA2;fontColor=#1A1A1A;" parent="1" vertex="1">
+                <mxCell id="RES" value="&lt;b&gt;log where_raw&lt;/b&gt;, clamped at 1e-9&lt;br&gt;and divided by 20.7, onto −1..0&lt;br&gt;log where_mass is not a stem channel" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#F3E5F5;strokeColor=#7B1FA2;fontColor=#1A1A1A;" parent="1" vertex="1">
                     <mxGeometry x="1080" y="800" width="420" height="90" as="geometry"/>
                 </mxCell>
-                <mxCell id="CAT" value="&lt;b&gt;concat&lt;/b&gt; [B,25,128³]&lt;br&gt;B(I) 16 + A 3 + F 3 + where_raw 1 + log where 1 + log mass 1&lt;br&gt;22 channels if carver_sees_anchors is off, 9 in the prompt-only ablation" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FFFDE7;strokeColor=#F9A825;fontColor=#1A1A1A;" parent="1" vertex="1">
+                <mxCell id="CAT" value="&lt;b&gt;concat&lt;/b&gt; [B,8,128³]&lt;br&gt;A 3 + F 3 + where_raw 1 + log where 1&lt;br&gt;5 channels if carver_sees_anchors is off" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FFFDE7;strokeColor=#F9A825;fontColor=#1A1A1A;" parent="1" vertex="1">
                     <mxGeometry x="1080" y="1140" width="860" height="90" as="geometry"/>
                 </mxCell>
                 <mxCell id="SAM" value="&lt;b&gt;soft_argmax&lt;/b&gt;&lt;br&gt;expectation under a softmax over 64³ cells" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#F3E5F5;strokeColor=#7B1FA2;fontColor=#1A1A1A;" parent="1" vertex="1">
@@ -151,7 +151,7 @@
                 <mxCell id="LEG_FREE" value="no parameters, no gradient" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#F3E5F5;strokeColor=#7B1FA2;fontColor=#1A1A1A;" parent="1" vertex="1">
                     <mxGeometry x="60" y="1120" width="330" height="40" as="geometry"/>
                 </mxCell>
-                <mxCell id="LEG_TR" value="trained: 268,275 parameters" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="1" vertex="1">
+                <mxCell id="LEG_TR" value="trained: 261,748 parameters" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FBE9E7;strokeColor=#E64A19;fontColor=#1A1A1A;" parent="1" vertex="1">
                     <mxGeometry x="60" y="1180" width="330" height="40" as="geometry"/>
                 </mxCell>
                 <mxCell id="LEG_T" value="tensor crossing a module boundary" style="rounded=1;whiteSpace=wrap;html=1;fontFamily=Helvetica;fontSize=13;arcSize=8;spacing=6;fillColor=#FFFDE7;strokeColor=#F9A825;fontColor=#1A1A1A;" parent="1" vertex="1">
@@ -314,13 +314,10 @@
                 <mxCell id="e_u1_bi" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1.0;exitDx=0;exitDy=0;entryX=0.5;entryY=0.0;entryDx=0;entryDy=0;" parent="1" source="U1" target="BI" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
                 </mxCell>
-                <mxCell id="e_map_res" value="F_i, where_raw, where_mass" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1.0;exitDx=0;exitDy=0;entryX=0.5;entryY=0.0;entryDx=0;entryDy=0;" parent="1" source="MAP" target="RES" edge="1">
+                <mxCell id="e_map_res" value="F_i, where_raw" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1.0;exitDx=0;exitDy=0;entryX=0.5;entryY=0.0;entryDx=0;entryDy=0;" parent="1" source="MAP" target="RES" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
                 </mxCell>
                 <mxCell id="e_res_cat" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=0.1;exitY=1.0;exitDx=0;exitDy=0;entryX=0.0488;entryY=0.0;entryDx=0;entryDy=0;" parent="1" source="RES" target="CAT" edge="1">
-                    <mxGeometry relative="1" as="geometry"/>
-                </mxCell>
-                <mxCell id="e_bi_cat" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1.0;exitDx=0;exitDy=0;entryX=0.7674;entryY=0.0;entryDx=0;entryDy=0;" parent="1" source="BI" target="CAT" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
                 </mxCell>
                 <mxCell id="e_anch_cat" value="if carver_sees_anchors" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=0.75;exitY=1.0;exitDx=0;exitDy=0;" parent="1" source="ANCH" edge="1">
@@ -356,7 +353,7 @@
                 <mxCell id="e_skip_head" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=0.5;exitY=1.0;exitDx=0;exitDy=0;entryX=0.5;entryY=0.0;entryDx=0;entryDy=0;" parent="1" source="SKIP" target="HEAD" edge="1">
                     <mxGeometry relative="1" as="geometry"/>
                 </mxCell>
-                <mxCell id="e_bi_skip" value="full-resolution skip" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=1.0;exitY=0.5;exitDx=0;exitDy=0;entryX=1.0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="BI" target="SKIP" edge="1">
+                <mxCell id="e_bi_skip" value="K, V" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;endArrow=block;endFill=1;strokeWidth=1.5;strokeColor=#37474F;fontSize=12;fontColor=#37474F;labelBackgroundColor=#FFFFFF;exitX=1.0;exitY=0.5;exitDx=0;exitDy=0;entryX=1.0;entryY=0.5;entryDx=0;entryDy=0;" parent="1" source="BI" target="SKIP" edge="1">
                     <mxGeometry relative="1" as="geometry">
                         <Array as="points">
                             <mxPoint x="2030" y="920"/>

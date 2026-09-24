@@ -5,7 +5,6 @@
     scripts/train.py boundary           # pretrain B(I) with no class ids
     scripts/train.py b                  # the relational model
     scripts/train.py b --segmenter runs/phase-a/current/best.pt
-    scripts/train.py b --prompt-only    # the §7 ablation: B(I) removed
     scripts/train.py b --overfit 1 --set train.stage_b.epochs=200
 
 The order is the pipeline's: ``a`` is trained on every name that may be an
@@ -96,7 +95,7 @@ def boundary(cfg, corpus: Corpus, overfit: int | None):
 
 
 def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
-            prompt_only: bool, anchors: Path | None):
+            anchors: Path | None):
     stage_cfg, model_cfg = cfg.train.stage_b, cfg.model.stage_b
     scenes = {split: corpus.scene_ids(split)[:overfit] if overfit else None for split in ("train", "val")}
     val_examples = cfg.train.get("val_examples")
@@ -154,8 +153,6 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         boundary_widths=tuple(model_cfg.boundary_widths),
         carver_width=int(model_cfg.carver.width),
         carver_blocks=int(model_cfg.carver.blocks),
-        full_resolution_skip=bool(model_cfg.carver.full_resolution_skip),
-        use_image=bool(model_cfg.use_image) and not prompt_only,
         carver_sees_anchors=bool(model_cfg.get("carver_sees_anchors", True)),
         additive_prior=bool(model_cfg.additive_prior),
         alpha=float(model_cfg.alpha),
@@ -163,7 +160,7 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         prior_foreground=float(model_cfg.prior_foreground),
     )
     checkpoint = stage_cfg.get("boundary_checkpoint")
-    if checkpoint not in (None, "", "null") and model.boundary is not None:
+    if checkpoint not in (None, "", "null"):
         pretrained = load_model(checkpoint)
         model.boundary.load_state_dict(pretrained.encoder.state_dict())
         model.boundary_lr_scale = float(stage_cfg.boundary_lr_scale)
@@ -185,7 +182,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", choices=["a", "boundary", "b"])
     parser.add_argument("--segmenter", type=Path, help="Stage A checkpoint (overrides train.stage_b.phase_a_checkpoint)")
-    parser.add_argument("--prompt-only", action="store_true", help="the §7 ablation: remove B(I)")
     parser.add_argument("--overfit", type=int, metavar="N", help="train on the first N scenes only")
     parser.add_argument("--out", type=Path, help="run directory (default runs/<stage>)")
     parser.add_argument("--config", type=Path, help="config file (default configs/config.yaml)")
@@ -194,8 +190,6 @@ def main() -> int:
 
     if args.segmenter is not None and args.stage != "b":
         parser.error("--segmenter only applies to stage b")
-    if args.prompt_only and args.stage != "b":
-        parser.error("--prompt-only only applies to stage b")
 
     cfg = load_config(args.config, overrides=parse_overrides(args.overrides))
     corpus = Corpus.load(cfg.data.root)
@@ -218,10 +212,9 @@ def main() -> int:
             f"anchor masks: {anchors or 'live from ' + str(path)}"
             + ("" if anchors else "  (run scripts/cache_anchors.py for a ~20% faster step)")
         )
-        datasets, task, extra = stage_b(cfg, corpus, args.overfit, segmenter, args.prompt_only, anchors)
+        datasets, task, extra = stage_b(cfg, corpus, args.overfit, segmenter, anchors)
 
-    suffix = "-prompt-only" if args.prompt_only else ""
-    out_dir = args.out or Path("runs") / f"{stage_key}{suffix}"
+    out_dir = args.out or Path("runs") / stage_key
     train_cfg = {
         key: value for key, value in cfg.train.to_dict().items()
         if key not in ("stage_a", "stage_b", "boundary")
@@ -262,8 +255,8 @@ def main() -> int:
           + "".join(f" | {name} {len(d)}" for name, d in extra.items())
           + f" -> {out_dir}")
     if args.stage == "b":
-        print(f"anchors: {task.anchor_source} | B(I): {'off (prompt-only)' if not task.model.use_image else 'on'}"
-              f" | tau {task.model.mapper.tau} | flip {stage_cfg.flip_probability}")
+        print(f"anchors: {task.anchor_source} | tau {task.model.mapper.tau}"
+              f" | flip {stage_cfg.flip_probability}")
         print("selecting best.pt on val-split subjects with TRAINED classes;"
               " the two held-out class curves are reported, never selected on")
     trainer.fit()

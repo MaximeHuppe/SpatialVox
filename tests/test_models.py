@@ -16,7 +16,7 @@ import torch
 from src.engine import load_model, save_checkpoint
 from src.models import (
     BoundaryEncoder, BoundaryPretrainer, Carver, NullHead, StageA, StageB,
-    bottleneck_for, grid_world_axes, prior_bias, soft_argmax,
+    bottleneck_for, channel_attention, grid_world_axes, prior_bias, soft_argmax,
 )
 
 RESOLUTION = 16
@@ -95,15 +95,48 @@ def test_names_reach_stage_a_and_stop_there(model):
     assert torch.equal(first.valid, second.valid)
 
 
-def test_the_carver_takes_exactly_the_ten_declared_channels(model):
-    """§4: ``B(I)``, three masks, three fields, ``where_raw``, its log, the mass.
+def test_the_stem_reads_eight_geometry_channels_and_not_the_boundary(model):
+    """The stem is anchors, fields, ``where_raw``, and ``log(where)``. Not ``B(I)``.
 
-    Counted off the first convolution's weight, so an added coordinate grid or a
-    smuggled extra map changes the number and fails here.
+    Counted off the first convolution, and checked by swapping the volume ``B``
+    reads: that tensor must be bit-identical. A coordinate grid or a concatenated
+    boundary would change the count or the values.
     """
-    expected = model.boundary.out_channels + 2 * model.n_anchors + 3
-    assert model.carver.stem[0].in_channels == expected
-    assert expected == 4 + 3 + 3 + 1 + 1 + 1  # B(I), A_i, F_i, where, log(where), mass
+    assert model.carver.stem[0].in_channels == 8
+    assert model.carver.stem[0].in_channels == 2 * model.n_anchors + 2
+    assert model.boundary.out_channels not in (model.carver.stem[0].in_channels,)
+    seen = {}
+
+    def capture(_module, inputs):
+        seen["geometry"] = inputs[0].detach().clone()
+
+    handle = model.carver.stem.register_forward_pre_hook(capture)
+    image, directions, names = inputs()
+    anchors = soft_anchors()
+    try:
+        with torch.no_grad():
+            first_out = model(image, directions, names, anchors=anchors)
+            first = seen["geometry"]
+            second_out = model(
+                image, directions, names, anchors=anchors, boundary_image=torch.randn_like(image),
+            )
+            second = seen["geometry"]
+    finally:
+        handle.remove()
+    assert first.shape[1] == 8
+    assert torch.equal(first, second)
+    # refine is still zero, so the mask itself does not move either.
+    assert torch.equal(first_out.logits, second_out.logits)
+
+
+def test_without_anchors_the_stem_has_five_channels():
+    """``carver_sees_anchors`` false: fields + ``where`` + ``log(where)`` = 5."""
+    bare = StageB(
+        SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4,
+        carver_sees_anchors=False,
+    )
+    assert bare.carver.stem[0].in_channels == bare.n_anchors + 2
+    assert bare.carver.stem[0].in_channels == 5
 
 
 def test_no_module_in_stage_b_builds_a_coordinate_grid(model):
@@ -175,15 +208,15 @@ def test_replacing_the_image_moves_the_mask_and_not_the_field(model):
     image, directions, names = inputs()
     anchors = soft_anchors()
     other = torch.randn_like(image)
-    # The mask head is zero-initialised (it starts at the foreground prior), so
-    # at init no input can move the logits at all. Give it a weight first: the
-    # claim under test is the architecture's dependency structure.
-    torch.nn.init.normal_(model.carver.head.weight, std=0.1)
+    # ``refine`` is zero at init, so ``boundary`` cannot move the logits until it
+    # has a weight. The claim under test is the dependency once that path is open.
+    torch.nn.init.normal_(model.carver.refine.weight, std=0.1)
     with torch.no_grad():
         base = model(image, directions, names, anchors=anchors)
         swapped = model(image, directions, names, anchors=anchors, boundary_image=other)
     assert torch.equal(base.where_raw, swapped.where_raw)
     assert torch.equal(base.valid, swapped.valid)
+    assert torch.equal(base.centroid, swapped.centroid)
     assert not torch.equal(base.logits, swapped.logits)
 
 
@@ -202,18 +235,6 @@ def test_anchor_voxels_above_a_half_are_written_to_background(model):
     assert not torch.allclose(out.logits[~inside], torch.full_like(out.logits[~inside], -10.0))
 
 
-def test_the_prompt_only_carver_builds_without_b():
-    """§7: "``B(I)`` is removed. Anchors and ``where_raw`` stay"."""
-    model = StageB(SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4,
-                   use_image=False).eval()
-    assert model.boundary is None
-    assert model.carver.stem[0].in_channels == 2 * model.n_anchors + 3
-    image, directions, names = inputs()
-    with torch.no_grad():
-        out = model(image, directions, names)
-    assert out.logits.shape == (2, 1, *(RESOLUTION,) * 3)
-
-
 def test_the_additive_prior_is_one_scalar_with_no_other_input():
     """§4: "``alpha`` is a single scalar... It cannot depend on the MRI, a class, or a name"."""
     off = StageB(SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4)
@@ -226,37 +247,76 @@ def test_the_additive_prior_is_one_scalar_with_no_other_input():
     )
 
 
-@pytest.mark.parametrize("skip", [True, False])
-def test_the_split_mask_head_is_exactly_the_1x1_on_the_upsampled_concatenation(skip):
-    """The efficient head is the same function as the literal one, to rounding.
-
-    ``head(cat[up(f), B]) = up(W_f f + b) + W_B B`` because a 1x1 convolution and
-    a trilinear upsample are both linear and the upsample's weights sum to one.
-    Checked in float64 with a non-zero head, since the shipped head starts at zero
-    and would make the comparison vacuous.
-    """
+def test_a_zero_refine_matches_the_upsampled_coarse_and_ignores_boundary():
+    """At init ``refine`` is zero, so logits are the geometry mask alone."""
     torch.manual_seed(0)
-    boundary_channels = 4 if skip else 0
-    carver = Carver(boundary_channels + 9, boundary_channels, width=4, blocks=1,
-                    full_resolution_skip=skip).double().eval()
-    torch.nn.init.normal_(carver.head.weight, std=0.5)
-    torch.nn.init.normal_(carver.head.bias, std=0.5)
-    x = torch.randn(2, boundary_channels + 9, 10, 12, 14, dtype=torch.float64)
-    boundary = x[:, :boundary_channels] if skip else None
+    carver = Carver(8, 4, width=4, blocks=1, prior_foreground=0.01).double().eval()
+    assert torch.count_nonzero(carver.refine.weight) == 0
+    assert torch.count_nonzero(carver.refine.bias) == 0
+    assert torch.count_nonzero(carver.query.weight) > 0
+    assert torch.count_nonzero(carver.key.weight) > 0
+    assert torch.count_nonzero(carver.value.weight) > 0
+    geometry = torch.randn(2, 8, 8, 8, 8, dtype=torch.float64)
+    boundary = torch.randn(2, 4, 8, 8, 8, dtype=torch.float64)
     with torch.no_grad():
-        logits, heatmap = carver(x, boundary)
-        features = carver.blocks(carver.stem(x))
-        full = torch.nn.functional.interpolate(features, size=x.shape[2:], mode="trilinear",
-                                               align_corners=True)
-        reference = carver.head(torch.cat([full, boundary], dim=1) if skip else full)
-    assert logits.shape == (2, 1, 10, 12, 14)
-    assert torch.allclose(logits, reference, atol=1e-10)
+        logits, heatmap = carver(geometry, boundary)
+        other, heatmap_other = carver(geometry, torch.randn_like(boundary))
+        features = carver.blocks(carver.stem(geometry))
+        coarse = torch.nn.functional.interpolate(
+            carver.coarse(features), size=geometry.shape[2:], mode="trilinear", align_corners=True,
+        )
+    assert torch.equal(logits, coarse)
+    assert torch.equal(logits, other)
+    assert torch.equal(heatmap, heatmap_other)
     assert torch.equal(heatmap, carver.heatmap(features))
+
+
+def test_a_nonzero_refine_lets_boundary_move_the_logits_but_not_the_heatmap():
+    """``refine`` is the only path from ``boundary`` onto the mask."""
+    torch.manual_seed(0)
+    carver = Carver(8, 4, width=4, blocks=1).double().eval()
+    torch.nn.init.normal_(carver.refine.weight, std=0.5)
+    geometry = torch.randn(2, 8, 8, 8, 8, dtype=torch.float64)
+    first = torch.randn(2, 4, 8, 8, 8, dtype=torch.float64)
+    second = torch.randn_like(first)
+    with torch.no_grad():
+        logits_a, heat_a = carver(geometry, first)
+        logits_b, heat_b = carver(geometry, second)
+    assert not torch.equal(logits_a, logits_b)
+    assert torch.equal(heat_a, heat_b)
+
+
+def test_chunked_channel_attention_matches_a_per_voxel_implementation():
+    """The chunked outer product is the same sum as one voxel at a time."""
+    torch.manual_seed(0)
+    query = torch.randn(2, 3, 2, 2, 2, dtype=torch.float64)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+
+    def per_voxel(q, k, v):
+        batch, channels, depth, height, width = q.shape
+        scale = channels ** 0.5
+        out = torch.empty_like(q)
+        for b in range(batch):
+            for z in range(depth):
+                for y in range(height):
+                    for x in range(width):
+                        score = q[b, :, z, y, x][:, None] * k[b, :, z, y, x][None, :] / scale
+                        alpha = torch.softmax(score, dim=-1)
+                        out[b, :, z, y, x] = alpha @ v[b, :, z, y, x]
+        return out
+
+    chunked = channel_attention(query, key, value, chunk=3)
+    assert torch.allclose(chunked, per_voxel(query, key, value), atol=1e-12)
+    query = query.detach().requires_grad_(True)
+    channel_attention(query, key, value, chunk=3).sum().backward()
+    assert query.grad is not None and torch.count_nonzero(query.grad) > 0
 
 
 def test_the_heatmap_is_a_separate_head_not_a_reading_of_the_mask(model):
     """§4: "a separate 1x1, soft-argmax -> centroid"; §5: not trained through the mask."""
-    assert model.carver.heatmap is not model.carver.head
+    assert model.carver.heatmap is not model.carver.coarse
+    assert model.carver.heatmap is not model.carver.refine
     image, directions, names = inputs()
     with torch.no_grad():
         out = model(image, directions, names)
@@ -280,8 +340,10 @@ def test_soft_argmax_is_an_expectation_in_world_units():
 def test_the_config_carries_every_architectural_constant(model):
     """§8: ``mapper.tau``, ``mapper.min_mass``, ``alpha``, and the width of ``B``."""
     for key in ("tau", "min_mass", "alpha", "boundary_widths", "carver_width",
-                "full_resolution_skip", "use_image", "additive_prior", "spacing"):
+                "carver_sees_anchors", "additive_prior", "spacing"):
         assert key in model.config, key
+    assert "full_resolution_skip" not in model.config
+    assert "use_image" not in model.config
     assert model.config["segmenter"] == SEGMENTER
 
 

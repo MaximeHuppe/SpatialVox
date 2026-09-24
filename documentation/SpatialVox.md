@@ -10,7 +10,7 @@ aliases:
 The one document for this project: what the model is for, why it is built this way, and what happens to the data at each step from an HCP scan to a reported number. It describes the code at commit `f11b02f` (branch `dev-SpatialVox-V1`, 2026-09-22). Companion notes sit beside it: [[Flowchart]] (the model on one page, with an editable `Flowchart.drawio`), [[Result_tracker]] (every experiment, its parent and what it changed), and `Model Info/`, one note per module ([[MODEL PHASE A]], [[MODEL PHASE B]], and a note for each block below). `CLAUDE.md` at the repository root is the short list of constraints; this note explains them.
 
 > [!summary] 0. Overview
-> SpatialVox segments a brain structure that the prompt never names. The prompt is three clauses, each a direction and a named anchor, for example *"superior to the Left-Thalamus, medial to the Right-Putamen, and anterior to the Brain-Stem"*, and only their conjunction picks out one structure. A frozen promptable segmenter (**Stage A**) turns the three anchor names into three soft masks, and the names go no further than that. A parameter-free mapper turns those masks and the three direction words into three 45° pyramid fields and their product, `where_raw`. A boundary encoder `B(I)` reads the MRI without seeing the prompt. A small **carver** combines `B(I)` with the geometry to produce the target mask and a centroid, and a null head that reads four scalars says whether the clauses name anything. The mask is painted from the image rather than picked from Stage A's proposals, so in principle the target does not have to be a structure Stage A can draw. That is the lesion claim, and the evaluation machinery (prompt-blind floors, counterfactuals, image replacement, the prompt-only carver) exists to test whether the model lives up to it. On the MRI-like synthetic corpus the baseline, [[B0 mask-valid-seed1]] (commit `d14f201`), reaches 0.962 on trained classes. It also reaches **0.724 / 0.775 on target classes never supervised as targets**, against floors of 0.247 / 0.162, with one seed. What unlocked it was `mask_on: valid`: the mask is no longer trained to be empty, and the null head alone decides "names nothing". On real MRI the only reference is still the older `mask_on: all` model: 0.794 on supervised classes, and 0.005 held out against a 0.110 floor.
+> SpatialVox segments a brain structure that the prompt never names. The prompt is three clauses, each a direction and a named anchor, for example *"superior to the Left-Thalamus, medial to the Right-Putamen, and anterior to the Brain-Stem"*, and only their conjunction picks out one structure. A frozen promptable segmenter (**Stage A**) turns the three anchor names into three soft masks, and the names go no further than that. A parameter-free mapper turns those masks and the three direction words into three 45° pyramid fields and their product, `where_raw`. A boundary encoder `B(I)` reads the MRI without seeing the prompt. A small **carver** reads the geometry in its stem and queries `B(I)` to produce the target mask and a centroid, and a null head that reads four scalars says whether the clauses name anything. The mask is painted from the image rather than picked from Stage A's proposals, so in principle the target does not have to be a structure Stage A can draw. That is the lesion claim, and the evaluation machinery (prompt-blind floors, counterfactuals, image replacement, the prompt-only carver) exists to test whether the model lives up to it. On the MRI-like synthetic corpus the baseline, [[B0 mask-valid-seed1]] (commit `d14f201`), reaches 0.962 on trained classes. It also reaches **0.724 / 0.775 on target classes never supervised as targets**, against floors of 0.247 / 0.162, with one seed. What unlocked it was `mask_on: valid`: the mask is no longer trained to be empty, and the null head alone decides "names nothing". On real MRI the only reference is still the older `mask_on: all` model: 0.794 on supervised classes, and 0.005 held out against a 0.110 floor.
 
 **Contents**
 [[#1. The task]]
@@ -120,9 +120,7 @@ flowchart LR
     CACHE --> OVF
     OVF --> TB["train.py b<br/>the relational model"]
     PRE -.-> TB
-    TB --> PO["train.py b --prompt-only<br/>mandatory ablation"]
     TB --> EV["evaluate.py<br/>six-block report"]
-    PO --> EV
 ```
 
 ```bash
@@ -137,7 +135,6 @@ flowchart LR
 .venv/bin/python scripts/train.py b --overfit 1 --set train.stage_b.epochs=120   # wiring test
 .venv/bin/python scripts/train.py boundary                                       # optional: pretrain B(I)
 .venv/bin/python scripts/train.py b --out runs/<name>
-.venv/bin/python scripts/train.py b --prompt-only --out runs/<name>-prompt-only
 # 4. the report
 .venv/bin/python scripts/evaluate.py runs/<name>/best.pt --split val --classes train
 .venv/bin/python scripts/evaluate.py runs/<name>/best.pt --split val --classes val
@@ -167,7 +164,7 @@ flowchart LR
 | `scripts/corpus_report.py` | shortcut ceilings and prompt-blind floors per population. No checkpoint, no GPU |
 | `scripts/gate_mapper.py` | the gate, the `tau` sweep, `min_mass`, the null-head ceiling, Stage A's centroid errors |
 | `scripts/cache_anchors.py` | precomputes Stage A's soft masks, once per scene |
-| `scripts/train.py` | `a` \| `boundary` \| `b`, with `--prompt-only`, `--overfit N`, `--segmenter`, `--out`, `--config`, `--set` |
+| `scripts/train.py` | `a` \| `boundary` \| `b`, with `--overfit N`, `--segmenter`, `--out`, `--config`, `--set` |
 | `scripts/evaluate.py` | the six-block report of a Stage B checkpoint |
 | `tests/` | the contract (§19): what must hold for a number to mean what it says |
 | `vizualization/` | `demonstrate.py` (does the prompt find the right thing), `inspect_stage_b.py` (`A_i`, the fields, the feature maps), `single_forward.ipynb`. They write self-contained HTML files into `vizualization/out/` |
@@ -195,7 +192,7 @@ flowchart LR
     TASK -->|"image, direction_ids, name_ids, anchors"| MODEL["StageB.forward"]
     MODEL -->|"StageBOutput"| TASK
     TASK --> LOSS["five loss terms<br/>weighted by keep"]
-    LOSS --> OPT["AdamW on 268,275 params<br/>Stage A excluded"]
+    LOSS --> OPT["AdamW on 261,748 params<br/>Stage A excluded"]
 ```
 
 The single rule running through the whole pipeline: **the label volume goes to the task and never to the model.** The task uses it to build the training target and to score. `StageB.forward` accepts the image, the two id tensors, and two optional arguments, neither of which can identify the target (§13).
@@ -1033,7 +1030,7 @@ $$F_i(p) = \sigma\!\left(\frac{\mathrm{margin}_i(p)}{\tau}\right)\cdot\big[\math
 |---|---|---|
 | `fields` | `[B,3,128³]` | the carver (3 channels) |
 | `where_raw` | `[B,1,128³]` | the carver (raw and log), `L_far`, the field-centroid target |
-| `where_mass` | `[B,1]` | the null head, and a broadcast carver channel |
+| `where_mass` | `[B,1]` | the null head only. Not a carver channel: one broadcast scalar is erased by InstanceNorm |
 | `masses` | `[B,3]` | the null head |
 | `centroids` | `[B,3,3]` | reported as `anchor_centroids` |
 
@@ -1205,7 +1202,7 @@ def label_boundary(labels: Tensor) -> Tensor:
 | `boundary` | same | 1 where a 6-neighbour has a different label: an edge, never *whose* | Dice + BCE (1.0) |
 | `edge` | same | $\lvert\nabla I\rvert$ by central differences | L1 (0.5) |
 
-Cubes are blanked rather than scattered voxels, because a voxel-wise mask is filled in from its own neighbours and teaches nothing about structure. The boundary target covers about 1.63% of voxels. The three heads total 51 parameters and are discarded afterwards: only `encoder` transfers. The optional contrastive term from the original proposal is **not implemented**. To use a pretrained `B`, set `train.stage_b.boundary_checkpoint` to the run's `best.pt`. `B` then gets `boundary_lr_scale = 0.1` of the carver's learning rate through `StageB.parameter_groups` (228,528 parameters at 3e-5 against 39,747 at 3e-4).
+Cubes are blanked rather than scattered voxels, because a voxel-wise mask is filled in from its own neighbours and teaches nothing about structure. The boundary target covers about 1.63% of voxels. The three heads total 51 parameters and are discarded afterwards: only `encoder` transfers. The optional contrastive term from the original proposal is **not implemented**. To use a pretrained `B`, set `train.stage_b.boundary_checkpoint` to the run's `best.pt`. `B` then gets `boundary_lr_scale = 0.1` of the carver's learning rate through `StageB.parameter_groups` (228,528 parameters at 3e-5 against 33,220 at 3e-4).
 
 Measured (`P01 boundary-seed1` (archived)): 30 epochs in about 10 minutes, boundary-map Dice 0.0041 → 0.6290 on train and 0.0163 → 0.6258 on val (best 0.6327 at epoch 28). Train and val land on the same number, so `B` learns edges rather than memorising subjects. **What this does and does not test:** the label-adjacency target covers all 23 structures, including the held-out ones, so pretraining tests whether a class-agnostic edge prior restores *relational transfer*. It does not test the lesion claim. It did not restore transfer (`B05 pretrained-b-seed1` (archived)).
 
@@ -1220,80 +1217,68 @@ Measured (`P01 boundary-seed1` (archived)): 30 epochs in about 10 minutes, bound
 ```python
         where = field.where_raw
         log_where = where.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
-        log_mass = (
-            field.where_mass.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
-        ).reshape(-1, 1, 1, 1, 1).expand_as(where)
-        ...
+        source = image if boundary_image is None else boundary_image
+        boundary = self.boundary(source.to(torch.float32))
         parts = ([anchors] if self.carver_sees_anchors else []) + [
-            field.fields, where, log_where, log_mass
+            field.fields, where, log_where
         ]
+        geometry = torch.cat([part.to(dtype=boundary.dtype) for part in parts], dim=1)
+        logits, heatmap = self.carver(geometry, boundary)
 ```
 
 | channels | tensor | range | from |
 |---|---|---|---|
-| 16 | `B(I)` | features | §11 |
 | 3 | `A_0..2`, detached soft anchor masks (only if `carver_sees_anchors`) | [0, 1] | Stage A |
 | 3 | `F_0..2`, the three pyramids | [0, 1] | mapper |
 | 1 | `where_raw` | [0, 1] | mapper |
 | 1 | `log(max(where_raw, 1e-9)) / 20.72` | [−1, 0] | rescaled |
-| 1 | `log(max(where_mass, 1e-9)) / 20.72`, broadcast over space | [−1, 0] | rescaled |
-| **25** | concatenated in `B(I)`'s dtype | | 22 without anchors, 9 in the prompt-only ablation |
+| **8** | the stem concat, in `B(I)`'s dtype | | 5 without anchors |
 
-Both logs are clamped at `LOG_FLOOR = 1e-9` and divided by $-\ln(10^{-9}) = 20.72$. The other channels live in [0, 1], a raw `where_mass` of 1e-3 is indistinguishable from zero after one convolution, and a raw log reaching −21 would dominate every other channel. The `where_mass` channel is the one number that tells the carver the conjunction has no mass, without renormalising the map. `test_the_carver_takes_exactly_the_ten_declared_channels` counts this off `stem[0].in_channels`, so a smuggled coordinate grid would change the count and fail.
+`B(I)` is not in that tensor. `log(where_mass)` is not either: it is one scalar broadcast over the volume, and `ConvBlock` is Conv → `InstanceNorm3d(affine=False)` → LeakyReLU, so a spatially constant channel is identically zero. The null head still reads the scalar. `log(where_raw)` is clamped at `LOG_FLOOR = 1e-9` and divided by $-\ln(10^{-9}) = 20.72$, which maps it onto [−1, 0]. The other stem channels live in [0, 1]. `test_the_stem_reads_eight_geometry_channels_and_not_the_boundary` counts this off `stem[0].in_channels` and checks that swapping the volume `B` reads leaves the stem input bit-identical.
 
 > [!note] `carver_sees_anchors` (default on)
-> The three anchor *masks* are Stage A outputs, so their shapes identify the anchor classes. The unordered anchor set alone recovers the target 67.8% of the time on the supervised MRI population, which gives the carver a channel through which to *name* the target instead of solving for it. The geometry it actually needs is already in `F_i` and `where_raw`. Turning the flag off removes the three mask channels (25 → 22) and leaves the anchor **exclusion** (§12.3) unchanged. `configs/config.yaml` does not set the flag, so it defaults to on. It has not yet been tested: the arm meant to test it ran with the flag on (`B11 arm-noanchor` (archived)).
+> The three anchor *masks* are Stage A outputs, so their shapes identify the anchor classes. The unordered anchor set alone recovers the target 67.8% of the time on the supervised MRI population, which gives the carver a channel through which to *name* the target instead of solving for it. The geometry it actually needs is already in `F_i` and `where_raw`. Turning the flag off removes the three mask channels (8 → 5) and leaves the anchor **exclusion** (§12.3) unchanged. `configs/config.yaml` does not set the flag, so it defaults to on. It has not yet been tested: the arm meant to test it ran with the flag on (`B11 arm-noanchor` (archived)).
 
 ### 12.2 `Carver`
 
-```python
-    def __init__(
-        self,
-        in_channels: int,
-        boundary_channels: int,
-        *,
-        width: int = 16,
-        blocks: int = 2,
-        act: str = "leaky_relu",
-        full_resolution_skip: bool = True,
-        prior_foreground: float = 0.0016,
-    ) -> None:
-        super().__init__()
-        self.full_resolution_skip = bool(full_resolution_skip) and boundary_channels > 0
-        self.stem = ConvBlock(in_channels, width, act, stride=2)
-        self.blocks = nn.Sequential(*[ResBlock(width, act) for _ in range(int(blocks))])
-        self.head = nn.Conv3d(width + (boundary_channels if self.full_resolution_skip else 0), 1, 1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.constant_(self.head.bias, prior_bias(prior_foreground))
-        self.heatmap = nn.Conv3d(width, 1, 1)
+`geometry_features` is the `[B, 16, 64³]` tensor after the stem and the two residual blocks. It is not a module. The stem reads only the geometry concat from §12.1.
 
-    def forward(self, x: Tensor, boundary: Tensor | None) -> tuple[Tensor, Tensor]:
-        """``-> (logits [B, 1, D, H, W], heatmap logits [B, 1, D/2, H/2, W/2])``."""
-        features = self.blocks(self.stem(x))
-        width = features.shape[1]
-        coarse = F.conv3d(features, self.head.weight[:, :width], self.head.bias)
-        logits = F.interpolate(coarse, size=x.shape[2:], mode="trilinear", align_corners=True)
-        if self.full_resolution_skip:
-            logits = logits + F.conv3d(boundary, self.head.weight[:, width:])
-        return logits, self.heatmap(features)
+```python
+        geometry_features = self.blocks(self.stem(geometry))
+        coarse = F.interpolate(
+            self.coarse(geometry_features), size=geometry.shape[2:],
+            mode="trilinear", align_corners=True,
+        )
+        query = F.interpolate(
+            self.query(geometry_features), size=boundary.shape[2:],
+            mode="trilinear", align_corners=True,
+        )
+        retrieved = channel_attention(query, self.key(boundary), self.value(boundary))
+        logits = coarse + self.refine(retrieved)
+        return logits, self.heatmap(geometry_features)
 ```
+
+`channel_attention` is per voxel, softmax over channels, never over space. For channels `i, j`, `score_ij = Q_i K_j / sqrt(C)` and `retrieved_i = Σ_j α_ij V_j`. The voxel axis is chunked (4096) so the score is never materialised as `[B, 16, 16, 128³]`, which is about 2 GB per sample.
 
 | step | operation | shape | params |
 |---|---|---|---|
-| input | `x` (25 channels) | `[B,25,128³]` | — |
-| `stem` | `ConvBlock(25→16)`, stride 2. This is what makes 3×3×3 affordable at 128³ | `[B,16,64³]` | 10,800 |
-| `blocks` | 2 × `ResBlock(16)` | `[B,16,64³]` | 27,648 |
-| `head`, feature half | the first 16 input weights of the 1×1 and its bias, **on the working grid** | `[B,1,64³]` | 17 |
-| upsample | trilinear to 128³, **one channel** | `[B,1,128³]` | — |
-| `head`, `B(I)` half | the last 16 input weights, on `B(I)` at full resolution (`full_resolution_skip`), added | `[B,1,128³]` logits | 16 |
-| `heatmap` | a *separate* 1×1 conv on the **pre-upsample** features | `[B,1,64³]` | 17 |
-| **total** | | | **38,498** (37,202 without anchor channels) |
+| input | geometry concat | `[B,8,128³]` | — |
+| `stem` | `ConvBlock(8→16)`, stride 2. This is what makes 3×3×3 affordable at 128³ | `[B,16,64³]` | 3,456 |
+| `blocks` | 2 × `ResBlock(16)` → `geometry_features` | `[B,16,64³]` | 27,648 |
+| `coarse` | `Conv3d(16→1, 1×1)`, zero weight, bias $\log\frac{0.0016}{0.9984}$ | `[B,1,64³]` | 17 |
+| upsample | trilinear to 128³, **one channel**. This is the geometry-only mask | `[B,1,128³]` | — |
+| `heatmap` | a *separate* 1×1 on `geometry_features`, not on the mask | `[B,1,64³]` | 17 |
+| `query` | `Conv3d(16→16, 1×1)` on `geometry_features`, then trilinear to 128³. Default init | `[B,16,128³]` | 272 |
+| `key`, `value` | `Conv3d(16→16, 1×1)` on `B(I)`. Default init | `[B,16,128³]` | 272 + 272 |
+| `refine` | `Conv3d(16→1, 1×1)` on `retrieved`. **Weight and bias 0** | `[B,1,128³]` | 17 |
+| `logits` | upsampled `coarse` + `refine(retrieved)` | `[B,1,128³]` | — |
+| **total** | | | **31,971** (30,675 without anchor channels) |
 
-The `head` is still one `Conv3d(32→1, 1×1)`, zero weight and bias $\log\frac{0.0016}{0.9984}$, applied in two halves. Up to 2026-09-22 the forward upsampled the 16 feature channels, concatenated `B(I)` into a `[B,32,128³]` tensor and ran the 1×1 on that. A 1×1 convolution and a trilinear upsample are both linear, and the upsample's weights sum to one, so $\mathrm{head}(\mathrm{cat}[\mathrm{up}(f), B]) = \mathrm{up}(W_f f + b) + W_B B$ exactly. The same function, parameters and checkpoints now cost 40% less carver peak memory and about 8% less carver time (measured: 1.9e-6 max difference in fp32 at 128³; `test_the_split_mask_head_is_exactly_the_1x1_on_the_upsampled_concatenation`; `_update_ideas/2026-09-22-null-head-decides-emptiness.md`).
+`Q`, `K`, and `V` are not zeroed. If they were, `retrieved` would be zero and a zero `refine` would get no gradient. Because `refine` *is* zero at init, `logits` equal the upsampled coarse and do not depend on `boundary` (`test_a_zero_refine_matches_the_upsampled_coarse_and_ignores_boundary`). After `refine.weight` is nonzero, changing `boundary` changes the logits and still does not change the heatmap (`test_a_nonzero_refine_lets_boundary_move_the_logits_but_not_the_heatmap`). Checkpoints of the previous carver, the 25-channel stem and the split 1×1, do not load. There is no weight translator.
 
-- **Zero-initialised head at the foreground prior.** An untrained carver predicts the base rate everywhere. Otherwise training would start by pushing two million background logits down before Dice carried any usable gradient.
-- **`full_resolution_skip`, an addition to the original specification.** Read literally, the spec's "stride-2 stem, two 16-channel blocks, then a 1×1 up to 128³" makes the stem the only path from `B(I)` to the output. Every full-resolution boundary detail would be destroyed before the first convolution, and the mask would be a trilinear upsample of a 2.5 mm grid, on a corpus whose targets are nuclei of 300–4000 voxels. With the flag on, the final 1×1 sees `B(I)` at the resolution it was computed at. It is a flag so the literal form stays measurable. That ablation has not been run.
-- **The heatmap is a separate head**, not a reading of the mask, so it keeps training when the mask target is empty.
+- **Zero-initialised `coarse` at the foreground prior.** An untrained carver predicts the base rate everywhere. Otherwise training would start by pushing two million background logits down before Dice carried any usable gradient.
+- **`boundary` enters only through attention.** There is no concatenation of `B(I)` into the stem and no prompt-free residual `W_B · boundary` on the logits. A missing boundary is not a mode: `StageB` always builds the boundary encoder.
+- **The heatmap is a separate head**, not a reading of the mask and not a function of `boundary`, so it keeps training when the mask target is empty.
 
 ### 12.3 Anchor exclusion and the additive ablation
 
@@ -1361,26 +1346,17 @@ The heatmap `[B,1,64³]` is turned into a softmax over its 262,144 cells, and th
             field = self.mapper(anchors, direction_ids, self.spacing, self.center)
         where = field.where_raw
         log_where = where.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
-        log_mass = (
-            field.where_mass.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
-        ).reshape(-1, 1, 1, 1, 1).expand_as(where)
 
-        boundary = None
-        if self.boundary is not None:
-            source = image if boundary_image is None else boundary_image
-            boundary = self.boundary(source.to(torch.float32))
+        source = image if boundary_image is None else boundary_image
+        boundary = self.boundary(source.to(torch.float32))
         parts = ([anchors] if self.carver_sees_anchors else []) + [
-            field.fields, where, log_where, log_mass
+            field.fields, where, log_where
         ]
         # Under autocast the boundary features come back in the low-precision
-        # dtype while the geometry is float32; the concatenation has to agree,
-        # and matching the features is what keeps the 25-channel input at 128^3
-        # off the float32 path.
-        dtype = boundary.dtype if boundary is not None else torch.float32
-        logits, heatmap = self.carver(
-            torch.cat(([boundary] if boundary is not None else []) + [p.to(dtype) for p in parts], dim=1),
-            boundary,
-        )
+        # dtype while the geometry is float32. The stem concat is cast to that
+        # dtype. boundary is not one of its channels.
+        geometry = torch.cat([part.to(dtype=boundary.dtype) for part in parts], dim=1)
+        logits, heatmap = self.carver(geometry, boundary)
 
         if self.alpha is not None:
             # The ablation: a weak explicit bias, one scalar, no other input.
@@ -1428,7 +1404,7 @@ The heatmap `[B,1,64³]` is turned into a softmax over its 262,144 cells, and th
 
 Everything after `valid` is carried rather than recomputed, because it is a pure function of inputs the caller no longer holds, and the losses and the report need it.
 
-**Constructor and `StageB.config`.** `StageB(segmenter, *, spacing, n_anchors=3, tau=0.5, min_mass=1e-6, boundary_widths=(16,32,32), carver_width=16, carver_blocks=2, full_resolution_skip=True, use_image=True, carver_sees_anchors=True, additive_prior=False, alpha=0.35, background_logit=-10.0, prior_foreground=0.0016)`. The keyword arguments are stored verbatim in `self.config`, and `load_model` rebuilds from that dict, never from the YAML. So **every architectural parameter must be a constructor argument**, or old checkpoints stop loading (`test_the_config_carries_every_architectural_constant`). Training-schedule values (`flip_probability`, the loss weights) live in the checkpoint's `meta["config"]["stage"]` and its `.json` sidecar. Checkpoints of the attention-based Stage B do not load here, and are not meant to.
+**Constructor and `StageB.config`.** `StageB(segmenter, *, spacing, n_anchors=3, tau=0.5, min_mass=1e-6, boundary_widths=(16,32,32), carver_width=16, carver_blocks=2, carver_sees_anchors=True, additive_prior=False, alpha=0.35, background_logit=-10.0, prior_foreground=0.0016)`. The keyword arguments are stored verbatim in `self.config`, and `load_model` rebuilds from that dict, never from the YAML. So **every architectural parameter must be a constructor argument**, or old checkpoints stop loading (`test_the_config_carries_every_architectural_constant`). Training-schedule values (`flip_probability`, the loss weights) live in the checkpoint's `meta["config"]["stage"]` and its `.json` sidecar. Checkpoints of the attention-based Stage B do not load here, and are not meant to. Checkpoints of the previous carver (25-channel stem, split 1×1, `full_resolution_skip`, `use_image`) do not load either. There is no weight translator.
 
 | quantity | code | runtime (MRI) | runtime (`synthetic-mri`) |
 |---|---|---|---|
@@ -1706,7 +1682,7 @@ Per epoch the probes run on 200 examples as a trend line. The reported drops com
 5. **Prompts that name nothing.** `empty_prompts` rewrites up to 400 of the scored rows, flipping a clause up to 6 times, until `solutions_for` returns nothing. It reports how often the null head says invalid, how often *any* mask is emitted, and the mean false-positive voxel count, each also **gated** (`false_positive_rate_null_gated`, `false_positive_voxels_null_gated`). Under `mask_on: valid` the carver is no longer trained to fall silent here, so the ungated leak rises by design, and the gated one is the system's answer. This is the check that the tiny spike in `where_raw` was not renormalised into a confident answer.
 6. **Image replacement** (mandatory). Keep this subject's anchors and every field, and feed `B` the **neighbouring row's MRI** from a *shuffled* loader. Pairs from the same subject are **skipped and counted**: manifests are in scene order, so four consecutive rows are usually one volume, and swapping those would report a reassuring null for the wrong reason. The Dice should **fall** and the centroid should **hold**. That pattern is the signature that *the words placed the structure and the image drew it.*
 
-Next to the Dice it prints the **population's own anchor-set ceiling**, with a warning when that is ≥ 90%. It writes `report.json` and `predictions.jsonl`, and with `--save-masks` also every predicted mask. The other mandatory test, the **prompt-only carver**, is a training run: `scripts/train.py b --prompt-only`. If its Dice approaches the full model's, the mask is a spatial prior. One item on the original proposal's report list is not implemented as such: the **alternate-prompt switch rate** (a prompt that names a different structure should move the mask). `flip_direction` is its nearest proxy.
+Next to the Dice it prints the **population's own anchor-set ceiling**, with a warning when that is ≥ 90%. It writes `report.json` and `predictions.jsonl`, and with `--save-masks` also every predicted mask. The prompt-only training run is gone: `B` is required, and `boundary` reaches the mask only through `refine`. Image replacement is the check that the image moves the mask. One item on the original proposal's report list is not implemented as such: the **alternate-prompt switch rate** (a prompt that names a different structure should move the mask). `flip_direction` is its nearest proxy.
 
 ### 16.3 The floors and ceilings a Dice is read against
 
@@ -1743,7 +1719,7 @@ These are **lower bounds** on seed spread. **A single-seed number is not a resul
 
 1. Its population's prompt-blind floor and anchor-set ceiling (§16.3).
 2. `permute_channels`, `permute_clauses` and `flip_direction` fall, and `permute_both` does not move.
-3. The prompt-only carver and image replacement, before a Dice is treated as evidence that the image was used at all.
+3. Image replacement, before a Dice is treated as evidence that the image was used at all. At init `refine` is zero, so that test is meaningful only after `refine` has left zero.
 4. The gate from ground truth (`gate_mapper.py`) and from the anchors actually used (`gate_fraction_predicted`), named differently.
 5. The number of seeds.
 6. Dice both gated and ungated by the null head.
@@ -1773,11 +1749,11 @@ MRI corpus, `B = 4`, training step with the anchor cache.
 | 3 | `where_mass` | `[B,1]` | `[4,1]` | float32 | |
 | 4 | `valid` | `[B]` | `[4]` | float32 | null-head logit |
 | 5 | `B(I)` | `[B,16,D,H,W]` | `[4,16,128,128,128]` | bf16 | |
-| 6 | `log_where`, `log_mass` | `[B,1,D,H,W]` | `[4,1,128,128,128]` | float32 → bf16 | in [−1, 0] |
-| 6 | carver input `x` | `[B,25,D,H,W]` | `[4,25,128,128,128]` | bf16 | 22 without anchors, 9 prompt-only |
-| 7 | carver `features` | `[B,16,D/2,H/2,W/2]` | `[4,16,64,64,64]` | bf16 | after the stem and blocks |
-| 7 | `coarse` | `[B,1,D/2,H/2,W/2]` | `[4,1,64,64,64]` | bf16 | feature half of the 1×1 `head`, on the working grid |
-| 7 | upsampled `coarse` + `B(I)` half | `[B,1,D,H,W]` | `[4,1,128,128,128]` | bf16/float32 | one channel upsampled; replaces the old `[4,32,128³]` concatenation (§12.2) |
+| 6 | `log_where` | `[B,1,D,H,W]` | `[4,1,128,128,128]` | float32 → bf16 | in [−1, 0]. `log(where_mass)` is not a channel |
+| 6 | carver geometry | `[B,8,D,H,W]` | `[4,8,128,128,128]` | bf16 | 5 without anchors. `B(I)` is not in it |
+| 7 | `geometry_features` | `[B,16,D/2,H/2,W/2]` | `[4,16,64,64,64]` | bf16 | after the stem and blocks |
+| 7 | `coarse` | `[B,1,D/2,H/2,W/2]` | `[4,1,64,64,64]` | bf16 | 1×1 on `geometry_features`, then trilinear |
+| 7 | `retrieved`, `refine` | `[B,16,D,H,W]`, `[B,1,D,H,W]` | `[4,16,128³]`, `[4,1,128³]` | bf16 | channel attention; `logits = up(coarse) + refine` |
 | 7 | `logits` | `[B,1,D,H,W]` | `[4,1,128,128,128]` | bf16 | after the exclusion |
 | 7 | `heatmap` | `[B,1,D/2,H/2,W/2]` | `[4,1,64,64,64]` | bf16 | |
 | 8 | `centroid` | `[B,3]` | `[4,3]` | float32 | soft-argmax, mm |
@@ -1803,12 +1779,12 @@ Counted from the constructors with the shipped MRI configuration.
 | | `heads` (4 × `MaskHead`) | 211,364 | frozen |
 | | **Stage A total** | **17,004,292** | 0 |
 | **mapper** | — | **0** | — |
-| **`B(I)`** | `down.0/1/2`, `up.0/1` | 432 + 69,120 + 82,944 + 55,296 + 20,736 = **228,528** | yes (85.2%) |
-| **carver** | `stem` 10,800 · `blocks` 27,648 · `head` 33 · `heatmap` 17 | **38,498** | yes (14.3%) |
+| **`B(I)`** | `down.0/1/2`, `up.0/1` | 432 + 69,120 + 82,944 + 55,296 + 20,736 = **228,528** | yes (87.3%) |
+| **carver** | `stem` 3,456 · `blocks` 27,648 · `coarse` 17 · `heatmap` 17 · `query`/`key`/`value` 816 · `refine` 17 | **31,971** | yes (12.2%) |
 | **null head** | 160 + 1,056 + 33 | **1,249** | yes (0.5%) |
-| **Stage B trainable** | | **268,275** of 17,272,567 total | |
+| **Stage B trainable** | | **261,748** of 17,266,040 total | |
 
-Variants: `carver_sees_anchors: false` gives a 37,202-parameter carver and 266,979 trainable. `--prompt-only` (no `B`, 9 input channels, no skip) gives 32,819 trainable. `additive_prior: true` adds 1 (`alpha`). `BoundaryPretrainer` has 228,579 (the encoder plus 3 × 17 in the heads). Stage A on the 64³, 16-class synthetic corpus has 8,023,299.
+Variants: `carver_sees_anchors: false` gives a 30,675-parameter carver and 260,452 trainable. `additive_prior: true` adds 1 (`alpha`). `BoundaryPretrainer` has 228,579 (the encoder plus 3 × 17 in the heads). Stage A on the 64³, 16-class synthetic corpus has 8,023,299. `B` is 87.3% of the trainable weight.
 
 ---
 
@@ -1820,7 +1796,7 @@ The tests pin the **contract, not the numbers**: they fail when something would 
 |---|---|
 | **What Stage B may see**: the image, `name_ids` (Stage A only), `direction_ids` (mapper only), and optionally `anchors=` and `boundary_image=` | `test_stage_b_signature_admits_nothing_that_identifies_the_target`, `test_the_task_never_hands_the_model_anything_from_the_label_volume`, `test_a_stage_b_item_carries_no_mask_and_no_target_geometry` |
 | **Names stop at Stage A**: every output is bit-identical under an arbitrary renaming once the masks are fixed | `test_names_reach_stage_a_and_stop_there` |
-| **No coordinate grid in `B` or the carver**; world coordinates exist only inside the mapper | `test_no_module_in_stage_b_builds_a_coordinate_grid`, `test_the_carver_takes_exactly_the_ten_declared_channels` |
+| **No coordinate grid in `B` or the carver**; world coordinates exist only inside the mapper | `test_no_module_in_stage_b_builds_a_coordinate_grid`, `test_the_stem_reads_eight_geometry_channels_and_not_the_boundary` |
 | **`B` sees the image and nothing else; the null head reads four scalars** | `test_the_boundary_encoder_sees_the_image_and_nothing_else`, `test_the_null_head_reads_four_scalars_and_no_image` |
 | **Stage A is frozen**, and what leaves it is a detached probability | `test_stage_a_is_frozen_and_out_of_the_optimiser`, `test_the_optimiser_never_receives_the_frozen_segmenter`, `test_the_anchors_the_carver_sees_are_detached_probabilities`, `test_stage_a_masks_do_not_depend_on_which_other_names_were_asked_for` |
 | **The mapper is `classify`, soft, with no parameters, never renormalised** | `test_the_mapper_has_no_parameters`, `test_each_region_is_the_half_pyramid_classify_names`, `test_a_point_off_the_dominant_axis_falls_outside_the_45_degree_pyramid`, `test_the_product_sits_on_the_satisfying_point_not_on_any_anchor`, `test_flipping_one_clause_moves_the_high_region_off_the_old_point`, `test_an_impossible_conjunction_keeps_a_tiny_peak_and_is_not_renormalised`, `test_a_rejected_anchor_zeroes_its_field_and_the_whole_product`, `test_a_target_voxel_on_the_near_side_may_score_low`, `test_the_soft_centroid_is_confidence_weighted_not_thresholded`, `test_mass_is_the_volume_fraction_so_min_mass_is_corpus_independent`, `test_the_point_form_of_the_margin_matches_the_volume_form`, `test_tau_only_sharpens_it_never_moves_the_boundary` |
@@ -1828,7 +1804,7 @@ The tests pin the **contract, not the numbers**: they fail when something would 
 | **Order carries no information** | `test_a_manifest_anchor_order_is_not_sorted_by_distance` |
 | **Anchor-first, well-posed prompts** | `test_anchor_first_only_emits_prompts_that_describe_one_structure`, `test_anchor_first_stops_the_anchor_set_from_naming_the_target`, `test_anchor_first_clauses_stay_aligned_with_their_anchors`, `test_anchor_first_directions_are_pairwise_distinct`, `test_an_example_never_names_its_own_target` |
 | **A flip is re-scored; dropped means dropped everywhere** | `test_a_flip_is_retargeted_emptied_or_dropped_and_never_assumed_empty`, `test_a_record_with_target_zero_is_an_empty_prompt_however_it_got_there`, `test_the_flip_is_reproducible_from_the_epoch_and_the_index`, `test_a_dropped_sample_changes_no_loss_term`, `test_an_all_dropped_batch_is_zero_and_not_nan`, `test_metrics_skip_a_dropped_sample`, `test_an_invalid_prompt_gets_the_empty_mask_not_the_background` |
-| **Carver details** | `test_anchor_voxels_above_a_half_are_written_to_background`, `test_the_heatmap_is_a_separate_head_not_a_reading_of_the_mask`, `test_soft_argmax_is_an_expectation_in_world_units`, `test_a_coarse_grid_maps_to_the_world_centre_of_the_block_it_covers`, `test_the_head_bias_starts_at_the_foreground_prior`, `test_the_additive_prior_is_one_scalar_with_no_other_input`, `test_the_prompt_only_carver_builds_without_b`, `test_replacing_the_image_moves_the_mask_and_not_the_field`, `test_an_impossible_prompt_does_not_produce_a_peak_of_one` |
+| **Carver details** | `test_anchor_voxels_above_a_half_are_written_to_background`, `test_the_heatmap_is_a_separate_head_not_a_reading_of_the_mask`, `test_soft_argmax_is_an_expectation_in_world_units`, `test_a_coarse_grid_maps_to_the_world_centre_of_the_block_it_covers`, `test_the_head_bias_starts_at_the_foreground_prior`, `test_the_additive_prior_is_one_scalar_with_no_other_input`, `test_a_zero_refine_matches_the_upsampled_coarse_and_ignores_boundary`, `test_a_nonzero_refine_lets_boundary_move_the_logits_but_not_the_heatmap`, `test_chunked_channel_attention_matches_a_per_voxel_implementation`, `test_without_anchors_the_stem_has_five_channels`, `test_replacing_the_image_moves_the_mask_and_not_the_field`, `test_an_impossible_prompt_does_not_produce_a_peak_of_one` |
 | **Checkpoints are self-describing; constants are the measured ones** | `test_the_config_carries_every_architectural_constant`, `test_a_checkpoint_round_trips_through_load_model`, `test_a_pretrained_boundary_encoder_loads_into_stage_b`, `test_b_gets_its_own_learning_rate_only_once_it_is_pretrained`, `test_the_shipped_constants_are_the_measured_ones`, `test_stage_b_always_needs_a_segmenter` |
 | **The report measures what it says** | `test_permute_both_cannot_move_the_field_at_all`, `test_the_probes_report_all_four_counterfactuals`, `test_every_probe_actually_reaches_the_model`, `test_the_empty_prompt_population_really_names_nothing`, `test_the_shortcut_ceiling_is_computed_on_the_population_it_is_printed_beside`, `test_the_boundary_target_marks_label_changes_and_carries_no_class`, `test_the_anchor_cache_reproduces_the_masks_it_was_built_from`, `test_the_anchor_cache_directory_is_keyed_by_the_checkpoint` |
 
@@ -1865,7 +1841,7 @@ This architecture was first specified as a proposal, together with a separate fi
 ### 20.2 Quantities rescaled to be usable (monotone, no new information)
 
 - The null head reads `log10` of its four inputs (§10), because `where_mass` spans 1e-21 to 2e-2.
-- The carver's `log(where_raw)` and `where_mass` channels are clamped at 1e-9 and divided by $-\ln 10^{-9}$, which maps them to [−1, 0] (§12.1). The `where_mass` channel is therefore the *log* of the mass.
+- The carver's `log(where_raw)` channel is clamped at 1e-9 and divided by $-\ln 10^{-9}$, which maps it to [−1, 0] (§12.1). `log(where_mass)` is not a stem channel.
 
 ### 20.3 Where the specification was ambiguous
 
@@ -1879,12 +1855,12 @@ This architecture was first specified as a proposal, together with a separate fi
 
 ### 20.4 Architectural additions
 
-- **`carver.full_resolution_skip` (default on)**: the final 1×1 reads `concat(upsample(residual), B(I))` (§12.2). The literal reading remains an ablation, and it has not been run.
+- **Geometry-query carver** (§12.2): the stem reads geometry only, and `B(I)` returns as keys and values. `logits = upsample(coarse) + refine(retrieved)`, with `refine` zero at init. The previous split head and `full_resolution_skip` are gone. Old carver checkpoints do not load.
 - **No residual block at full resolution in `B`**: 350 of the 530 ms of a step (§11.1).
 - **`carver_sees_anchors` (default on)**, a flag added later to remove the three anchor-mask channels from the carver (§12.1). It is an architectural parameter and is recorded in `StageB.config`.
 - **`train.stage_b.leave_one_out` (default off)**, episodic class withholding (§7.4). It is a training-schedule value.
 - **`train.stage_b.mask_on` (shipped `valid` since 2026-09-22; `all` reproduces every earlier run)**. The proposal's loss table trains a prompt that names nothing towards the empty mask. That turned the carver into a second, image-based null detector, and the detector also rejects unfamiliar valid targets: 75% of held-out masks come out empty on `data/mri` ([[B03 relational-seed1]]). `valid` trains the mask only on prompts that name a structure and leaves emptiness to the null head's gate (§14.2). It is a training-schedule value, recorded in `meta["config"]["stage"]`. It is untested; see `_update_ideas/2026-09-22-null-head-decides-emptiness.md`.
-- **The mask head is applied in two exact halves** (§12.2): 1×1 on the working grid, then one upsampled channel plus the `B(I)` half at full resolution. Same function and checkpoints; carver peak memory −40%.
+- **No prompt-only carver.** `use_image: false` is not a mode. `StageB` always builds `BoundaryEncoder`.
 
 ### 20.5 Sequencing
 
@@ -1930,8 +1906,7 @@ Every tunable lives in a config file, and nothing in `src/` hard-codes a value f
 | `model.stage_a.deep_supervision` | `[0.05,0.1,0.25,0.6]` | `[0.1,0.3,0.6]` | one weight per decoder scale |
 | `model.stage_b.mapper.tau` / `min_mass` | 0.5 / 1e-6 | 0.5 / 1e-6 | world units / volume fraction |
 | `model.stage_b.boundary_widths` | `[16,32,32]` | `[16,32,32]` | `B(I)` |
-| `model.stage_b.carver.{width, blocks, full_resolution_skip}` | 16, 2, true | 16, 2, true | |
-| `model.stage_b.use_image` | true | true | `--prompt-only` sets it false |
+| `model.stage_b.carver.{width, blocks}` | 16, 2 | 16, 2 | stem is geometry only; `B(I)` is channel attention |
 | `model.stage_b.carver_sees_anchors` | *(absent → true)* | true | §12.1 |
 | `model.stage_b.additive_prior` / `alpha` | false / 0.35 | false / 0.35 | the α ablation |
 | `model.stage_b.background_logit` | −10.0 | −10.0 | the anchor exclusion |
