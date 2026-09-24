@@ -650,6 +650,7 @@ class StageB(nn.Module):
         intensity_tol: float = 1.0,
         tol_mode: str = "local_std",
         feature_tol: float = 0.30,
+        barrier_tol: float = 0.35,
         score_null: float = 0.5,
     ) -> None:
         super().__init__()
@@ -668,7 +669,7 @@ class StageB(nn.Module):
             dilate_radius=int(dilate_radius), region_threshold=float(region_threshold),
             max_seeds=int(max_seeds), intensity_tol=float(intensity_tol),
             tol_mode=str(tol_mode), feature_tol=float(feature_tol),
-            score_null=float(score_null),
+            barrier_tol=float(barrier_tol), score_null=float(score_null),
         )
         self.n_anchors = int(n_anchors)
         self.spacing = tuple(float(v) for v in spacing)
@@ -683,6 +684,7 @@ class StageB(nn.Module):
         self.intensity_tol = float(intensity_tol)
         self.tol_mode = str(tol_mode)
         self.feature_tol = float(feature_tol)
+        self.barrier_tol = float(barrier_tol)
         self.score_null = float(score_null)
 
         self.segmenter = StageA(**segmenter)
@@ -709,7 +711,20 @@ class StageB(nn.Module):
             self.carver = None
             self.null = None
             self.alpha = None
+        #: Frozen 1x1 from BoundaryPretrainer; turns B features into a boundary
+        #: probability used as a flood barrier. Attached when a boundary
+        #: checkpoint is loaded into instance mode.
+        self.boundary_head: nn.Conv3d | None = None
         self.boundary_lr_scale = 1.0
+
+    def attach_boundary_head(self, head: nn.Conv3d) -> "StageB":
+        """Copy the frozen BoundaryPretrainer boundary head for barrier floods."""
+        if head.out_channels != 1:
+            raise ValueError(f"boundary head must write one channel, got {head.out_channels}")
+        self.boundary_head = nn.Conv3d(head.in_channels, 1, 1)
+        self.boundary_head.load_state_dict(head.state_dict())
+        self.boundary_head.requires_grad_(False).eval()
+        return self
 
     # -- the freeze -------------------------------------------------------
     def train(self, mode: bool = True) -> "StageB":
@@ -792,23 +807,29 @@ class StageB(nn.Module):
         source = image if boundary_image is None else boundary_image
         batch = source.shape[0]
         features = None
+        barrier = None
         if self.boundary is not None:
             with torch.no_grad():
                 features = self.boundary(source.to(torch.float32))
+                if self.boundary_head is not None:
+                    barrier = torch.sigmoid(self.boundary_head(features))
         logits, centroids, valid = [], [], []
         for i in range(batch):
             feat_i = None if features is None else features[i]
+            barrier_i = None if barrier is None else barrier[i, 0]
             result = run_instance(
                 source[i],
                 field.where_raw[i],
                 self.spacing,
                 features=feat_i,
+                barrier=barrier_i,
                 dilate_radius=self.dilate_radius,
                 region_threshold=self.region_threshold,
                 max_seeds=self.max_seeds,
                 intensity_tol=self.intensity_tol,
                 tol_mode=self.tol_mode,
                 feature_tol=self.feature_tol,
+                barrier_tol=self.barrier_tol,
                 score_null=self.score_null,
             )
             # Finite background so BCE against a disagreeing target stays finite.

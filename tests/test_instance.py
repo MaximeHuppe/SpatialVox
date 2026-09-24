@@ -123,7 +123,20 @@ def test_stage_b_instance_mode_has_no_carver_and_names_still_stop_at_stage_a():
     assert torch.equal(out.logits, again.logits)
 
 
-def test_feature_flood_grows_a_homogeneous_feature_blob():
+def test_barrier_flood_stops_at_a_wall():
+    image = torch.zeros(1, 16, 16, 16)
+    image[0, 4:12, 4:12, 4:12] = 1.0
+    where = torch.ones(1, 16, 16, 16) * 0.9
+    barrier = torch.zeros(16, 16, 16)
+    barrier[:, :, 8] = 1.0  # wall separating left/right
+    proposals, _ = propose_seed_flood(
+        image, where, barrier=barrier, dilate_radius=0, max_seeds=4,
+        barrier_tol=0.35, min_voxels=4,
+    )
+    assert proposals.shape[0] >= 1
+    # A body seeded on the left must not cross x=8.
+    left = [p for p in proposals if float(p[8, 8, 5]) == 1.0]
+    assert left and all(float(p[8, 8, 10]) == 0.0 for p in left)
     """Cosine flood follows a constant feature body and stops at a different code."""
     image = torch.zeros(1, 16, 16, 16)
     image[0, 4:10, 4:10, 4:10] = 1.0

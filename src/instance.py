@@ -227,23 +227,63 @@ def normalize_features(features: Tensor) -> Tensor:
     raise ValueError(f"features must be [C,D,H,W] or [B,C,D,H,W], got {tuple(features.shape)}")
 
 
+def _flood_barrier(
+    barrier: np.ndarray,
+    seed: tuple[int, int, int],
+    region: np.ndarray,
+    *,
+    barrier_tol: float,
+) -> np.ndarray:
+    """6-connected flood that refuses to enter high predicted-boundary voxels.
+
+    ``barrier`` is a probability map in ``[0, 1]`` (``sigmoid`` of the frozen
+    BoundaryPretrainer boundary head). The head was trained to light up where
+    neighbouring labels differ, so low values are instance interiors.
+    """
+    depth, height, width = barrier.shape
+    out = np.zeros((depth, height, width), dtype=bool)
+    if not region[seed] or float(barrier[seed]) > barrier_tol:
+        return out
+    stack = [seed]
+    out[seed] = True
+    while stack:
+        z, y, x = stack.pop()
+        for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+            nz, ny, nx = z + dz, y + dy, x + dx
+            if not (0 <= nz < depth and 0 <= ny < height and 0 <= nx < width):
+                continue
+            if out[nz, ny, nx] or not region[nz, ny, nx]:
+                continue
+            if float(barrier[nz, ny, nx]) > barrier_tol:
+                continue
+            out[nz, ny, nx] = True
+            stack.append((nz, ny, nx))
+    return out
+
+
 def propose_seed_flood(
     image: Tensor,
     where_raw: Tensor,
     *,
     features: Tensor | None = None,
+    barrier: Tensor | None = None,
     dilate_radius: int = 4,
     region_threshold: float = 0.5,
     max_seeds: int = 16,
     intensity_tol: float = 1.0,
     tol_mode: str = "local_std",
     feature_tol: float = 0.30,
+    barrier_tol: float = 0.35,
     min_voxels: int = 8,
 ) -> tuple[Tensor, Tensor]:
     """Seed-flood proposals inside the relational region.
 
-    When ``features`` (``[C,D,H,W]`` from frozen ``B``) is given, flood by
-    cosine distance to the seed feature. Otherwise fall back to intensity.
+    Affinity, in priority order when provided:
+
+    1. ``barrier`` — refuse voxels with predicted boundary prob ``> barrier_tol``
+       (preferred on MRI; uses the frozen boundary head).
+    2. ``features`` — cosine distance to the seed feature.
+    3. intensity — local/absolute intensity band (synthetic / fallback).
     """
     if image.ndim == 4:
         image = image[0]
@@ -268,8 +308,15 @@ def propose_seed_flood(
             if abs(float(image_np[s]) - median) >= 0.25 * spread
         ] or seeds
 
+    barrier_np = None
+    if barrier is not None:
+        b = barrier.detach().float()
+        while b.ndim > 3:
+            b = b[0]
+        barrier_np = b.cpu().numpy()
+
     feat_np = None
-    if features is not None:
+    if barrier_np is None and features is not None:
         feat = features
         while feat.ndim > 4:
             feat = feat[0]
@@ -277,7 +324,9 @@ def propose_seed_flood(
 
     bodies: list[np.ndarray] = []
     for seed in seeds:
-        if feat_np is not None:
+        if barrier_np is not None:
+            body = _flood_barrier(barrier_np, seed, region_np, barrier_tol=float(barrier_tol))
+        elif feat_np is not None:
             body = _flood_features(feat_np, seed, region_np, feature_tol=float(feature_tol))
         else:
             tol = _resolve_intensity_tol(
@@ -343,12 +392,14 @@ def run_instance(
     spacing: Sequence[float],
     *,
     features: Tensor | None = None,
+    barrier: Tensor | None = None,
     dilate_radius: int = 4,
     region_threshold: float = 0.5,
     max_seeds: int = 16,
     intensity_tol: float = 1.0,
     tol_mode: str = "local_std",
     feature_tol: float = 0.30,
+    barrier_tol: float = 0.35,
     min_voxels: int = 8,
     score_null: float = 0.5,
 ) -> InstanceResult:
@@ -356,12 +407,14 @@ def run_instance(
     proposals, region = propose_seed_flood(
         image, where_raw,
         features=features,
+        barrier=barrier,
         dilate_radius=dilate_radius,
         region_threshold=region_threshold,
         max_seeds=max_seeds,
         intensity_tol=intensity_tol,
         tol_mode=tol_mode,
         feature_tol=feature_tol,
+        barrier_tol=barrier_tol,
         min_voxels=min_voxels,
     )
     scores, centroids = score_proposals(proposals, where_raw, spacing)

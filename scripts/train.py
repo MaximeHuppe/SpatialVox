@@ -163,6 +163,7 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         intensity_tol=float(model_cfg.get("instance", {}).get("intensity_tol", 1.0)),
         tol_mode=str(model_cfg.get("instance", {}).get("tol_mode", "local_std")),
         feature_tol=float(model_cfg.get("instance", {}).get("feature_tol", 0.30)),
+        barrier_tol=float(model_cfg.get("instance", {}).get("barrier_tol", 0.35)),
         score_null=float(model_cfg.get("instance", {}).get("score_null", 0.5)),
     )
     checkpoint = stage_cfg.get("boundary_checkpoint")
@@ -170,7 +171,11 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         pretrained = load_model(checkpoint)
         model.boundary.load_state_dict(pretrained.encoder.state_dict())
         model.boundary_lr_scale = float(stage_cfg.boundary_lr_scale)
-        print(f"B(I) initialised from {checkpoint}, lr scale {model.boundary_lr_scale}")
+        if str(model_cfg.get("answer_mode", "instance")) == "instance" and hasattr(pretrained, "boundary"):
+            model.attach_boundary_head(pretrained.boundary)
+            print(f"B(I) + boundary head from {checkpoint} (barrier flood)")
+        else:
+            print(f"B(I) initialised from {checkpoint}, lr scale {model.boundary_lr_scale}")
     task = StageBTask(
         model, corpus.vocab,
         spacing=corpus.spacing,

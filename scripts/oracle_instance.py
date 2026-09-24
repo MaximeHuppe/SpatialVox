@@ -1,16 +1,10 @@
 #!/usr/bin/env python
 """Offline instance ceilings (§5.1) — no training.
 
-Measures, on a corpus split:
-
-* mapper gate: fraction of target centroids with ``where_raw > 0.5``;
-* oracle instance: Dice of the labelled structure whose centroid maximises
-  ``where_raw`` (design ceiling ~0.97 on unique prompts);
-* seed-flood recall@K: whether some proposal overlaps the GT body (IoU ≥ 0.5);
-* diagnostics: best IoU, K, GT coverage, proposal/region size, flood-from-GT.
-
-Pass ``--boundary runs/boundary/.../best.pt`` to flood on frozen ``B`` features
-(cosine distance) instead of intensity.
+Pass ``--boundary runs/boundary/.../best.pt`` to propose with the frozen
+BoundaryPretrainer. Default affinity is the **boundary head barrier** (refuse
+high P(boundary) voxels). ``--affinity features`` uses cosine feature flood;
+omit ``--boundary`` for intensity.
 
     scripts/oracle_instance.py --split val --limit 200 \\
       --boundary runs/boundary/instance-pretext/best.pt
@@ -32,6 +26,7 @@ from src.data import Corpus, ExampleDataset
 from src.engine import dice_iou, load_model
 from src.geometry import volume_center_world
 from src.instance import (
+    _flood_barrier,
     _flood_features,
     _flood_intensity,
     _resolve_intensity_tol,
@@ -57,7 +52,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
     parser.add_argument("--limit", type=int, default=200)
-    parser.add_argument("--boundary", type=Path, help="BoundaryPretrainer checkpoint → feature affinity")
+    parser.add_argument("--boundary", type=Path, help="BoundaryPretrainer checkpoint")
+    parser.add_argument(
+        "--affinity", choices=["barrier", "features", "intensity"], default=None,
+        help="proposal affinity (default: barrier if --boundary else intensity)",
+    )
     parser.add_argument("--config", type=Path)
     parser.add_argument("--set", dest="overrides", action="append")
     args = parser.parse_args()
@@ -78,19 +77,30 @@ def main() -> int:
     intensity_tol = float(_cfg_get(inst, "intensity_tol", 1.0))
     tol_mode = str(_cfg_get(inst, "tol_mode", "local_std"))
     feature_tol = float(_cfg_get(inst, "feature_tol", 0.30))
+    barrier_tol = float(_cfg_get(inst, "barrier_tol", 0.35))
     region_threshold = float(_cfg_get(inst, "region_threshold", 0.5))
     max_seeds = int(_cfg_get(inst, "max_seeds", 16))
 
     encoder = None
-    mode = "intensity"
+    boundary_head = None
     if args.boundary is not None:
         pretrained = load_model(args.boundary)
         if not isinstance(pretrained, BoundaryPretrainer):
             raise TypeError(f"--boundary expects a BoundaryPretrainer checkpoint, got {type(pretrained).__name__}")
         encoder = pretrained.encoder.eval()
-        for parameter in encoder.parameters():
-            parameter.requires_grad_(False)
-        mode = "features"
+        boundary_head = pretrained.boundary.eval()
+        for module in (encoder, boundary_head):
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+
+    if args.affinity is not None:
+        mode = args.affinity
+    elif args.boundary is not None:
+        mode = "barrier"
+    else:
+        mode = "intensity"
+    if mode in ("barrier", "features") and encoder is None:
+        raise SystemExit(f"--affinity {mode} requires --boundary")
 
     gate, oracle_dice, recall = [], [], []
     best_ious, n_props, gt_cover, gt_flood = [], [], [], []
@@ -132,20 +142,29 @@ def main() -> int:
         gt_cover.append(float((gt_np & region_np).sum()) / gt_n if gt_n > 0 else 0.0)
         region_frac.append(region_n / float(np.prod(labels.shape)))
 
-        features = None
+        features = barrier = None
         if encoder is not None:
             with torch.no_grad():
-                features = encoder(image.unsqueeze(0) if image.ndim == 3 else image.unsqueeze(0)).squeeze(0)
+                vol = image.unsqueeze(0) if image.ndim == 3 else image
+                if vol.ndim == 4:
+                    vol = vol.unsqueeze(0)
+                feats = encoder(vol).squeeze(0)
+                if mode == "barrier":
+                    barrier = torch.sigmoid(boundary_head(feats.unsqueeze(0))).squeeze()
+                elif mode == "features":
+                    features = feats
 
         proposals, _ = propose_seed_flood(
             image, where,
             features=features,
+            barrier=barrier,
             dilate_radius=dilate_radius,
             region_threshold=region_threshold,
             max_seeds=max_seeds,
             intensity_tol=intensity_tol,
             tol_mode=tol_mode,
             feature_tol=feature_tol,
+            barrier_tol=barrier_tol,
             min_voxels=4,
         )
         n_props.append(int(proposals.shape[0]))
@@ -165,7 +184,9 @@ def main() -> int:
         image_np = image[0].numpy() if image.ndim == 4 else image.numpy()
         seed = (iz, iy, ix)
         if region_np[seed]:
-            if features is not None:
+            if mode == "barrier" and barrier is not None:
+                flooded = _flood_barrier(barrier.numpy(), seed, region_np, barrier_tol=barrier_tol)
+            elif mode == "features" and features is not None:
                 feat_np = normalize_features(features).cpu().numpy()
                 flooded = _flood_features(feat_np, seed, region_np, feature_tol=feature_tol)
             else:
@@ -182,7 +203,7 @@ def main() -> int:
     n = max(len(gate), 1)
     print(
         f"split={args.split} n={len(gate)}  mode={mode} "
-        f"feature_tol={feature_tol} intensity_tol={intensity_tol} r={dilate_radius}"
+        f"barrier_tol={barrier_tol} feature_tol={feature_tol} r={dilate_radius}"
     )
     print(f"mapper_gate (where>0.5 at target centroid): {sum(gate) / n:.4f}")
     print(f"oracle_instance Dice:                     {sum(oracle_dice) / n:.4f}")
