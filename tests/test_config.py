@@ -50,6 +50,7 @@ def test_the_shipped_config_builds_both_stages(cfg):
         max_seeds=int(block.get("instance", {}).get("max_seeds", 16)),
         intensity_tol=float(block.get("instance", {}).get("intensity_tol", 1.0)),
         tol_mode=str(block.get("instance", {}).get("tol_mode", "local_std")),
+        feature_tol=float(block.get("instance", {}).get("feature_tol", 0.30)),
         score_null=float(block.get("instance", {}).get("score_null", 0.5)),
     )
     # The relational half is meant to be small beside the frozen segmenter.

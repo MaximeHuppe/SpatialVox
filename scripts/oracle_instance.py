@@ -7,10 +7,13 @@ Measures, on a corpus split:
 * oracle instance: Dice of the labelled structure whose centroid maximises
   ``where_raw`` (design ceiling ~0.97 on unique prompts);
 * seed-flood recall@K: whether some proposal overlaps the GT body (IoU ≥ 0.5);
-* diagnostics: mean best IoU, mean K, GT coverage by the dilated region,
-  and flood-from-GT-centroid IoU (upper bound on intensity flood alone).
+* diagnostics: best IoU, K, GT coverage, proposal/region size, flood-from-GT.
 
-    scripts/oracle_instance.py --split val --limit 200
+Pass ``--boundary runs/boundary/.../best.pt`` to flood on frozen ``B`` features
+(cosine distance) instead of intensity.
+
+    scripts/oracle_instance.py --split val --limit 200 \\
+      --boundary runs/boundary/instance-pretext/best.pt
 """
 
 from __future__ import annotations
@@ -26,15 +29,19 @@ import torch
 
 from src.config import load_config, parse_overrides
 from src.data import Corpus, ExampleDataset
-from src.engine import dice_iou
+from src.engine import dice_iou, load_model
 from src.geometry import volume_center_world
 from src.instance import (
+    _flood_features,
     _flood_intensity,
     _resolve_intensity_tol,
+    normalize_features,
     oracle_label_instances,
     propose_seed_flood,
     region_mask,
 )
+from src.mapper import PositionalMapper3D
+from src.models import BoundaryPretrainer
 
 
 def _cfg_get(block, key, default):
@@ -50,6 +57,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
     parser.add_argument("--limit", type=int, default=200)
+    parser.add_argument("--boundary", type=Path, help="BoundaryPretrainer checkpoint → feature affinity")
     parser.add_argument("--config", type=Path)
     parser.add_argument("--set", dest="overrides", action="append")
     args = parser.parse_args()
@@ -61,8 +69,6 @@ def main() -> int:
         corpus, args.split, targets=targets, limit=args.limit,
         normalize_mode=cfg.data.normalize,
     )
-    from src.mapper import PositionalMapper3D
-
     mapper = PositionalMapper3D(
         tau=float(cfg.model.stage_b.mapper.tau),
         min_mass=float(cfg.model.stage_b.mapper.min_mass),
@@ -71,8 +77,20 @@ def main() -> int:
     dilate_radius = int(_cfg_get(inst, "dilate_radius", 4))
     intensity_tol = float(_cfg_get(inst, "intensity_tol", 1.0))
     tol_mode = str(_cfg_get(inst, "tol_mode", "local_std"))
+    feature_tol = float(_cfg_get(inst, "feature_tol", 0.30))
     region_threshold = float(_cfg_get(inst, "region_threshold", 0.5))
     max_seeds = int(_cfg_get(inst, "max_seeds", 16))
+
+    encoder = None
+    mode = "intensity"
+    if args.boundary is not None:
+        pretrained = load_model(args.boundary)
+        if not isinstance(pretrained, BoundaryPretrainer):
+            raise TypeError(f"--boundary expects a BoundaryPretrainer checkpoint, got {type(pretrained).__name__}")
+        encoder = pretrained.encoder.eval()
+        for parameter in encoder.parameters():
+            parameter.requires_grad_(False)
+        mode = "features"
 
     gate, oracle_dice, recall = [], [], []
     best_ious, n_props, gt_cover, gt_flood = [], [], [], []
@@ -114,13 +132,20 @@ def main() -> int:
         gt_cover.append(float((gt_np & region_np).sum()) / gt_n if gt_n > 0 else 0.0)
         region_frac.append(region_n / float(np.prod(labels.shape)))
 
+        features = None
+        if encoder is not None:
+            with torch.no_grad():
+                features = encoder(image.unsqueeze(0) if image.ndim == 3 else image.unsqueeze(0)).squeeze(0)
+
         proposals, _ = propose_seed_flood(
             image, where,
+            features=features,
             dilate_radius=dilate_radius,
             region_threshold=region_threshold,
             max_seeds=max_seeds,
             intensity_tol=intensity_tol,
             tol_mode=tol_mode,
+            feature_tol=feature_tol,
             min_voxels=4,
         )
         n_props.append(int(proposals.shape[0]))
@@ -135,19 +160,19 @@ def main() -> int:
                 hit = True
         best_ious.append(best)
         recall.append(hit)
-        if sizes and region_n > 0:
-            prop_frac.append(max(sizes) / region_n)
-        else:
-            prop_frac.append(0.0)
+        prop_frac.append(max(sizes) / region_n if sizes and region_n > 0 else 0.0)
 
-        # Upper bound: flood from the GT centroid with the same tolerance.
         image_np = image[0].numpy() if image.ndim == 4 else image.numpy()
         seed = (iz, iy, ix)
         if region_np[seed]:
-            tol = _resolve_intensity_tol(
-                image_np, region_np, intensity_tol, tol_mode=tol_mode, seed=seed,
-            )
-            flooded = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
+            if features is not None:
+                feat_np = normalize_features(features).cpu().numpy()
+                flooded = _flood_features(feat_np, seed, region_np, feature_tol=feature_tol)
+            else:
+                tol = _resolve_intensity_tol(
+                    image_np, region_np, intensity_tol, tol_mode=tol_mode, seed=seed,
+                )
+                flooded = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
             gt_flood.append(float(dice_iou(
                 torch.from_numpy(flooded.astype(np.float32))[None, None], gt
             )[1].reshape(-1)[0]))
@@ -155,7 +180,10 @@ def main() -> int:
             gt_flood.append(0.0)
 
     n = max(len(gate), 1)
-    print(f"split={args.split} n={len(gate)}  tol_mode={tol_mode} intensity_tol={intensity_tol} r={dilate_radius}")
+    print(
+        f"split={args.split} n={len(gate)}  mode={mode} "
+        f"feature_tol={feature_tol} intensity_tol={intensity_tol} r={dilate_radius}"
+    )
     print(f"mapper_gate (where>0.5 at target centroid): {sum(gate) / n:.4f}")
     print(f"oracle_instance Dice:                     {sum(oracle_dice) / n:.4f}")
     print(f"seed_flood recall@K (IoU≥0.5):            {sum(recall) / n:.4f}")

@@ -649,6 +649,7 @@ class StageB(nn.Module):
         max_seeds: int = 16,
         intensity_tol: float = 1.0,
         tol_mode: str = "local_std",
+        feature_tol: float = 0.30,
         score_null: float = 0.5,
     ) -> None:
         super().__init__()
@@ -666,7 +667,8 @@ class StageB(nn.Module):
             background_logit=float(background_logit), prior_foreground=float(prior_foreground),
             dilate_radius=int(dilate_radius), region_threshold=float(region_threshold),
             max_seeds=int(max_seeds), intensity_tol=float(intensity_tol),
-            tol_mode=str(tol_mode), score_null=float(score_null),
+            tol_mode=str(tol_mode), feature_tol=float(feature_tol),
+            score_null=float(score_null),
         )
         self.n_anchors = int(n_anchors)
         self.spacing = tuple(float(v) for v in spacing)
@@ -680,6 +682,7 @@ class StageB(nn.Module):
         self.max_seeds = int(max_seeds)
         self.intensity_tol = float(intensity_tol)
         self.tol_mode = str(tol_mode)
+        self.feature_tol = float(feature_tol)
         self.score_null = float(score_null)
 
         self.segmenter = StageA(**segmenter)
@@ -788,17 +791,24 @@ class StageB(nn.Module):
         """Seed-flood + rule score. No relational mask gradients into G."""
         source = image if boundary_image is None else boundary_image
         batch = source.shape[0]
+        features = None
+        if self.boundary is not None:
+            with torch.no_grad():
+                features = self.boundary(source.to(torch.float32))
         logits, centroids, valid = [], [], []
         for i in range(batch):
+            feat_i = None if features is None else features[i]
             result = run_instance(
                 source[i],
                 field.where_raw[i],
                 self.spacing,
+                features=feat_i,
                 dilate_radius=self.dilate_radius,
                 region_threshold=self.region_threshold,
                 max_seeds=self.max_seeds,
                 intensity_tol=self.intensity_tol,
                 tol_mode=self.tol_mode,
+                feature_tol=self.feature_tol,
                 score_null=self.score_null,
             )
             # Finite background so BCE against a disagreeing target stays finite.

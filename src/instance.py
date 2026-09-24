@@ -180,21 +180,70 @@ def _flood_intensity(
     return out
 
 
+def _flood_features(
+    features: np.ndarray,
+    seed: tuple[int, int, int],
+    region: np.ndarray,
+    *,
+    feature_tol: float,
+) -> np.ndarray:
+    """6-connected flood: keep voxels whose feature is within ``feature_tol`` of the seed.
+
+    ``features`` is ``[C, D, H, W]``, L2-normalised along ``C``. Distance is
+    ``1 - cosine`` (= half squared L2 on the unit sphere), so ``feature_tol`` is
+    in ``[0, 2]``; ~0.2–0.4 is a typical starting band on boundary features.
+    """
+    channels, depth, height, width = features.shape
+    out = np.zeros((depth, height, width), dtype=bool)
+    if not region[seed]:
+        return out
+    seed_f = features[(slice(None), *seed)].astype(np.float32)
+    stack = [seed]
+    out[seed] = True
+    while stack:
+        z, y, x = stack.pop()
+        for dz, dy, dx in ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)):
+            nz, ny, nx = z + dz, y + dy, x + dx
+            if not (0 <= nz < depth and 0 <= ny < height and 0 <= nx < width):
+                continue
+            if out[nz, ny, nx] or not region[nz, ny, nx]:
+                continue
+            neigh = features[:, nz, ny, nx]
+            # 1 - cos; both vectors unit-norm.
+            dist = 1.0 - float(np.dot(seed_f, neigh))
+            if dist > feature_tol:
+                continue
+            out[nz, ny, nx] = True
+            stack.append((nz, ny, nx))
+    return out
+
+
+def normalize_features(features: Tensor) -> Tensor:
+    """L2-normalise ``[C, D, H, W]`` or ``[B, C, D, H, W]`` along the channel axis."""
+    if features.ndim == 4:
+        return F.normalize(features.float(), dim=0, eps=EPS)
+    if features.ndim == 5:
+        return F.normalize(features.float(), dim=1, eps=EPS)
+    raise ValueError(f"features must be [C,D,H,W] or [B,C,D,H,W], got {tuple(features.shape)}")
+
+
 def propose_seed_flood(
     image: Tensor,
     where_raw: Tensor,
     *,
+    features: Tensor | None = None,
     dilate_radius: int = 4,
     region_threshold: float = 0.5,
     max_seeds: int = 16,
     intensity_tol: float = 1.0,
     tol_mode: str = "local_std",
+    feature_tol: float = 0.30,
     min_voxels: int = 8,
 ) -> tuple[Tensor, Tensor]:
     """Seed-flood proposals inside the relational region.
 
-    ``intensity_tol`` is an absolute band when ``tol_mode='absolute'``, otherwise
-    a multiple of a local (or region) intensity std. MRI default is ``local_std``.
+    When ``features`` (``[C,D,H,W]`` from frozen ``B``) is given, flood by
+    cosine distance to the seed feature. Otherwise fall back to intensity.
     """
     if image.ndim == 4:
         image = image[0]
@@ -202,7 +251,6 @@ def propose_seed_flood(
         where_raw = where_raw[0]
     region = region_mask(where_raw, region_threshold, dilate_radius)[0, 0]
     seeds = local_maxima_seeds(where_raw, region, max_seeds=max_seeds, image=image)
-    # Always keep the region's where_raw argmax — local-max pool can miss a flat peak.
     flat = (where_raw.float() * (region > 0.5).float()).flatten()
     if flat.numel() and float(flat.max()) > 0:
         idx = int(flat.argmax())
@@ -212,9 +260,6 @@ def propose_seed_flood(
             seeds = [peak, *seeds][:max_seeds]
     image_np = image.detach().float().cpu().numpy()
     region_np = region.detach().cpu().numpy() > 0.5
-    # Drop near-median seeds: a roomy where_raw plateau over CSF/background
-    # otherwise grows a large empty body whose centroid still sits in the field
-    # and outscores the real structure under the pure where(centroid) rule.
     if region_np.any():
         median = float(np.median(image_np[region_np]))
         spread = float(np.std(image_np[region_np])) + 1e-6
@@ -222,12 +267,23 @@ def propose_seed_flood(
             s for s in seeds
             if abs(float(image_np[s]) - median) >= 0.25 * spread
         ] or seeds
+
+    feat_np = None
+    if features is not None:
+        feat = features
+        while feat.ndim > 4:
+            feat = feat[0]
+        feat_np = normalize_features(feat).detach().cpu().numpy()
+
     bodies: list[np.ndarray] = []
     for seed in seeds:
-        tol = _resolve_intensity_tol(
-            image_np, region_np, intensity_tol, tol_mode=tol_mode, seed=seed,
-        )
-        body = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
+        if feat_np is not None:
+            body = _flood_features(feat_np, seed, region_np, feature_tol=float(feature_tol))
+        else:
+            tol = _resolve_intensity_tol(
+                image_np, region_np, intensity_tol, tol_mode=tol_mode, seed=seed,
+            )
+            body = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
         if int(body.sum()) < int(min_voxels):
             continue
         if any(float((body & other).sum()) / max(float(body.sum()), 1.0) > 0.9 for other in bodies):
@@ -286,22 +342,26 @@ def run_instance(
     where_raw: Tensor,
     spacing: Sequence[float],
     *,
+    features: Tensor | None = None,
     dilate_radius: int = 4,
     region_threshold: float = 0.5,
     max_seeds: int = 16,
     intensity_tol: float = 1.0,
     tol_mode: str = "local_std",
+    feature_tol: float = 0.30,
     min_voxels: int = 8,
     score_null: float = 0.5,
 ) -> InstanceResult:
     """End-to-end propose → score → pick for one sample."""
     proposals, region = propose_seed_flood(
         image, where_raw,
+        features=features,
         dilate_radius=dilate_radius,
         region_threshold=region_threshold,
         max_seeds=max_seeds,
         intensity_tol=intensity_tol,
         tol_mode=tol_mode,
+        feature_tol=feature_tol,
         min_voxels=min_voxels,
     )
     scores, centroids = score_proposals(proposals, where_raw, spacing)

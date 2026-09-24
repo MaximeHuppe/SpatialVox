@@ -142,6 +142,7 @@ model:
       max_seeds: 16
       intensity_tol: 1.0
       tol_mode: local_std
+      feature_tol: 0.30
       score_null: 0.5
     carver:
       width: 16

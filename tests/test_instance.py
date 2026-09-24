@@ -123,6 +123,24 @@ def test_stage_b_instance_mode_has_no_carver_and_names_still_stop_at_stage_a():
     assert torch.equal(out.logits, again.logits)
 
 
+def test_feature_flood_grows_a_homogeneous_feature_blob():
+    """Cosine flood follows a constant feature body and stops at a different code."""
+    image = torch.zeros(1, 16, 16, 16)
+    image[0, 4:10, 4:10, 4:10] = 1.0
+    where = torch.zeros(1, 16, 16, 16)
+    where[0, 3:11, 3:11, 3:11] = 0.9
+    features = torch.zeros(4, 16, 16, 16)
+    features[0, 4:10, 4:10, 4:10] = 1.0
+    features[1, 4:10, 4:10, 11:14] = 1.0  # different code next door
+    proposals, _ = propose_seed_flood(
+        image, where, features=features, dilate_radius=0, max_seeds=4,
+        feature_tol=0.2, min_voxels=4,
+    )
+    assert proposals.shape[0] >= 1
+    good = [p for p in proposals if float(p[6, 6, 6]) == 1.0 and float(p[6, 6, 12]) == 0.0]
+    assert good
+
+
 def test_run_instance_end_to_end_on_a_toy_conjunction():
     image = torch.zeros(1, RESOLUTION, RESOLUTION, RESOLUTION)
     image[0, 16:20, 16:20, 16:20] = 1.0

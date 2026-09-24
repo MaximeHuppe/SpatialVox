@@ -114,8 +114,9 @@ model:
       dilate_radius: 4            # ADR: start at 4; measure coverage vs neighbour invasion
       region_threshold: 0.5
       max_seeds: 16
-      intensity_tol: 1.0          # scale on local std(I) around each seed
-      tol_mode: local_std         # local_std | std | absolute — region-wide std over-grows on MRI
+      intensity_tol: 1.0          # scale on local std(I) around each seed (intensity fallback)
+      tol_mode: local_std         # local_std | std | absolute — used only without B features
+      feature_tol: 0.30           # 1 - cosine(seed, voxel) when flooding on frozen B features
       score_null: 0.5             # empty answer when best where_raw(centroid) is below this
     carver:
       width: 16                   # B2 parent path only (`answer_mode: carver`)
