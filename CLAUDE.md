@@ -108,8 +108,19 @@ side would not narrow the conjunction.
 
 **Anchor-first only.** The triple is fixed first and the targets follow, so one
 anchor set serves several targets and only the direction words tell them apart.
-A triple whose conjunction is not unique is dropped, so well-posedness holds by
-construction — measured, **100%** of manifest prompts name exactly one structure.
+A triple whose conjunction is not unique **on that scene** is dropped, so
+per-scene well-posedness holds by construction.
+
+**Global triple stability.** Per-scene uniqueness is not enough on real MRI: the
+same unordered set of `(anchor name, direction)` pairs can uniquely mean
+Left-Thalamus on one subject and Left-Caudate on another. After per-scene
+generation, `stabilize_relational_manifests` keeps a row only when **every** use
+of its triple across the corpus names the **same** target. Unstable triples are
+removed entirely. That guarantees a held-out-target prompt never reuses a triple
+that supervised a trained target. Rebuild with `scripts/rebuild_manifests.py`
+(or re-import); `meta.json` records `triple_stability: global-unique-target`.
+Audit with `scripts/triple_cross_patient.py` — `triples_with_different_targets`
+must be 0.
 
 The target-first generator is **deleted, not configurable**. It picked the
 anchors nearest the target, which on fixed anatomy made the anchor identities a
