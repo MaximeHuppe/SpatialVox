@@ -70,12 +70,13 @@ def main() -> int:
     inst = cfg.model.stage_b.get("instance", {})
     dilate_radius = int(_cfg_get(inst, "dilate_radius", 4))
     intensity_tol = float(_cfg_get(inst, "intensity_tol", 1.0))
-    tol_mode = str(_cfg_get(inst, "tol_mode", "std"))
+    tol_mode = str(_cfg_get(inst, "tol_mode", "local_std"))
     region_threshold = float(_cfg_get(inst, "region_threshold", 0.5))
     max_seeds = int(_cfg_get(inst, "max_seeds", 16))
 
     gate, oracle_dice, recall = [], [], []
     best_ious, n_props, gt_cover, gt_flood = [], [], [], []
+    prop_frac, region_frac = [], []
     for item in dataset:
         labels = item["labels"].numpy()
         target = int(item["target"])
@@ -106,8 +107,12 @@ def main() -> int:
 
         image = item["image"]
         region = region_mask(where, region_threshold, dilate_radius)[0, 0]
-        gt_np = (labels == target)
-        gt_cover.append(float(gt_np[region.numpy() > 0.5].mean()) if gt_np.any() else 0.0)
+        region_np = region.numpy() > 0.5
+        gt_np = labels == target
+        gt_n = float(gt_np.sum())
+        region_n = float(region_np.sum())
+        gt_cover.append(float((gt_np & region_np).sum()) / gt_n if gt_n > 0 else 0.0)
+        region_frac.append(region_n / float(np.prod(labels.shape)))
 
         proposals, _ = propose_seed_flood(
             image, where,
@@ -121,20 +126,27 @@ def main() -> int:
         n_props.append(int(proposals.shape[0]))
         best = 0.0
         hit = False
+        sizes = []
         for k in range(proposals.shape[0]):
+            sizes.append(float(proposals[k].sum()))
             iou = float(dice_iou(proposals[k][None, None], gt)[1].reshape(-1)[0])
             best = max(best, iou)
             if iou >= 0.5:
                 hit = True
         best_ious.append(best)
         recall.append(hit)
+        if sizes and region_n > 0:
+            prop_frac.append(max(sizes) / region_n)
+        else:
+            prop_frac.append(0.0)
 
         # Upper bound: flood from the GT centroid with the same tolerance.
         image_np = image[0].numpy() if image.ndim == 4 else image.numpy()
-        region_np = region.numpy() > 0.5
         seed = (iz, iy, ix)
         if region_np[seed]:
-            tol = _resolve_intensity_tol(image_np, region_np, intensity_tol, tol_mode=tol_mode)
+            tol = _resolve_intensity_tol(
+                image_np, region_np, intensity_tol, tol_mode=tol_mode, seed=seed,
+            )
             flooded = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
             gt_flood.append(float(dice_iou(
                 torch.from_numpy(flooded.astype(np.float32))[None, None], gt
@@ -150,6 +162,8 @@ def main() -> int:
     print(f"mean best IoU over proposals:             {sum(best_ious) / n:.4f}")
     print(f"mean K proposals:                         {sum(n_props) / n:.2f}")
     print(f"mean GT voxel coverage by dilated region: {sum(gt_cover) / n:.4f}")
+    print(f"mean region volume fraction:              {sum(region_frac) / n:.4f}")
+    print(f"mean max-proposal / region size:          {sum(prop_frac) / n:.4f}")
     print(f"mean IoU flood-from-GT-centroid:           {sum(gt_flood) / n:.4f}")
     return 0
 

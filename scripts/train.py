@@ -161,7 +161,7 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         region_threshold=float(model_cfg.get("instance", {}).get("region_threshold", 0.5)),
         max_seeds=int(model_cfg.get("instance", {}).get("max_seeds", 16)),
         intensity_tol=float(model_cfg.get("instance", {}).get("intensity_tol", 1.0)),
-        tol_mode=str(model_cfg.get("instance", {}).get("tol_mode", "std")),
+        tol_mode=str(model_cfg.get("instance", {}).get("tol_mode", "local_std")),
         score_null=float(model_cfg.get("instance", {}).get("score_null", 0.5)),
     )
     checkpoint = stage_cfg.get("boundary_checkpoint")

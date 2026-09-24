@@ -109,24 +109,45 @@ def _resolve_intensity_tol(
     region: np.ndarray,
     intensity_tol: float,
     *,
-    tol_mode: str = "std",
+    tol_mode: str = "local_std",
+    seed: tuple[int, int, int] | None = None,
+    local_radius: int = 2,
 ) -> float:
-    """Absolute intensity band, or a multiple of ``std(I | region)``.
+    """Intensity band for the flood.
 
-    Fixed ``0.15`` is fine on synthetic unit-range blobs and far too tight on
-    z-scored MRI, where within-structure texture routinely exceeds that. The
-    shipped default is therefore ``tol_mode='std'`` with ``intensity_tol`` as a
-    scale on the region's intensity std.
+    * ``absolute`` — fixed band (synthetic unit-range blobs).
+    * ``std`` — ``intensity_tol * std(I | region)``. Too loose on MRI: a relational
+      region spans several tissues, so the std is large and the flood eats the
+      whole region (~0.11 IoU = one structure / region).
+    * ``local_std`` (MRI default) — ``intensity_tol * std(I)`` in a small window
+      around the seed, restricted to the region. Matches within-structure texture
+      without inheriting the multi-structure region std.
     """
     scale = max(float(intensity_tol), 0.0)
     if tol_mode == "absolute":
         return max(scale, 1e-6)
-    if tol_mode != "std":
-        raise ValueError(f"tol_mode must be 'std' or 'absolute', got {tol_mode!r}")
-    vals = image[region]
-    if vals.size == 0:
-        return max(scale, 1e-6)
-    return max(scale * float(vals.std()), 1e-4)
+    if tol_mode == "std":
+        vals = image[region]
+        if vals.size == 0:
+            return max(scale, 1e-6)
+        return max(scale * float(vals.std()), 1e-4)
+    if tol_mode != "local_std":
+        raise ValueError(f"tol_mode must be 'local_std', 'std', or 'absolute', got {tol_mode!r}")
+    if seed is None:
+        vals = image[region]
+        return max(scale * float(vals.std()) if vals.size else scale, 1e-4)
+    depth, height, width = image.shape
+    z, y, x = seed
+    r = int(local_radius)
+    z0, z1 = max(0, z - r), min(depth, z + r + 1)
+    y0, y1 = max(0, y - r), min(height, y + r + 1)
+    x0, x1 = max(0, x - r), min(width, x + r + 1)
+    patch = image[z0:z1, y0:y1, x0:x1]
+    support = region[z0:z1, y0:y1, x0:x1]
+    vals = patch[support]
+    if vals.size < 8:
+        vals = image[region]
+    return max(scale * float(vals.std()) if vals.size else scale, 1e-4)
 
 
 def _flood_intensity(
@@ -167,13 +188,13 @@ def propose_seed_flood(
     region_threshold: float = 0.5,
     max_seeds: int = 16,
     intensity_tol: float = 1.0,
-    tol_mode: str = "std",
+    tol_mode: str = "local_std",
     min_voxels: int = 8,
 ) -> tuple[Tensor, Tensor]:
     """Seed-flood proposals inside the relational region.
 
     ``intensity_tol`` is an absolute band when ``tol_mode='absolute'``, otherwise
-    a multiple of ``std(I)`` inside the region (MRI default).
+    a multiple of a local (or region) intensity std. MRI default is ``local_std``.
     """
     if image.ndim == 4:
         image = image[0]
@@ -191,7 +212,6 @@ def propose_seed_flood(
             seeds = [peak, *seeds][:max_seeds]
     image_np = image.detach().float().cpu().numpy()
     region_np = region.detach().cpu().numpy() > 0.5
-    tol = _resolve_intensity_tol(image_np, region_np, intensity_tol, tol_mode=tol_mode)
     # Drop near-median seeds: a roomy where_raw plateau over CSF/background
     # otherwise grows a large empty body whose centroid still sits in the field
     # and outscores the real structure under the pure where(centroid) rule.
@@ -204,6 +224,9 @@ def propose_seed_flood(
         ] or seeds
     bodies: list[np.ndarray] = []
     for seed in seeds:
+        tol = _resolve_intensity_tol(
+            image_np, region_np, intensity_tol, tol_mode=tol_mode, seed=seed,
+        )
         body = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
         if int(body.sum()) < int(min_voxels):
             continue
@@ -267,7 +290,7 @@ def run_instance(
     region_threshold: float = 0.5,
     max_seeds: int = 16,
     intensity_tol: float = 1.0,
-    tol_mode: str = "std",
+    tol_mode: str = "local_std",
     min_voxels: int = 8,
     score_null: float = 0.5,
 ) -> InstanceResult:

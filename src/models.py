@@ -648,7 +648,7 @@ class StageB(nn.Module):
         region_threshold: float = 0.5,
         max_seeds: int = 16,
         intensity_tol: float = 1.0,
-        tol_mode: str = "std",
+        tol_mode: str = "local_std",
         score_null: float = 0.5,
     ) -> None:
         super().__init__()
