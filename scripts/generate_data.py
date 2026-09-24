@@ -42,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.config import load_config, parse_overrides
-from src.data import build_examples, write_corpus, write_scene
+from src.data import build_examples, stabilize_relational_manifests, write_corpus, write_scene
 from src.synthetic import SHAPE_NAMES, generate_scene
 from src.vocab import Vocabulary
 
@@ -121,6 +121,13 @@ def main() -> int:
             print(f"\r{split} {index + 1}/{n}  {len(manifests[split])} examples", end="", flush=True)
         print()
 
+    manifests, stab = stabilize_relational_manifests(manifests, vocab)
+    print(
+        f"triple stability: kept {stab['examples_kept']}  "
+        f"dropped {stab['examples_dropped_unstable_triple']}  "
+        f"({stab['triples_colliding']}/{stab['triples_total']} colliding triples)"
+    )
+
     write_corpus(
         root, vocab, manifests,
         shape=shape, spacing=spacing, n_anchors=int(data.n_anchors),
@@ -130,6 +137,8 @@ def main() -> int:
             "source": "synthetic",
             "appearance": appearance,
             "threshold_iou": round(iou, 4),
+            "triple_stability": "global-unique-target",
+            "triple_stability_stats": stab,
         },
     )
     print(f"\nwritten to {root}: " + ", ".join(f"{k} {len(v)}" for k, v in manifests.items()))

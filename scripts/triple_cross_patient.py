@@ -28,16 +28,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.config import load_config
-from src.data import Corpus, build_examples, write_corpus, write_scene
+from src.data import Corpus, build_examples, relational_triple_key, write_corpus, write_scene
 from src.vocab import Vocabulary
 
 
 def triple_key(row: dict, vocab) -> frozenset[tuple[str, str]]:
-    """Order-invariant relational triple: set of (anchor_name, direction)."""
-    return frozenset(
-        (vocab.name(int(a)), str(d))
-        for a, d in zip(row["anchors"], row["directions"])
-    )
+    return relational_triple_key(row, vocab)
 
 
 def load_all_rows(corpus: Corpus) -> list[dict]:

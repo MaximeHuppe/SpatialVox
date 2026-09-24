@@ -161,6 +161,67 @@ def build_examples(
     return examples
 
 
+def relational_triple_key(row: Mapping[str, Any], vocab: Vocabulary) -> frozenset[tuple[str, str]]:
+    """Order-invariant relational triple: unordered ``(anchor name, direction)`` pairs.
+
+    Clause order is shuffled at generation, so identity is the *set* of pairs,
+    not the slot sequence. Pairing is preserved: ``superior to X, medial to Y``
+    is not the same triple as ``superior to Y, medial to X``.
+    """
+    anchors, directions = row["anchors"], row["directions"]
+    if len(anchors) != len(directions):
+        raise ValueError(
+            f"anchors and directions must have the same length, got "
+            f"{len(anchors)} and {len(directions)}"
+        )
+    return frozenset((vocab.name(int(a)), str(d)) for a, d in zip(anchors, directions))
+
+
+def stabilize_relational_manifests(
+    manifests: Mapping[str, Sequence[Mapping[str, Any]]],
+    vocab: Vocabulary,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
+    """Drop triples that name different targets on different subjects.
+
+    Per-scene uniqueness (``solutions_for`` length 1) is not enough on real MRI:
+    the same ``(anchor, direction)`` set can uniquely mean Left-Thalamus on one
+    subject and Left-Caudate on another. Training then teaches "this sentence →
+    paint a trained class", and held-out eval of the same sentence fails.
+
+    This pass keeps a row only when **every** use of its triple across the whole
+    corpus (all splits) names the **same** target structure. Unstable triples are
+    removed entirely. That guarantees a held-out-target prompt never reuses a
+    triple that supervised a trained target (and the converse).
+
+    Returns ``(filtered_manifests, stats)`` with counts of kept / dropped rows
+    and how many distinct triples were stable vs colliding.
+    """
+    by_key: dict[frozenset[tuple[str, str]], set[str]] = {}
+    for rows in manifests.values():
+        for row in rows:
+            key = relational_triple_key(row, vocab)
+            by_key.setdefault(key, set()).add(vocab.name(int(row["target"])))
+    stable = {key for key, names in by_key.items() if len(names) == 1}
+
+    filtered: dict[str, list[dict[str, Any]]] = {split: [] for split in manifests}
+    kept = dropped = 0
+    for split, rows in manifests.items():
+        for row in rows:
+            if relational_triple_key(row, vocab) in stable:
+                filtered[split].append(dict(row))
+                kept += 1
+            else:
+                dropped += 1
+    stats = {
+        "examples_kept": kept,
+        "examples_dropped_unstable_triple": dropped,
+        "triples_stable": len(stable),
+        "triples_colliding": len(by_key) - len(stable),
+        "triples_total": len(by_key),
+    }
+    return filtered, stats
+
+
 def write_scene(root: Path | str, scene_id: str, image: np.ndarray, labels: np.ndarray, spacing) -> Path:
     """Write one scene's two volumes."""
     directory = Path(root) / "scenes" / scene_id
@@ -253,6 +314,12 @@ def import_corpus(
             manifests[split] += build_examples(scene_id, labels, vocab, spacing, n_anchors)
     if shape is None:
         raise ValueError("no scenes to import")
+    manifests, stab = stabilize_relational_manifests(manifests, vocab)
+    meta_extra = {
+        **dict(extra or {}),
+        "triple_stability": "global-unique-target",
+        "triple_stability_stats": stab,
+    }
     return write_corpus(
         root,
         vocab,
@@ -261,7 +328,7 @@ def import_corpus(
         spacing=spacing,
         n_anchors=n_anchors,
         targets=targets or {split: list(vocab.names) for split in splits},
-        extra=extra,
+        extra=meta_extra,
     )
 
 

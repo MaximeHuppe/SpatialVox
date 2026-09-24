@@ -34,7 +34,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.config import load_config, parse_overrides
-from src.data import build_examples, load_nifti, write_corpus, write_scene
+from src.data import (
+    build_examples, load_nifti, stabilize_relational_manifests, write_corpus, write_scene,
+)
 from src.mri import (
     download_subject,
     label_names,
@@ -156,6 +158,8 @@ def main() -> int:
                 locality=int(cfg.data.get("locality", 8)),
                 stats=stats,
             )
+    manifests, stab = stabilize_relational_manifests(manifests, vocab)
+    stats.update(stab)
     write_corpus(
         output,
         vocab,
@@ -171,10 +175,18 @@ def main() -> int:
             "n_subjects": len(kept),
             "skipped": skipped,
             "origin": str(source),
+            "triple_stability": "global-unique-target",
+            "triple_stability_stats": stab,
         },
     )
     if stats.get("dropped_ambiguous"):
         print(f"dropped {stats['dropped_ambiguous']} examples whose clauses matched more than one structure")
+    if stab.get("examples_dropped_unstable_triple"):
+        print(
+            f"dropped {stab['examples_dropped_unstable_triple']} examples whose triple "
+            f"named different targets across subjects "
+            f"({stab['triples_colliding']}/{stab['triples_total']} triples colliding)"
+        )
     if stats.get("pool_fallbacks"):
         print(
             f"WARNING: {stats['pool_fallbacks']} examples fell back to the deterministic"
