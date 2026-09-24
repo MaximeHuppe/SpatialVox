@@ -1111,6 +1111,11 @@ class Trainer:
             f"  epoch {epoch:>3}  loss {train['loss']:.4f}  train dice {train['dice']:.4f}",
             f"  val dice {val.get('dice', 0.0):.4f}",
         ]
+        # Overfit's transfer number. Val above is the memorised prompts; this is
+        # one other subject, so it sits with those two Dice and is not repeated
+        # with the full-run curves below.
+        if "hold" in record:
+            parts.append(f"  hold {float(record['hold'].get('dice', 0.0)):.4f}")
         for key, label, fmt in (
             ("centroid_error", "centr", "{:.2f}"), ("null_auc", "null", "{:.3f}"),
             ("empty_rate", "empty", "{:.2f}"),
@@ -1121,10 +1126,11 @@ class Trainer:
             if key in record["val"]:
                 parts.append(f"  {key.split('_')[0][:4]} {record['val'][key]:+.3f}")
         for name in self.extra_loaders:
-            if name in record:
-                parts.append(f"  {name} {record[name].get('dice', 0.0):.4f}")
-                if "empty_rate" in record[name]:
-                    parts.append(f" (empty {record[name]['empty_rate']:.2f})")
+            if name == "hold" or name not in record:
+                continue
+            parts.append(f"  {name} {record[name].get('dice', 0.0):.4f}")
+            if "empty_rate" in record[name]:
+                parts.append(f" (empty {record[name]['empty_rate']:.2f})")
         return "".join(parts) + f"  ({record['seconds']}s)"
 
     def _meta(self, epoch: int, metrics: Mapping[str, Any]) -> dict[str, Any]:

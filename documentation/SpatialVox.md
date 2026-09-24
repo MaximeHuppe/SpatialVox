@@ -609,7 +609,7 @@ Stage A is frozen and Stage B does not rotate, so `sigmoid(anchor_logits)` for a
 | `val:targets.test` | val split, `targets.test` | 600 | off | further held-out curve, never selected on |
 | probes | val split, `targets.train` | 200 (`train.probe_examples`) | off | per-epoch counterfactual drops |
 
-The validation subsets are random with a **fixed seed**, not a prefix, because slicing a manifest by order would validate on its first few subjects only. The two held-out curves are named after the split they are drawn from: **both use val-split subjects**. The test split is not touched until `scripts/evaluate.py --split test`. `--overfit N` restricts train and val to the first `N` training scenes and turns the flip off.
+The validation subsets are random with a **fixed seed**, not a prefix, because slicing a manifest by order would validate on its first few subjects only. The two held-out curves are named after the split they are drawn from: **both use val-split subjects**. The test split is not touched until `scripts/evaluate.py --split test`. `--overfit N` restricts train and val to the first `N` training scenes and turns the flip off. It does not report those two curves. `hold`, printed beside train and val, is Dice on `targets.val` and `targets.test` together, on the first val-split subject that is not an overfit scene. That image never enters the loss.
 
 ### 7.7 Stage A's own dataset
 

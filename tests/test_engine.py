@@ -404,6 +404,70 @@ def test_two_empty_masks_score_one_and_one_empty_against_one_full_scores_zero():
     assert np.isnan(hausdorff(empty[0, 0], full[0, 0]))
 
 
+def test_overfit_hold_is_another_subject_with_the_held_out_names(corpus):
+    """``--overfit`` scores caudate/putamen/hippocampus on a subject it does not train."""
+    from scripts.train import stage_b
+    from src.config import load_config
+
+    targets = corpus.meta["targets"]
+    cfg = load_config(overrides={
+        "targets.train": list(targets["train"]),
+        "targets.val": list(targets["val"]),
+        "targets.test": list(targets["test"]),
+        "model.stage_b.boundary_widths": [4, 8],
+        "model.stage_b.carver.width": 4,
+        "model.stage_b.carver.blocks": 1,
+    })
+    segmenter = tiny_stage_a(len(corpus.vocab), min(corpus.shape))
+    datasets, _task, extra = stage_b(cfg, corpus, 1, segmenter, None)
+
+    train_scenes = {row["scene"] for row in datasets["train"].records}
+    val_scenes = {row["scene"] for row in datasets["val"].records}
+    assert train_scenes == {"train_0"}
+    assert val_scenes == train_scenes
+
+    hold = extra["hold"]
+    hold_scenes = {row["scene"] for row in hold.records}
+    assert hold_scenes == {"val_0"}
+    assert hold_scenes.isdisjoint(train_scenes)
+
+    held_out = set(targets["val"]) | set(targets["test"])
+    names = set(hold.target_counts())
+    expected = {
+        corpus.vocab.name(row["target"])
+        for row in corpus.records("val", list(held_out))
+        if row["scene"] == "val_0"
+    }
+    assert names == expected
+    assert names <= held_out
+    assert names.isdisjoint(set(targets["train"]))
+    assert names
+
+    _datasets, _task, full = stage_b(cfg, corpus, None, segmenter, None)
+    assert "hold" not in full
+    assert set(full) == {"val:targets.val", "val:targets.test"}
+
+
+def test_the_epoch_line_prints_hold_beside_train_and_val():
+    trainer = Trainer.__new__(Trainer)
+    trainer.extra_loaders = {"hold": object(), "val:targets.val": object()}
+    line = trainer._line(
+        3,
+        {"loss": 1.25, "dice": 0.5},
+        {"dice": 0.25, "centroid_error": 4.0, "empty_rate": 0.1},
+        {
+            "val": {},
+            "hold": {"dice": 0.125, "empty_rate": 0.5},
+            "val:targets.val": {"dice": 0.75, "empty_rate": 0.0},
+            "seconds": 9.0,
+        },
+    )
+    head, _, tail = line.partition("centr")
+    assert "train dice 0.5000  val dice 0.2500  hold 0.1250" in head
+    assert "hold" not in tail
+    assert "val:targets.val 0.7500" in tail
+
+
 def test_the_scheduler_warms_up_then_decays():
     parameter = torch.nn.Parameter(torch.zeros(1))
     optimizer = torch.optim.AdamW([parameter], lr=1.0)

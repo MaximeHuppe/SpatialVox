@@ -11,17 +11,23 @@ The order is the pipeline's: ``a`` is trained on every name that may be an
 anchor and is then frozen inside ``b``; ``boundary`` is optional and its
 checkpoint goes in ``train.stage_b.boundary_checkpoint``.
 
-``--overfit N`` restricts training and validation to the first N scenes and
-turns the direction flip off: it is the bug catcher, and a model that cannot
-memorise one scene has something wrong with its channel order, its world
-coordinates or its prompt indices, so nothing measured on the full corpus will
-mean anything.
+``--overfit N`` restricts training to the first N training scenes and turns the
+direction flip off. ``val`` is a second pass over those memorised prompts. It
+is the bug catcher: a model that cannot memorise one scene has something wrong
+with its channel order, its world coordinates or its prompt indices, so nothing
+measured on the full corpus will mean anything. ``hold`` is a different number.
+It is Dice on the held-out names (``targets.val`` and ``targets.test``: caudate,
+putamen, hippocampus) of one val-split subject, the first in manifest order
+that is not an overfit scene. That volume never enters the loss. The overfit
+scene itself is not used for it: there those structures are background in the
+training prompts, so their Dice is not transfer.
 
 **Checkpoint selection.** ``best.pt`` is chosen on ``targets.train`` - the eight
-classes Stage B is supervised on. ``targets.val`` (caudate, putamen) and
-``targets.test`` (hippocampus) are scored every epoch and never selected on;
-they are the transfer curves, and choosing a checkpoint on them would be
-choosing on the number being reported.
+classes Stage B is supervised on. On a full run, ``targets.val`` (caudate,
+putamen) and ``targets.test`` (hippocampus) are scored every epoch and never
+selected on; they are the transfer curves, and choosing a checkpoint on them
+would be choosing on the number being reported. ``--overfit`` replaces those
+two curves with the single ``hold`` Dice above, which is also never selected on.
 """
 
 from __future__ import annotations
@@ -94,6 +100,30 @@ def boundary(cfg, corpus: Corpus, overfit: int | None):
     return datasets, BoundaryTask(model, corpus.vocab, loss_weights=stage_cfg.loss.to_dict()), {}
 
 
+def overfit_hold_dataset(cfg, corpus: Corpus, train_scenes, anchors) -> ExampleDataset:
+    """Held-out target names on one val-split subject, outside the overfit scenes.
+
+    Overfit scenes are a prefix of the train split, so the subject is the first
+    val-split scene, in manifest order, that is not one of them and that has a
+    prompt for ``targets.val`` or ``targets.test``. Its image is scored only.
+    The overfit scene is the wrong volume for this: the held-out structures are
+    background in its training prompts, so that Dice is not transfer.
+    """
+    held_out = [str(name) for name in (*cfg.targets.val, *cfg.targets.test)]
+    blocked = set(train_scenes)
+    present = {row["scene"] for row in corpus.records("val", held_out)}
+    for scene in corpus.scene_ids("val"):
+        if scene not in blocked and scene in present:
+            return ExampleDataset(
+                corpus, "val", scenes=[scene], targets=held_out,
+                anchor_cache=anchors, normalize_mode=cfg.data.normalize,
+            )
+    raise ValueError(
+        "overfit hold needs a val-split subject outside the overfit train "
+        "scenes with a prompt for a held-out target"
+    )
+
+
 def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
             anchors: Path | None):
     stage_cfg, model_cfg = cfg.train.stage_b, cfg.model.stage_b
@@ -137,12 +167,12 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
             )
         except ValueError:  # that split holds none of those classes
             pass
-    if overfit:  # validate on what we are trying to memorise
+    if overfit:  # val repeats the memorised prompts; hold is another subject
         datasets["val"] = ExampleDataset(
             corpus, "train", scenes=scenes["train"], anchor_cache=anchors,
             normalize_mode=cfg.data.normalize,
         )
-        extra = {}
+        extra = {"hold": overfit_hold_dataset(cfg, corpus, scenes["train"], anchors)}
 
     model = StageB.from_segmenter(
         segmenter,
@@ -182,7 +212,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", choices=["a", "boundary", "b"])
     parser.add_argument("--segmenter", type=Path, help="Stage A checkpoint (overrides train.stage_b.phase_a_checkpoint)")
-    parser.add_argument("--overfit", type=int, metavar="N", help="train on the first N scenes only")
+    parser.add_argument(
+        "--overfit", type=int, metavar="N",
+        help="train on the first N train scenes; score hold on one other val subject",
+    )
     parser.add_argument("--out", type=Path, help="run directory (default runs/<stage>)")
     parser.add_argument("--config", type=Path, help="config file (default configs/config.yaml)")
     parser.add_argument("--set", dest="overrides", action="append", metavar="KEY=VALUE")
@@ -257,8 +290,13 @@ def main() -> int:
     if args.stage == "b":
         print(f"anchors: {task.anchor_source} | tau {task.model.mapper.tau}"
               f" | flip {stage_cfg.flip_probability}")
-        print("selecting best.pt on val-split subjects with TRAINED classes;"
-              " the two held-out class curves are reported, never selected on")
+        if args.overfit:
+            subject = extra["hold"].records[0]["scene"]
+            print("overfit: val is a second pass over the memorized prompts; "
+                  f"hold is the held-out classes on {subject}, a different subject")
+        else:
+            print("selecting best.pt on val-split subjects with TRAINED classes;"
+                  " the two held-out class curves are reported, never selected on")
     trainer.fit()
 
     task.model = trainer.model = load_model(out_dir / "best.pt", trainer.device)
