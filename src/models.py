@@ -246,10 +246,10 @@ class NamePrompt(nn.Module):
     lives on the far side of the freeze.
     """
 
-    def __init__(self, vocab_size: int, dim: int, text_dim: int | None = None) -> None:
+    def __init__(self, vocab_size: int, dim: int) -> None:
         super().__init__()
-        self.table = nn.Embedding(vocab_size, text_dim or dim)
-        self.projection = nn.Linear(text_dim or dim, dim)
+        self.table = nn.Embedding(vocab_size, dim)
+        self.projection = nn.Linear(dim, dim)
         nn.init.trunc_normal_(self.table.weight, std=0.02)
 
     def forward(self, name_ids: Tensor) -> Tensor:

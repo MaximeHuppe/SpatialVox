@@ -576,7 +576,6 @@ class ExampleDataset(Dataset):
         split: str,
         *,
         targets: Sequence[str] | None = None,
-        leave_out: Sequence[str] | None = None,
         scenes: Sequence[str] | None = None,
         flip_probability: float = 0.0,
         anchor_cache: Path | str | None = None,
@@ -606,22 +605,6 @@ class ExampleDataset(Dataset):
         # example, so nothing outside `targets` is ever supervised as a target.
         names = corpus.meta["targets"].get(split, corpus.vocab.names) if targets is None else targets
         self.retarget_to = {corpus.vocab.label(str(name)) for name in names}
-        # Episodic leave-one-class-out. Each epoch one supervised class is
-        # withheld from the loss, so the model is asked, DURING TRAINING, to
-        # segment a class it is not being supervised on this epoch.
-        #
-        # The point is not regularisation. Measured on this project, a model
-        # trained on every class at once learns to RECOGNISE which of them the
-        # prompt is asking for and paint that class's remembered shape - held-out
-        # volume comes out at 0.43-0.51 of truth and a quarter of predictions are
-        # empty, while `where_raw` at the true centroid is 0.97, as good as for a
-        # supervised class. Recognition is the cheaper route and nothing in the
-        # loss forbids it. Rotating a class out makes that route fail while
-        # training, which is the only pressure that reaches it.
-        #
-        # `keep = 0` is the existing per-example drop and it already reaches every
-        # loss term and every metric, so nothing else has to change.
-        self.leave_out = [str(n) for n in (leave_out or [])]
         self.epoch = torch.zeros((), dtype=torch.long).share_memory_()
         self._cache = _SceneCache(corpus.root, cache, normalize_mode)
         self._anchors = None if anchor_cache is None else AnchorCache(anchor_cache, corpus.shape)
@@ -631,13 +614,6 @@ class ExampleDataset(Dataset):
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch.fill_(int(epoch))
-
-    def target_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for row in self.records:
-            name = self.corpus.vocab.name(row["target"])
-            counts[name] = counts.get(name, 0) + 1
-        return dict(sorted(counts.items()))
 
     def flip(self, record, labels, rng) -> tuple[dict[str, Any], int]:
         """One clause to its opposite, re-scored. ``(record, keep)``.
@@ -675,12 +651,6 @@ class ExampleDataset(Dataset):
         record = self.records[index]
         image, labels = self._cache.get(record["scene"])
         keep = 1
-        if self.leave_out:
-            # One class per epoch, cycled deterministically so every class takes
-            # its turn and a run is reproducible from its seed alone.
-            withheld = self.leave_out[int(self.epoch) % len(self.leave_out)]
-            if self.corpus.vocab.name(record["target"]) == withheld:
-                keep = 0
         if self.flip_probability > 0:
             rng = np.random.default_rng([int(self.epoch), index])
             if float(rng.random()) < self.flip_probability:

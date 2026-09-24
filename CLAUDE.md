@@ -191,8 +191,7 @@ A bare Dice is not interpretable in this project. Any reported Dice must carry:
    `flip_direction` must drop. `permute_both` preserves every relation and must
    not move — but note that `where_raw` is a product and therefore *exactly*
    permutation-invariant, so the only order dependence left is the carver's
-   `cat`. A flat control is a much weaker statement here than it was under the
-   attention architecture.
+   `cat`.
 
 3. **The two mandatory tests of §7**, before a Dice is treated as evidence that
    the image was used at all:

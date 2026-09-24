@@ -54,16 +54,6 @@ OPPOSITE: dict[str, str] = {
     "lateral": "medial",
 }
 
-#: World axis each direction pair is decided on.
-AXIS_OF: dict[str, str] = {
-    "anterior": "y",
-    "posterior": "y",
-    "superior": "z",
-    "inferior": "z",
-    "medial": "x",
-    "lateral": "x",
-}
-
 ATOL = 1e-9
 
 

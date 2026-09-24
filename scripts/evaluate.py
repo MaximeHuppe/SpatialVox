@@ -56,9 +56,8 @@ import torch
 from src.config import load_config, parse_overrides
 from src.data import Corpus, ExampleDataset, anchor_cache_dir, load_nifti, loader, save_nifti
 from src.engine import (
-    Metrics, StageBTask, dice_iou, format_table, load_model, mask_centroid_world,
+    Metrics, StageBTask, dice_iou, format_table, load_model,
     null_gated, null_summary, resolve_anchor_source, resolve_device, roll_anchors,
-    segmentation_loss,
 )
 from src.geometry import DIRECTIONS, OPPOSITE, centroids_world, solutions_for, volume_center_world
 

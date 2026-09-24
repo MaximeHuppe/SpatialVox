@@ -109,11 +109,6 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         "train": ExampleDataset(
             corpus, "train", scenes=scenes["train"], targets=list(cfg.targets.train),
             flip_probability=flip, anchor_cache=anchors, normalize_mode=cfg.data.normalize,
-            # Episodic leave-one-class-out: one SUPERVISED class withheld from
-            # the loss each epoch. It never touches val, which must keep scoring
-            # every trained class or the selection curve changes meaning.
-            leave_out=(list(cfg.targets.train)
-                       if bool(stage_cfg.get("leave_one_out", False)) else None),
         ),
         # The selection curve: held-out *subjects*, trained *classes*.
         "val": ExampleDataset(

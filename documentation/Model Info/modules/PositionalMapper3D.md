@@ -24,7 +24,7 @@ flowchart LR
 
 ### Params (`__init__`)
 
-`PositionalMapper3D(tau=2.0, min_mass=1e-5)`: these are the constructor's own defaults. `StageB` always passes the configured `tau = 0.5` and `min_mass = 1e-6`.
+`PositionalMapper3D(tau=0.5, min_mass=1e-6)`: constructor defaults match the shipped Stage B config. `StageB` still passes the configured values explicitly.
 
 | param | source | shipped | role |
 | --- | --- | --- | --- |

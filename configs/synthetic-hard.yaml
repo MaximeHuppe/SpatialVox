@@ -60,7 +60,7 @@ synthetic:
   seeds: {train: 1000000, val: 2000000, test: 3000000}
   spacing: [1.0, 1.0, 1.0]
   margin: 2
-  packing: {max_object_attempts: 200, max_scene_attempts: 50}
+  packing: {max_scene_attempts: 50}
   size: 1.8                    # scales every structure. At 1.0 the primitives are ~8 voxels
                                # across in a 64^3 volume and the carver's stride-2 stem sees
                                # them at four, so Dice measures the discretisation rather than
@@ -201,10 +201,6 @@ train:
     # valid | all - see configs/config.yaml. `all` reproduces mri-stage-b and the
     # two arms; `valid` leaves "names nothing" to the null head alone.
     mask_on: valid
-    # Withhold one supervised class from the loss each epoch, cycling. Makes the
-    # recognise-and-recall route fail DURING training, which is the only pressure
-    # that reaches it. `keep = 0` is the existing per-example drop.
-    leave_one_out: false
 
 
 logging:

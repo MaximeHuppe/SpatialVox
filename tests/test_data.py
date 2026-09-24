@@ -5,8 +5,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-import torch
-
 from src.data import (
     AnchorCache,
     Corpus,
@@ -25,7 +23,7 @@ from src.data import (
     stabilize_relational_manifests,
 )
 from src.geometry import (
-    OPPOSITE, centroids_world, classify, solutions_for, volume_center_world,
+    centroids_world, classify, solutions_for, volume_center_world,
 )
 
 
