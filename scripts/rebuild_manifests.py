@@ -97,7 +97,7 @@ def main() -> int:
         extra={
             **{k: v for k, v in corpus.meta.items()
                if k in ("source", "label_scheme", "n_subjects", "origin")},
-            "triple_stability": "global-unique-target",
+            "triple_stability": "train-unique-target",
             "triple_stability_stats": stab,
         },
     )

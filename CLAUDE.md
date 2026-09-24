@@ -114,13 +114,14 @@ per-scene well-posedness holds by construction.
 **Global triple stability.** Per-scene uniqueness is not enough on real MRI: the
 same unordered set of `(anchor name, direction)` pairs can uniquely mean
 Left-Thalamus on one subject and Left-Caudate on another. After per-scene
-generation, `stabilize_relational_manifests` keeps a row only when **every** use
-of its triple across the corpus names the **same** target. Unstable triples are
-removed entirely. That guarantees a held-out-target prompt never reuses a triple
-that supervised a trained target. Rebuild with `scripts/rebuild_manifests.py`
-(or re-import); `meta.json` records `triple_stability: global-unique-target`.
-Audit with `scripts/triple_cross_patient.py` — `triples_with_different_targets`
-must be 0.
+generation, `stabilize_relational_manifests` (default `define_on="train"`)
+decides stability from **train subjects only** and drops unstable rows from
+train only. Val/test rows that collide with a train target are kept and counted
+as an exposure stratum, so the recogniser shortcut stays measurable. Pass
+`define_on="all"` only to reproduce the legacy global filter. Rebuild with
+`scripts/rebuild_manifests.py` (or re-import); `meta.json` records
+`triple_stability: train-unique-target`. Audit with
+`scripts/triple_cross_patient.py`.
 
 The target-first generator is **deleted, not configurable**. It picked the
 anchors nearest the target, which on fixed anatomy made the anchor identities a
@@ -189,11 +190,16 @@ A bare Dice is not interpretable in this project. Any reported Dice must carry:
    `cat`. A flat control is a much weaker statement here than it was under the
    attention architecture.
 
-3. **Image replacement**, before a Dice is treated as evidence that the image
-   was used at all. `scripts/evaluate.py` feeds another subject's MRI into `B`
-   and keeps this subject's anchors and fields. The centroid should hold and the
-   Dice should fall. There is no prompt-only carver: `B` is required, and at
-   init `refine` is zero so the mask does not yet depend on `boundary`.
+3. **Image use**, before a Dice is treated as evidence that the image was used
+   at all. Two complementary tests:
+
+   - **Image replacement** (`scripts/evaluate.py`): another subject's MRI into
+     `B`, this subject's anchors and fields. The centroid should hold and the
+     Dice should fall.
+   - **Trained twin** (`scripts/train.py b --twin`): `refine` / q / K / V stay
+     at their zero init, `B` is not computed, same seeds as the full run. The
+     success bar is full model minus twin, never an absolute Dice. Switching
+     `refine` off only at eval is not a twin — coarse alone is nearly flat.
 
 4. **The gate.** `scripts/gate_mapper.py` measures the fraction of target
    centroids with `where_raw > 0.5`. §2 of the proposal makes it a precondition:

@@ -112,6 +112,12 @@ model:
     carver:
       width: 16                   # "two 16-channel blocks, stride-2 stem"
       blocks: 2                   # stem is geometry only; B(I) is channel attention, not a concat
+      attention_resolution: 64    # channel attention spatial size. Full 128^3 saves ~4.7 GB/prompt
+                                  # of attention tensors and is 6-10x slower; 64^3 is the default
+                                  # before any transfer baseline. null = full resolution.
+    # Detached Stage A masks as stem channels. On data/mri the unordered anchor set
+    # recovers the target 67.8-99.2% of the time; leave false for every transfer arm.
+    carver_sees_anchors: false
     additive_prior: false         # the ablation `logits = residual + alpha * logit(where_raw)`
     alpha: 0.35                   # its one scalar, with no other input
     background_logit: -10.0       # what "logits = background where A_i > 0.5" writes. Finite,
@@ -172,6 +178,14 @@ train:
                                         # substitutes ground-truth anchor masks and is a diagnostic
                                         # that separates Stage A's error from the architecture's.
     flip_probability: 0.25              # one clause to its opposite, then re-scored. Train only.
+    # Flip retarget whitelist. `train` = only onto targets.train (S). Without this a
+    # flip can supervise a held-out class (~0.12% of MRI prompts) and the claim
+    # "never supervised as a relational target" is false. null = unrestricted.
+    retarget_only_to: train
+    # B3 diagnostic: zero the mask-loss weight on voxels whose label is in
+    # targets.val ∪ targets.test. Uses the class split; not a deployment method.
+    # Careful negatives (Phase 2) build on the same voxel_weight plumbing.
+    never_supervise_heldout: false
     loss:                               # §5's table, one weight per term
       dice: 1.0
       bce: 1.0

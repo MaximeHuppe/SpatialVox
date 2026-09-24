@@ -543,14 +543,12 @@ class Carver(nn.Module):
     separate 1x1s on that tensor. ``boundary`` is not a stem channel and is not
     added as a prompt-free residual on the logits.
 
-    Channel attention runs at full resolution, softmax over channels. ``query``
-    is a 1x1 on ``geometry_features``, then trilinear to full resolution.
-    ``key`` and ``value`` are 1x1s on ``boundary``. ``logits`` are the upsampled
-    coarse plus ``refine`` of the retrieved values. ``refine`` is zero at init,
-    so the initial mask equals the upsampled coarse and does not depend on
-    ``boundary``. ``query``, ``key``, and ``value`` keep the default convolution
-    init: zeroing them would make ``retrieved`` zero, and a zero ``refine``
-    would then receive no gradient.
+    Channel attention runs at ``attention_resolution`` (default 64³), softmax
+    over channels. ``query`` is a 1x1 on ``geometry_features``, then trilinear
+    to the attention grid; ``key`` and ``value`` are 1x1s on downsampled
+    ``boundary``. Retrieved values are upsampled to full resolution before
+    ``refine``. ``refine`` is zero at init, so the initial mask equals the
+    upsampled coarse and does not depend on ``boundary``.
 
     The anchor exclusion is applied by :class:`StageB` after this forward, not
     here. Checkpoints of the previous carver do not load; there is no translator.
@@ -565,11 +563,19 @@ class Carver(nn.Module):
         blocks: int = 2,
         act: str = "leaky_relu",
         prior_foreground: float = 0.0016,
+        attention_resolution: int | None = 64,
     ) -> None:
         super().__init__()
         if int(boundary_channels) < 1:
             raise ValueError(
                 f"Carver requires boundary features, got boundary_channels={boundary_channels}"
+            )
+        self.attention_resolution = (
+            None if attention_resolution in (None, 0) else int(attention_resolution)
+        )
+        if self.attention_resolution is not None and self.attention_resolution < 1:
+            raise ValueError(
+                f"attention_resolution must be a positive int or null, got {attention_resolution!r}"
             )
         self.stem = ConvBlock(in_channels, width, act, stride=2)
         self.blocks = nn.Sequential(*[ResBlock(width, act) for _ in range(int(blocks))])
@@ -584,25 +590,51 @@ class Carver(nn.Module):
         nn.init.zeros_(self.refine.weight)
         nn.init.zeros_(self.refine.bias)
 
-    def forward(self, geometry: Tensor, boundary: Tensor) -> tuple[Tensor, Tensor]:
-        """``-> (logits [B, 1, D, H, W], heatmap logits [B, 1, D/2, H/2, W/2])``."""
-        if boundary.shape[2:] != geometry.shape[2:]:
-            raise ValueError(
-                f"boundary spatial size {tuple(boundary.shape[2:])} does not match "
-                f"geometry {tuple(geometry.shape[2:])}"
-            )
+    def forward(
+        self,
+        geometry: Tensor,
+        boundary: Tensor | None = None,
+        *,
+        image_free: bool = False,
+    ) -> tuple[Tensor, Tensor]:
+        """``-> (logits [B, 1, D, H, W], heatmap logits [B, 1, D/2, H/2, W/2])``.
+
+        ``image_free=True`` (the trained twin) returns the upsampled coarse alone
+        and does not read ``boundary``.
+        """
         geometry_features = self.blocks(self.stem(geometry))
         coarse = F.interpolate(
             self.coarse(geometry_features), size=geometry.shape[2:],
             mode="trilinear", align_corners=True,
         )
+        heatmap = self.heatmap(geometry_features)
+        if image_free:
+            return coarse, heatmap
+        if boundary is None:
+            raise ValueError("Carver.forward needs boundary unless image_free=True")
+        if boundary.shape[2:] != geometry.shape[2:]:
+            raise ValueError(
+                f"boundary spatial size {tuple(boundary.shape[2:])} does not match "
+                f"geometry {tuple(geometry.shape[2:])}"
+            )
+        full = tuple(int(v) for v in boundary.shape[2:])
+        attn = full
+        if self.attention_resolution is not None and max(full) > self.attention_resolution:
+            attn = (self.attention_resolution,) * 3
         query = F.interpolate(
-            self.query(geometry_features), size=boundary.shape[2:],
-            mode="trilinear", align_corners=True,
+            self.query(geometry_features), size=attn, mode="trilinear", align_corners=True,
         )
-        retrieved = channel_attention(query, self.key(boundary), self.value(boundary))
-        logits = coarse + self.refine(retrieved)
-        return logits, self.heatmap(geometry_features)
+        key = self.key(boundary)
+        value = self.value(boundary)
+        if attn != full:
+            key = F.interpolate(key, size=attn, mode="trilinear", align_corners=True)
+            value = F.interpolate(value, size=attn, mode="trilinear", align_corners=True)
+        retrieved = channel_attention(query, key, value)
+        if attn != full:
+            retrieved = F.interpolate(
+                retrieved, size=full, mode="trilinear", align_corners=True,
+            )
+        return coarse + self.refine(retrieved), heatmap
 
 
 def soft_argmax(
@@ -673,24 +705,41 @@ class StageB(nn.Module):
         boundary_widths: Sequence[int] = (16, 32, 32),
         carver_width: int = 16,
         carver_blocks: int = 2,
-        carver_sees_anchors: bool = True,
+        carver_sees_anchors: bool = False,
+        attention_resolution: int | None = 64,
         additive_prior: bool = False,
         alpha: float = 0.35,
         background_logit: float = -10.0,
         prior_foreground: float = 0.0016,
+        center: Sequence[float] | None = None,
+        prompt_only: bool = False,
     ) -> None:
         super().__init__()
+        resolution = int(segmenter["resolution"])
+        spacing_t = tuple(float(v) for v in spacing)
+        if center is None:
+            center_t = tuple(volume_center_world((resolution,) * 3, spacing_t).tolist())
+        else:
+            center_t = tuple(float(v) for v in center)
+            if len(center_t) != 3:
+                raise ValueError(f"center must be length 3, got {center!r}")
+        attention_resolution = (
+            None if attention_resolution in (None, 0) else int(attention_resolution)
+        )
         self.config = dict(
-            segmenter=dict(segmenter), spacing=tuple(float(v) for v in spacing),
+            segmenter=dict(segmenter), spacing=spacing_t,
             n_anchors=int(n_anchors), tau=float(tau), min_mass=float(min_mass),
             boundary_widths=tuple(int(w) for w in boundary_widths),
             carver_width=int(carver_width), carver_blocks=int(carver_blocks),
             carver_sees_anchors=bool(carver_sees_anchors),
+            attention_resolution=attention_resolution,
             additive_prior=bool(additive_prior), alpha=float(alpha),
             background_logit=float(background_logit), prior_foreground=float(prior_foreground),
+            center=center_t,
+            prompt_only=bool(prompt_only),
         )
         self.n_anchors = int(n_anchors)
-        self.spacing = tuple(float(v) for v in spacing)
+        self.spacing = spacing_t
         # Whether the three detached anchor MASKS go into the carver alongside
         # the fields. They are Stage A outputs, so their shapes identify the
         # anchor classes, and the unordered anchor set alone recovers the target
@@ -704,12 +753,14 @@ class StageB(nn.Module):
         self.carver_sees_anchors = bool(carver_sees_anchors)
         self.additive_prior = bool(additive_prior)
         self.background_logit = float(background_logit)
+        # Trained twin: geometry trunk only. refine/q/K/V stay at zero init and
+        # B is never computed, so Dice is image-free by construction.
+        self.prompt_only = bool(prompt_only)
 
         self.segmenter = StageA(**segmenter)
         self.segmenter.requires_grad_(False).eval()
-        resolution = int(self.segmenter.config["resolution"])
         self.resolution = resolution
-        self.center = tuple(volume_center_world((resolution,) * 3, self.spacing).tolist())
+        self.center = center_t
 
         self.mapper = PositionalMapper3D(tau=tau, min_mass=min_mass)
         self.boundary = BoundaryEncoder(boundary_widths)
@@ -720,6 +771,7 @@ class StageB(nn.Module):
         self.carver = Carver(
             geometry, self.boundary.out_channels,
             width=carver_width, blocks=carver_blocks, prior_foreground=prior_foreground,
+            attention_resolution=attention_resolution,
         )
         self.null = NullHead(self.n_anchors)
         #: Set by the trainer when ``B`` came from a pretraining run; 1.0 otherwise.
@@ -728,17 +780,36 @@ class StageB(nn.Module):
         # or a name - that is what makes the additive form an ablation and not a
         # second, learned field.
         self.alpha = nn.Parameter(torch.tensor(float(alpha))) if self.additive_prior else None
+        if self.prompt_only:
+            self._freeze_image_path()
 
     # -- the freeze -------------------------------------------------------
+    def _freeze_image_path(self) -> None:
+        """Keep refine/q/K/V at zero init and drop B from the optimiser (twin)."""
+        for module in (self.carver.query, self.carver.key, self.carver.value, self.carver.refine):
+            nn.init.zeros_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+            for parameter in module.parameters():
+                parameter.requires_grad_(False)
+        for parameter in self.boundary.parameters():
+            parameter.requires_grad_(False)
+
     def train(self, mode: bool = True) -> "StageB":
         super().train(mode)
         self.segmenter.eval()  # frozen; never a training-mode submodule
+        if self.prompt_only:
+            self.boundary.eval()
         return self
 
     def trainable_parameters(self):
         """Every parameter except the frozen segmenter's - what the optimiser gets."""
         frozen = {id(p) for p in self.segmenter.parameters()}
-        return [p for p in self.parameters() if id(p) not in frozen]
+        if self.prompt_only:
+            frozen |= {id(p) for p in self.boundary.parameters()}
+            for module in (self.carver.query, self.carver.key, self.carver.value, self.carver.refine):
+                frozen |= {id(p) for p in module.parameters()}
+        return [p for p in self.parameters() if id(p) not in frozen and p.requires_grad]
 
     def parameter_groups(self, lr: float) -> list[dict]:
         """Two groups when ``B`` was pretrained: the carver at ``lr``, ``B`` below it.
@@ -818,16 +889,21 @@ class StageB(nn.Module):
         where = field.where_raw
         log_where = where.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
 
-        source = image if boundary_image is None else boundary_image
-        boundary = self.boundary(source.to(torch.float32))
         parts = ([anchors] if self.carver_sees_anchors else []) + [
             field.fields, where, log_where
         ]
-        # Under autocast the boundary features come back in the low-precision
-        # dtype while the geometry is float32. The stem concat is cast to that
-        # dtype. boundary is not one of its channels.
-        geometry = torch.cat([part.to(dtype=boundary.dtype) for part in parts], dim=1)
-        logits, heatmap = self.carver(geometry, boundary)
+        if self.prompt_only:
+            # Twin: geometry dtype only; B is never run.
+            geometry = torch.cat([part.float() for part in parts], dim=1)
+            logits, heatmap = self.carver(geometry, image_free=True)
+        else:
+            source = image if boundary_image is None else boundary_image
+            boundary = self.boundary(source.to(torch.float32))
+            # Under autocast the boundary features come back in the low-precision
+            # dtype while the geometry is float32. The stem concat is cast to that
+            # dtype. boundary is not one of its channels.
+            geometry = torch.cat([part.to(dtype=boundary.dtype) for part in parts], dim=1)
+            logits, heatmap = self.carver(geometry, boundary)
 
         if self.alpha is not None:
             # The ablation: a weak explicit bias, one scalar, no other input.

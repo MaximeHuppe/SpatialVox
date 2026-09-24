@@ -69,19 +69,49 @@ def load_config(path: Path | str | None = None, overrides: Mapping[str, Any] | N
     return Config(data)
 
 
+def _parse_override_value(raw: str) -> Any:
+    """Parse one ``--set`` value.
+
+    ``true`` / ``false`` / ``null`` (any case) become Python ``True`` / ``False`` /
+    ``None``. Bare ``ast.literal_eval("false")`` is a ``ValueError``, so the old
+    path kept the *string* ``"false"`` and ``bool("false")`` was silently
+    ``True`` - which invalidated every ``--set x=false`` arm (B11).
+    """
+    text = raw.strip()
+    lowered = text.lower()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered in ("null", "none"):
+        return None
+    try:
+        return ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        return text
+
+
 def parse_overrides(assignments: list[str] | None) -> dict[str, Any]:
     """Turn ``["train.epochs=5", "data.root=/tmp/x"]`` into a mapping.
 
     Values are parsed as Python literals when possible (so ``5`` is an int and
-    ``[1,2]`` a list) and kept as strings otherwise.
+    ``[1,2]`` a list). Boolean and null tokens are recognised case-insensitively
+    so ``--set flag=false`` is never the truthy string ``"false"``.
     """
     parsed: dict[str, Any] = {}
     for assignment in assignments or []:
         if "=" not in assignment:
             raise ValueError(f"--set expects key=value, got {assignment!r}")
         key, raw = assignment.split("=", 1)
-        try:
-            parsed[key.strip()] = ast.literal_eval(raw)
-        except (ValueError, SyntaxError):
-            parsed[key.strip()] = raw
+        parsed[key.strip()] = _parse_override_value(raw)
     return parsed
+
+
+def require_bool(value: Any, name: str) -> bool:
+    """Cast a config leaf to ``bool``, rejecting strings that look like flags."""
+    if isinstance(value, bool):
+        return value
+    raise TypeError(
+        f"{name} must be a bool, got {type(value).__name__} {value!r}. "
+        f"Pass true/false via --set (not the strings 'true'/'false')."
+    )

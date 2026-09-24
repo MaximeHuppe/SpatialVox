@@ -138,12 +138,13 @@ model:
     carver:
       width: 16
       blocks: 2
+      attention_resolution: 32
     # The three anchor MASKS into the carver alongside the fields. Their shapes
     # identify the anchor classes, and the unordered anchor set alone recovers
     # the target 67.8% of the time on data/mri - a channel through which the
     # carver can name the target instead of solving for it. `F_i` and `where_raw`
     # already carry the geometry it needs. The anchor EXCLUSION is unaffected.
-    carver_sees_anchors: true
+    carver_sees_anchors: false
     additive_prior: false
     alpha: 0.35
     background_logit: -10.0
@@ -187,6 +188,8 @@ train:
     boundary_lr_scale: 0.1
     anchor_source: predicted
     flip_probability: 0.25
+    retarget_only_to: train
+    never_supervise_heldout: false
     loss:
       dice: 1.0
       bce: 1.0

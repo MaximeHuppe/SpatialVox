@@ -61,6 +61,7 @@ def segmentation_loss(
     lambda_dice: float = 1.0,
     lambda_bce: float = 1.0,
     weight: Tensor | None = None,
+    voxel_weight: Tensor | None = None,
 ) -> Tensor:
     """``lambda_dice * soft Dice + lambda_bce * BCEWithLogits``, per sample.
 
@@ -68,13 +69,27 @@ def segmentation_loss(
     voxel - two million of them at 128^3 - and float16 has neither the range nor
     the resolution for that sum, so the objective would depend on the autocast
     dtype.
+
+    ``voxel_weight`` (``[B, 1, D, H, W]`` in {0, 1}) zeroes individual voxels
+    inside the mask loss - held-out tissue under ``never_supervise_heldout``, or
+    careful negatives later. Sample-level ``weight`` (``keep`` / ``mask_on``)
+    still drops whole examples.
     """
     logits, target = logits.float(), target.float()
-    probability = torch.sigmoid(logits).flatten(2)
-    reference = target.flatten(2)
-    intersection = (probability * reference).sum(-1)
-    dice = 1 - (2 * intersection + 1) / (probability.sum(-1) + reference.sum(-1) + 1)
-    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none").flatten(2).mean(-1)
+    if voxel_weight is None:
+        voxel_weight = torch.ones_like(target)
+    else:
+        voxel_weight = voxel_weight.float()
+    probability = torch.sigmoid(logits) * voxel_weight
+    reference = target * voxel_weight
+    probability_flat = probability.flatten(2)
+    reference_flat = reference.flatten(2)
+    intersection = (probability_flat * reference_flat).sum(-1)
+    dice = 1 - (2 * intersection + 1) / (probability_flat.sum(-1) + reference_flat.sum(-1) + 1)
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    # Mean over supervised voxels only; an all-ignored sample contributes 0.
+    voxel_sum = voxel_weight.flatten(2).sum(-1).clamp(min=EPS)
+    bce = (bce * voxel_weight).flatten(2).sum(-1) / voxel_sum
     return lambda_dice * weighted_mean(dice, weight) + lambda_bce * weighted_mean(bce, weight)
 
 
@@ -464,6 +479,7 @@ class Prediction:
     has_field: Tensor | None = None  # [B] whether where_raw has any mass at all
     where_raw: Tensor | None = None
     anchor_dice: Tensor | None = None  # [B, A] predicted anchors against ground truth
+    voxel_weight: Tensor | None = None  # [B, 1, D, H, W] mask-loss per-voxel weight
 
 
 @dataclass
@@ -575,6 +591,7 @@ class StageBTask:
     far_dilation: int = 8
     field_centroid_on: str = "always"
     mask_on: str = "all"
+    ignore_labels: Sequence[int] = ()
     name: str = "stage_b"
     components: dict[str, float] = field(default_factory=dict)
 
@@ -587,7 +604,18 @@ class StageBTask:
             )
         if self.mask_on not in MASK_ON:
             raise ValueError(f"mask_on must be one of {MASK_ON}, got {self.mask_on!r}")
+        self.ignore_labels = tuple(int(v) for v in self.ignore_labels)
         self.model.segmenter.eval()
+
+    def voxel_weight_from(self, labels: Tensor) -> Tensor:
+        """``[B, 1, D, H, W]`` ones, zeroed on :attr:`ignore_labels`."""
+        weight = torch.ones(
+            labels.shape[0], 1, *labels.shape[1:],
+            device=labels.device, dtype=torch.float32,
+        )
+        for label in self.ignore_labels:
+            weight = weight * (labels != label).unsqueeze(1).float()
+        return weight
 
     def __call__(self, batch: Mapping[str, Any]) -> Prediction:
         labels = batch["labels"]
@@ -627,6 +655,7 @@ class StageBTask:
             field_centroid=field_centroid, has_field=(field_total > 0).float(),
             where_raw=output.where_raw,
             anchor_dice=dice_iou(output.anchors, truth)[0],
+            voxel_weight=self.voxel_weight_from(labels),
         )
 
     def loss(self, prediction: Prediction) -> Tensor:
@@ -649,7 +678,8 @@ class StageBTask:
         terms = {
             "mask": segmentation_loss(
                 prediction.logits, prediction.target,
-                float(weights.get("dice", 1.0)), float(weights.get("bce", 1.0)), weight=mask_weight,
+                float(weights.get("dice", 1.0)), float(weights.get("bce", 1.0)),
+                weight=mask_weight, voxel_weight=prediction.voxel_weight,
             ),
             "null_bce": float(weights.get("null_bce", 0.2)) * weighted_mean(
                 F.binary_cross_entropy_with_logits(
@@ -773,6 +803,17 @@ def git_revision() -> str | None:
         return None
 
 
+def git_dirty() -> bool | None:
+    """Whether the worktree has uncommitted changes; ``None`` if git is unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True, check=True
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return bool(result.stdout.strip())
+
+
 def save_checkpoint(path: Path | str, model: nn.Module, meta: Mapping[str, Any]) -> Path:
     """Weights plus everything needed to rebuild and trace the model.
 
@@ -783,11 +824,17 @@ def save_checkpoint(path: Path | str, model: nn.Module, meta: Mapping[str, Any])
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    dirty = git_dirty()
     payload = {
         "state_dict": model.state_dict(),
         "model": model.config,
         "kind": type(model).__name__,
-        "meta": {**dict(meta), "git": git_revision(), "torch": torch.__version__},
+        "meta": {
+            **dict(meta),
+            "git": git_revision(),
+            "git_dirty": dirty,
+            "torch": torch.__version__,
+        },
     }
     torch.save(payload, path)
     path.with_suffix(".json").write_text(
@@ -1056,7 +1103,15 @@ class Trainer:
                 f"{self.task.name}: {trainable:.2f}M trainable of {total:.2f}M "
                 f"on {self.device} ({self.cfg['precision']})"
             )
-        log = (self.out_dir / "metrics.jsonl").open("w", encoding="utf-8")
+        log = (self.out_dir / "metrics.jsonl").open("a", encoding="utf-8")
+        log.write(json.dumps({
+            "event": "run_start",
+            "git": git_revision(),
+            "git_dirty": git_dirty(),
+            "torch": torch.__version__,
+            "config": {**self.cfg, "stage": self.stage},
+        }) + "\n")
+        log.flush()
         run = _logger(self.logging, self.out_dir.name, {**self.cfg, **self.stage})
         try:
             for epoch in range(self.epochs):

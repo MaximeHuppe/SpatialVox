@@ -57,6 +57,8 @@ model:
     carver:
       width: 16
       blocks: 2
+      attention_resolution: 32   # half of 64^3; keeps the same relative downsample as MRI
+    carver_sees_anchors: false
     additive_prior: false
     alpha: 0.35
     background_logit: -10.0
@@ -100,6 +102,8 @@ train:
     boundary_lr_scale: 0.1
     anchor_source: predicted
     flip_probability: 0.25
+    retarget_only_to: train
+    never_supervise_heldout: false
     loss:
       dice: 1.0
       bce: 1.0

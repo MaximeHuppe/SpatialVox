@@ -189,7 +189,6 @@ def test_a_flip_is_retargeted_emptied_or_dropped_and_never_assumed_empty(corpus)
     seen = {"retargeted": 0, "empty": 0, "dropped": 0}
     for index in range(len(dataset)):
         item = dataset[index]
-        _, labels = load_nifti(corpus.root / "scenes" / item["scene"] / "labels.nii.gz", np.int16), None
         labels = load_nifti(corpus.root / "scenes" / item["scene"] / "labels.nii.gz", np.int16)
         record = {"anchors": item["anchors"].tolist(), "directions": item["directions"]}
         if int(item["keep"]) == 0:
@@ -206,6 +205,20 @@ def test_a_flip_is_retargeted_emptied_or_dropped_and_never_assumed_empty(corpus)
             assert int(item["target"]) == 0
             assert item["target_name"] == ExampleDataset.NONE
     assert seen["empty"] > 0 and seen["dropped"] > 0, seen
+
+
+def test_retarget_whitelist_drops_flips_onto_held_out_classes(corpus):
+    """Default transfer hygiene: a flip may only name a trained-class target."""
+    trained = list(corpus.meta["targets"]["train"])
+    held = [n for n in corpus.vocab.names if n not in trained]
+    dataset = ExampleDataset(
+        corpus, "train", flip_probability=1.0, retarget_only_to=trained, normalize_mode="none",
+    )
+    for index in range(len(dataset)):
+        item = dataset[index]
+        if int(item["keep"]) == 1 and int(item["valid"]) == 1:
+            assert item["target_name"] in trained
+            assert item["target_name"] not in held
 
 
 def test_a_record_with_target_zero_is_an_empty_prompt_however_it_got_there(corpus):
@@ -380,7 +393,12 @@ def test_stabilize_keeps_a_triple_reused_for_the_same_target(vocab):
 
 
 def test_stabilize_drops_cross_split_train_vs_heldout_collision(vocab):
-    """A held-out-target row must not reuse a triple that supervised a train target."""
+    """Train-only scope: train keeps a stable-within-train triple; val is kept too.
+
+    The exposure stratum counts val rows whose words mean a different target than
+    train taught - those used to be dropped by the global filter, which hid the
+    recogniser shortcut.
+    """
     shared = {
         "anchors": [1, 2, 3],
         "directions": ["superior", "medial", "anterior"],
@@ -391,6 +409,26 @@ def test_stabilize_drops_cross_split_train_vs_heldout_collision(vocab):
         "val": [{**shared, "scene": "s1", "id": "held_hit", "target": vocab.label("gamma")}],
     }
     filtered, stats = stabilize_relational_manifests(manifests, vocab)
+    assert [row["id"] for row in filtered["train"]] == ["train_hit"]
+    assert [row["id"] for row in filtered["val"]] == ["held_hit"]
+    assert stats["examples_dropped_unstable_triple"] == 0
+    assert stats["triples_colliding"] == 0
+    assert stats["define_on"] == "train"
+    assert stats["exposure_rows_kept"] == 1
+
+
+def test_stabilize_define_on_all_still_drops_cross_split_collisions(vocab):
+    """Legacy global pass: both sides of a train↔held-out collision go away."""
+    shared = {
+        "anchors": [1, 2, 3],
+        "directions": ["superior", "medial", "anterior"],
+        "prompt": "x",
+    }
+    manifests = {
+        "train": [{**shared, "scene": "s0", "id": "train_hit", "target": vocab.label("alpha")}],
+        "val": [{**shared, "scene": "s1", "id": "held_hit", "target": vocab.label("gamma")}],
+    }
+    filtered, stats = stabilize_relational_manifests(manifests, vocab, define_on="all")
     assert filtered["train"] == []
     assert filtered["val"] == []
     assert stats["examples_dropped_unstable_triple"] == 2

@@ -5,6 +5,7 @@
     scripts/train.py boundary           # pretrain B(I) with no class ids
     scripts/train.py b                  # the relational model
     scripts/train.py b --segmenter runs/phase-a/current/best.pt
+    scripts/train.py b --twin           # trained image-free twin (refine frozen, B off)
     scripts/train.py b --overfit 1 --set train.stage_b.epochs=200
 
 The order is the pipeline's: ``a`` is trained on every name that may be an
@@ -22,6 +23,10 @@ classes Stage B is supervised on. ``targets.val`` (caudate, putamen) and
 ``targets.test`` (hippocampus) are scored every epoch and never selected on;
 they are the transfer curves, and choosing a checkpoint on them would be
 choosing on the number being reported.
+
+**Twin.** ``--twin`` trains the mandatory image-use comparator: ``refine`` / q /
+K / V stay at zero init and ``B`` is not computed. Report every Dice as full
+minus twin, never as an absolute.
 """
 
 from __future__ import annotations
@@ -29,10 +34,11 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any, Mapping, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.config import load_config, parse_overrides
+from src.config import load_config, parse_overrides, require_bool
 from src.data import Corpus, ExampleDataset, SceneDataset, anchor_cache_dir, loader
 from src.engine import (
     BoundaryTask, StageATask, StageBTask, Trainer, format_table, load_model,
@@ -47,6 +53,34 @@ def loss_weights(cfg) -> dict[str, float]:
     if loss["name"] != "dice_bce":
         raise ValueError(f"train.loss.name must be 'dice_bce', got {loss['name']!r}")
     return {"lambda_dice": float(loss["lambda_dice"]), "lambda_bce": float(loss["lambda_bce"])}
+
+
+def assert_targets_agree(cfg, corpus: Corpus) -> dict[str, list[str]]:
+    """One target split: config wins, meta must match when present."""
+    resolved = {split: list(cfg.targets[split]) for split in cfg.targets}
+    meta = corpus.meta.get("targets")
+    if meta:
+        meta_norm = {split: list(names) for split, names in meta.items()}
+        if meta_norm != resolved:
+            raise ValueError(
+                "corpus meta.targets disagrees with config targets. "
+                f"meta={meta_norm} config={resolved}. Rebuild manifests or fix the config."
+            )
+    return resolved
+
+
+def resolve_retarget_whitelist(stage_cfg, trained: Sequence[str]) -> list[str] | None:
+    """``train`` / ``true`` -> trained names; ``null`` / ``false`` -> unrestricted."""
+    raw = stage_cfg.get("retarget_only_to", "train")
+    if raw in (None, "null", False):
+        return None
+    if raw in (True, "train", "true"):
+        return list(trained)
+    if isinstance(raw, (list, tuple)):
+        return [str(n) for n in raw]
+    raise ValueError(
+        f"train.stage_b.retarget_only_to must be 'train', null, or a name list, got {raw!r}"
+    )
 
 
 def stage_a(cfg, corpus: Corpus, overfit: int | None):
@@ -95,28 +129,29 @@ def boundary(cfg, corpus: Corpus, overfit: int | None):
 
 
 def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
-            anchors: Path | None):
+            twin: bool, anchors: Path | None):
     stage_cfg, model_cfg = cfg.train.stage_b, cfg.model.stage_b
+    targets = assert_targets_agree(cfg, corpus)
     scenes = {split: corpus.scene_ids(split)[:overfit] if overfit else None for split in ("train", "val")}
     val_examples = cfg.train.get("val_examples")
     val_examples = None if val_examples in (None, 0) else int(val_examples)
     flip = 0.0 if overfit else float(stage_cfg.flip_probability)
+    retarget = None if overfit else resolve_retarget_whitelist(stage_cfg, targets["train"])
 
     datasets = {
-        # `train` is filtered to `targets.train` by the corpus, which is what
-        # "supervised on eight classes" means in code.
+        # Explicit targets from config (asserted against meta) so a fold cannot
+        # silently train on a stale meta.targets list.
         "train": ExampleDataset(
-            corpus, "train", scenes=scenes["train"], flip_probability=flip,
+            corpus, "train", targets=targets["train"], scenes=scenes["train"],
+            flip_probability=flip, retarget_only_to=retarget,
             anchor_cache=anchors, normalize_mode=cfg.data.normalize,
-            # Episodic leave-one-class-out: one SUPERVISED class withheld from
-            # the loss each epoch. It never touches val, which must keep scoring
-            # every trained class or the selection curve changes meaning.
-            leave_out=(list(cfg.targets.train)
-                       if bool(stage_cfg.get("leave_one_out", False)) else None),
+            leave_out=(list(targets["train"])
+                       if require_bool(stage_cfg.get("leave_one_out", False), "leave_one_out")
+                       else None),
         ),
         # The selection curve: held-out *subjects*, trained *classes*.
         "val": ExampleDataset(
-            corpus, "val", scenes=scenes["val"], targets=list(cfg.targets.train),
+            corpus, "val", scenes=scenes["val"], targets=targets["train"],
             sample=val_examples, seed=int(cfg.train.seed), anchor_cache=anchors,
             normalize_mode=cfg.data.normalize,
         ),
@@ -127,8 +162,8 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
     # is untouched until `scripts/evaluate.py --split test`, and a column called
     # `test_*` that was not the test split is exactly the reporting error
     # `CLAUDE.md` exists to prevent.
-    for name, classes in (("val:targets.val", cfg.targets.val),
-                          ("val:targets.test", cfg.targets.test)):
+    for name, classes in (("val:targets.val", targets["val"]),
+                          ("val:targets.test", targets["test"])):
         try:
             extra[name] = ExampleDataset(
                 corpus, "val", scenes=scenes["val"], targets=list(classes),
@@ -139,10 +174,16 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
             pass
     if overfit:  # validate on what we are trying to memorise
         datasets["val"] = ExampleDataset(
-            corpus, "train", scenes=scenes["train"], anchor_cache=anchors,
-            normalize_mode=cfg.data.normalize,
+            corpus, "train", targets=targets["train"], scenes=scenes["train"],
+            anchor_cache=anchors, normalize_mode=cfg.data.normalize,
         )
         extra = {}
+
+    attention = model_cfg.carver.get("attention_resolution", 64)
+    if attention in (None, "null"):
+        attention = None
+    else:
+        attention = int(attention)
 
     model = StageB.from_segmenter(
         segmenter,
@@ -153,18 +194,29 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         boundary_widths=tuple(model_cfg.boundary_widths),
         carver_width=int(model_cfg.carver.width),
         carver_blocks=int(model_cfg.carver.blocks),
-        carver_sees_anchors=bool(model_cfg.get("carver_sees_anchors", True)),
-        additive_prior=bool(model_cfg.additive_prior),
+        carver_sees_anchors=require_bool(
+            model_cfg.get("carver_sees_anchors", False), "carver_sees_anchors"
+        ),
+        attention_resolution=attention,
+        additive_prior=require_bool(model_cfg.additive_prior, "additive_prior"),
         alpha=float(model_cfg.alpha),
         background_logit=float(model_cfg.background_logit),
         prior_foreground=float(model_cfg.prior_foreground),
+        prompt_only=bool(twin),
     )
     checkpoint = stage_cfg.get("boundary_checkpoint")
-    if checkpoint not in (None, "", "null"):
+    if checkpoint not in (None, "", "null") and not twin:
         pretrained = load_model(checkpoint)
         model.boundary.load_state_dict(pretrained.encoder.state_dict())
         model.boundary_lr_scale = float(stage_cfg.boundary_lr_scale)
         print(f"B(I) initialised from {checkpoint}, lr scale {model.boundary_lr_scale}")
+
+    ignore_labels: list[int] = []
+    if require_bool(stage_cfg.get("never_supervise_heldout", False), "never_supervise_heldout"):
+        held = list(targets["val"]) + list(targets["test"])
+        ignore_labels = [corpus.vocab.label(name) for name in held]
+        print(f"never_supervise_heldout: ignoring labels {held}")
+
     task = StageBTask(
         model, corpus.vocab,
         spacing=corpus.spacing,
@@ -174,6 +226,7 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         far_dilation=int(stage_cfg.far.dilation),
         field_centroid_on=str(stage_cfg.field_centroid_on),
         mask_on=str(stage_cfg.mask_on),
+        ignore_labels=ignore_labels,
     )
     return datasets, task, extra
 
@@ -182,6 +235,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("stage", choices=["a", "boundary", "b"])
     parser.add_argument("--segmenter", type=Path, help="Stage A checkpoint (overrides train.stage_b.phase_a_checkpoint)")
+    parser.add_argument(
+        "--twin", action="store_true",
+        help="trained image-free twin: freeze refine at zero, do not run B(I)",
+    )
     parser.add_argument("--overfit", type=int, metavar="N", help="train on the first N scenes only")
     parser.add_argument("--out", type=Path, help="run directory (default runs/<stage>)")
     parser.add_argument("--config", type=Path, help="config file (default configs/config.yaml)")
@@ -190,6 +247,8 @@ def main() -> int:
 
     if args.segmenter is not None and args.stage != "b":
         parser.error("--segmenter only applies to stage b")
+    if args.twin and args.stage != "b":
+        parser.error("--twin only applies to stage b")
 
     cfg = load_config(args.config, overrides=parse_overrides(args.overrides))
     corpus = Corpus.load(cfg.data.root)
@@ -212,9 +271,10 @@ def main() -> int:
             f"anchor masks: {anchors or 'live from ' + str(path)}"
             + ("" if anchors else "  (run scripts/cache_anchors.py for a ~20% faster step)")
         )
-        datasets, task, extra = stage_b(cfg, corpus, args.overfit, segmenter, anchors)
+        datasets, task, extra = stage_b(cfg, corpus, args.overfit, segmenter, args.twin, anchors)
 
-    out_dir = args.out or Path("runs") / stage_key
+    suffix = "-twin" if args.twin else ""
+    out_dir = args.out or Path("runs") / f"{stage_key}{suffix}"
     train_cfg = {
         key: value for key, value in cfg.train.to_dict().items()
         if key not in ("stage_a", "stage_b", "boundary")
@@ -255,8 +315,10 @@ def main() -> int:
           + "".join(f" | {name} {len(d)}" for name, d in extra.items())
           + f" -> {out_dir}")
     if args.stage == "b":
-        print(f"anchors: {task.anchor_source} | tau {task.model.mapper.tau}"
-              f" | flip {stage_cfg.flip_probability}")
+        mode = "twin (image-free)" if args.twin else "full (geometry + B)"
+        print(f"anchors: {task.anchor_source} | carver: {mode}"
+              f" | sees_anchors={task.model.carver_sees_anchors}"
+              f" | tau {task.model.mapper.tau} | flip {stage_cfg.flip_probability}")
         print("selecting best.pt on val-split subjects with TRAINED classes;"
               " the two held-out class curves are reported, never selected on")
     trainer.fit()

@@ -175,7 +175,7 @@ def main() -> int:
             "n_subjects": len(kept),
             "skipped": skipped,
             "origin": str(source),
-            "triple_stability": "global-unique-target",
+            "triple_stability": "train-unique-target",
             "triple_stability_stats": stab,
         },
     )

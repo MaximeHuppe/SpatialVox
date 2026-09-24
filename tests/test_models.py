@@ -95,15 +95,16 @@ def test_names_reach_stage_a_and_stop_there(model):
     assert torch.equal(first.valid, second.valid)
 
 
-def test_the_stem_reads_eight_geometry_channels_and_not_the_boundary(model):
-    """The stem is anchors, fields, ``where_raw``, and ``log(where)``. Not ``B(I)``.
+def test_the_stem_reads_geometry_only_and_not_the_boundary(model):
+    """Default stem: fields + ``where_raw`` + ``log(where)``. Not anchors, not ``B(I)``.
 
     Counted off the first convolution, and checked by swapping the volume ``B``
     reads: that tensor must be bit-identical. A coordinate grid or a concatenated
     boundary would change the count or the values.
     """
-    assert model.carver.stem[0].in_channels == 8
-    assert model.carver.stem[0].in_channels == 2 * model.n_anchors + 2
+    assert model.carver_sees_anchors is False
+    assert model.carver.stem[0].in_channels == model.n_anchors + 2
+    assert model.carver.stem[0].in_channels == 5
     assert model.boundary.out_channels not in (model.carver.stem[0].in_channels,)
     seen = {}
 
@@ -123,10 +124,20 @@ def test_the_stem_reads_eight_geometry_channels_and_not_the_boundary(model):
             second = seen["geometry"]
     finally:
         handle.remove()
-    assert first.shape[1] == 8
+    assert first.shape[1] == 5
     assert torch.equal(first, second)
     # refine is still zero, so the mask itself does not move either.
     assert torch.equal(first_out.logits, second_out.logits)
+
+
+def test_with_anchors_the_stem_has_eight_channels():
+    """``carver_sees_anchors`` true: A_i + F_i + where + log(where) = 8."""
+    with_anchors = StageB(
+        SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4,
+        carver_sees_anchors=True,
+    )
+    assert with_anchors.carver.stem[0].in_channels == 2 * with_anchors.n_anchors + 2
+    assert with_anchors.carver.stem[0].in_channels == 8
 
 
 def test_without_anchors_the_stem_has_five_channels():
@@ -137,6 +148,43 @@ def test_without_anchors_the_stem_has_five_channels():
     )
     assert bare.carver.stem[0].in_channels == bare.n_anchors + 2
     assert bare.carver.stem[0].in_channels == 5
+
+
+def test_attention_runs_at_configured_resolution():
+    """``attention_resolution`` downsamples Q/K/V before the channel softmax."""
+    model = StageB(
+        SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4,
+        attention_resolution=8,
+    )
+    assert model.carver.attention_resolution == 8
+    assert model.config["attention_resolution"] == 8
+    image, directions, names = inputs()
+    with torch.no_grad():
+        out = model(image, directions, names)
+    assert out.logits.shape[-3:] == (RESOLUTION,) * 3
+
+
+def test_the_trained_twin_never_reads_the_image():
+    """``prompt_only``: refine stays zero, B is frozen out of the optimiser."""
+    twin = StageB(
+        SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4,
+        prompt_only=True,
+    )
+    assert twin.prompt_only
+    assert twin.config["prompt_only"] is True
+    assert twin.config["center"] == twin.center
+    assert all(not p.requires_grad for p in twin.boundary.parameters())
+    assert all(not p.requires_grad for p in twin.carver.refine.parameters())
+    trainable = {id(p) for p in twin.trainable_parameters()}
+    assert trainable.isdisjoint({id(p) for p in twin.boundary.parameters()})
+    image, directions, names = inputs()
+    anchors = soft_anchors()
+    with torch.no_grad():
+        a = twin(image, directions, names, anchors=anchors).logits
+        b = twin(
+            torch.randn_like(image), directions, names, anchors=anchors,
+        ).logits
+    assert torch.equal(a, b)
 
 
 def test_no_module_in_stage_b_builds_a_coordinate_grid(model):
@@ -340,11 +388,13 @@ def test_soft_argmax_is_an_expectation_in_world_units():
 def test_the_config_carries_every_architectural_constant(model):
     """§8: ``mapper.tau``, ``mapper.min_mass``, ``alpha``, and the width of ``B``."""
     for key in ("tau", "min_mass", "alpha", "boundary_widths", "carver_width",
-                "carver_sees_anchors", "additive_prior", "spacing"):
+                "carver_sees_anchors", "attention_resolution", "additive_prior",
+                "spacing", "center", "prompt_only"):
         assert key in model.config, key
     assert "full_resolution_skip" not in model.config
     assert "use_image" not in model.config
     assert model.config["segmenter"] == SEGMENTER
+    assert model.config["center"] == model.center
 
 
 def test_a_checkpoint_round_trips_through_load_model(tmp_path, model):
