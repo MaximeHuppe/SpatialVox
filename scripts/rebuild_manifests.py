@@ -10,9 +10,12 @@ Every prompt-side knob - `data.n_anchors`, `data.shuffle_clauses`,
 which is minutes of I/O to change a line of JSON; this reads
 `scenes/*/labels.nii.gz` and rewrites the JSONL.
 
-After per-scene anchor-first generation, triples that name **different** targets
-on different subjects are dropped (`stabilize_relational_manifests`), so a
-held-out-target prompt never reuses a triple that supervised a trained class.
+After per-scene anchor-first generation, ``stabilize_relational_manifests``
+(default ``define_on="train"``) drops triples that name different targets
+**across train subjects**, from the train split only. Val/test rows are kept so
+the stratum where the same words mean a held-out class stays measurable.
+Pass the filter with ``define_on="all"`` only to reproduce the legacy global
+pass.
 
 The vocabulary, the scene list, the split assignment and the target-class split
 are all preserved exactly; only `{train,val,test}.jsonl` and the generation keys
@@ -75,10 +78,13 @@ def main() -> int:
         print(f"  {split:5s} generated {len(rows):7d}  (was {before:7d})")
 
     manifests, stab = stabilize_relational_manifests(manifests, corpus.vocab)
+    scope = stab.get("define_on", "train")
     print(
-        f"\ntriple stability (global unique target): "
+        f"\ntriple stability (define_on={scope}): "
         f"kept {stab['examples_kept']}  dropped {stab['examples_dropped_unstable_triple']}  "
         f"triples {stab['triples_stable']}/{stab['triples_total']} stable"
+        + (f"  exposure_rows_kept={stab['exposure_rows_kept']}"
+           if "exposure_rows_kept" in stab else "")
     )
     for split, rows in manifests.items():
         print(f"  {split:5s} {len(rows):7d} examples after stability filter")

@@ -172,7 +172,7 @@ def build_fixed_anatomy_corpus(root: Path, *, n_subjects: int = 20, shift: int =
     return Corpus.load(root)
 
 
-def print_report(report: dict, *, show: int = 15) -> None:
+def print_report(report: dict, *, show: int = 15, meta: dict | None = None) -> None:
     print(f"rows {report['n_rows']}  scenes {report['n_scenes']}  "
           f"distinct triples {report['n_distinct_triples']}")
     print(f"  used once:                    {report['triples_used_once']}")
@@ -181,6 +181,13 @@ def print_report(report: dict, *, show: int = 15) -> None:
           f"({report['fraction_triples_collide']:.2%} of distinct triples)")
     print(f"  within-scene multi-target:    {len(report['within_scene_multi_target'])}  "
           "(should be 0)")
+    stability = (meta or {}).get("triple_stability")
+    if stability == "train-unique-target" and report["triples_with_different_targets"]:
+        print(
+            "  note: under train-only stability, cross-split collisions are the "
+            "exposure stratum (kept on purpose). Zero is only required for "
+            "define_on=all / global-unique-target."
+        )
     if report["within_scene_multi_target"][:3]:
         print("  within-scene examples:", report["within_scene_multi_target"][:3])
     print()
