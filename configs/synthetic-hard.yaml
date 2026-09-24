@@ -195,7 +195,7 @@ train:
       field_centroid: 0.01
       far: 0.2
     far: {epsilon: 0.05, dilation: 4}
-    field_centroid_on: always
+    field_centroid_on: empty-only      # see configs/config.yaml
     # valid | all - see configs/config.yaml. `all` reproduces mri-stage-b and the
     # two arms; `valid` leaves "names nothing" to the null head alone.
     mask_on: valid

@@ -184,13 +184,10 @@ train:
       field_centroid: 0.01              # the same, against the field's own centre
       far: 0.2                          # L_far
     far: {epsilon: 0.05, dilation: 8}   # mass outside dilate(where_raw > epsilon) is penalised
-    field_centroid_on: always           # always | empty-only. `always` is §5's table read
-                                        # literally. Measured: the field's centre of mass sits
-                                        # 20.2 mm from the target's centroid (the conjunction is
-                                        # an elongated wedge and the target is near its apex), so
-                                        # under `always` this term pulls the heatmap ~20 mm off on
-                                        # every valid prompt. `empty-only` restricts it to prompts
-                                        # that name nothing, where it is the only target there is.
+    field_centroid_on: empty-only      # empty-only | always. `empty-only` is the setting:
+                                        # on a valid prompt the field centre sits ~20 mm off the
+                                        # target and was pulling geometry_features away from the
+                                        # mask. The term applies only when the prompt names nothing.
     mask_on: valid                      # valid | all. Which prompts the MASK term supervises.
                                         # `all` also trains prompts that name nothing towards the
                                         # empty mask. Measured (relational-seed1), that taught the
