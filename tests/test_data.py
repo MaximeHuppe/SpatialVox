@@ -19,8 +19,10 @@ from src.data import (
     import_corpus,
     load_nifti,
     normalize,
+    relational_triple_key,
     rotate,
     save_nifti,
+    stabilize_relational_manifests,
 )
 from src.geometry import (
     OPPOSITE, centroids_world, classify, solutions_for, volume_center_world,
@@ -310,3 +312,86 @@ def test_the_dataset_emits_cached_anchors_in_slot_order(corpus, tmp_path):
         channel = label - 1
         assert float(masks[slot, channel, channel, channel]) == 1.0
         assert float(masks[slot].sum()) == 1.0
+
+
+# -- cross-subject triple stability ------------------------------------------
+def test_relational_triple_key_ignores_clause_order(vocab):
+    """Shuffling slots must not change the identity of a triple."""
+    a = {"anchors": [1, 2, 3], "directions": ["superior", "medial", "anterior"]}
+    b = {"anchors": [3, 1, 2], "directions": ["anterior", "superior", "medial"]}
+    assert relational_triple_key(a, vocab) == relational_triple_key(b, vocab)
+
+
+def test_relational_triple_key_keeps_pairing(vocab):
+    """Swapping which anchor has which direction is a different triple."""
+    a = {"anchors": [1, 2, 3], "directions": ["superior", "medial", "anterior"]}
+    b = {"anchors": [2, 1, 3], "directions": ["superior", "medial", "anterior"]}
+    assert relational_triple_key(a, vocab) != relational_triple_key(b, vocab)
+
+
+def test_stabilize_drops_triples_that_name_different_targets_across_subjects(vocab):
+    """The MRI leak: same sentence → thalamus on A, caudate on B → drop both."""
+    shared = {
+        "anchors": [1, 2, 3],
+        "directions": ["superior", "medial", "anterior"],
+        "prompt": "x",
+    }
+    manifests = {
+        "train": [
+            {**shared, "scene": "s0", "id": "s0__a", "target": vocab.label("alpha")},
+            {**shared, "scene": "s1", "id": "s1__g", "target": vocab.label("gamma")},
+            {
+                "scene": "s0", "id": "s0__stable", "target": vocab.label("beta"),
+                "anchors": [4, 5, 6], "directions": ["inferior", "lateral", "posterior"],
+                "prompt": "y",
+            },
+            {
+                "scene": "s1", "id": "s1__stable", "target": vocab.label("beta"),
+                "anchors": [4, 5, 6], "directions": ["inferior", "lateral", "posterior"],
+                "prompt": "y",
+            },
+        ],
+        "val": [],
+        "test": [],
+    }
+    filtered, stats = stabilize_relational_manifests(manifests, vocab)
+    kept_ids = {row["id"] for row in filtered["train"]}
+    assert kept_ids == {"s0__stable", "s1__stable"}
+    assert stats["examples_dropped_unstable_triple"] == 2
+    assert stats["triples_colliding"] == 1
+    assert stats["triples_stable"] == 1
+
+
+def test_stabilize_keeps_a_triple_reused_for_the_same_target(vocab):
+    row = {
+        "anchors": [1, 2, 3], "directions": ["superior", "medial", "anterior"],
+        "target": vocab.label("alpha"), "prompt": "x",
+    }
+    manifests = {
+        "train": [
+            {**row, "scene": "s0", "id": "a"},
+            {**row, "scene": "s1", "id": "b"},
+        ],
+    }
+    filtered, stats = stabilize_relational_manifests(manifests, vocab)
+    assert len(filtered["train"]) == 2
+    assert stats["examples_dropped_unstable_triple"] == 0
+    assert stats["triples_colliding"] == 0
+
+
+def test_stabilize_drops_cross_split_train_vs_heldout_collision(vocab):
+    """A held-out-target row must not reuse a triple that supervised a train target."""
+    shared = {
+        "anchors": [1, 2, 3],
+        "directions": ["superior", "medial", "anterior"],
+        "prompt": "x",
+    }
+    manifests = {
+        "train": [{**shared, "scene": "s0", "id": "train_hit", "target": vocab.label("alpha")}],
+        "val": [{**shared, "scene": "s1", "id": "held_hit", "target": vocab.label("gamma")}],
+    }
+    filtered, stats = stabilize_relational_manifests(manifests, vocab)
+    assert filtered["train"] == []
+    assert filtered["val"] == []
+    assert stats["examples_dropped_unstable_triple"] == 2
+    assert stats["triples_colliding"] == 1

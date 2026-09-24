@@ -10,6 +10,10 @@ Every prompt-side knob - `data.n_anchors`, `data.shuffle_clauses`,
 which is minutes of I/O to change a line of JSON; this reads
 `scenes/*/labels.nii.gz` and rewrites the JSONL.
 
+After per-scene anchor-first generation, triples that name **different** targets
+on different subjects are dropped (`stabilize_relational_manifests`), so a
+held-out-target prompt never reuses a triple that supervised a trained class.
+
 The vocabulary, the scene list, the split assignment and the target-class split
 are all preserved exactly; only `{train,val,test}.jsonl` and the generation keys
 of `meta.json` are rewritten.
@@ -27,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from src.config import load_config, parse_overrides
-from src.data import Corpus, build_examples, load_nifti, write_corpus
+from src.data import Corpus, build_examples, load_nifti, stabilize_relational_manifests, write_corpus
 
 
 def main() -> int:
@@ -68,7 +72,16 @@ def main() -> int:
             )
         manifests[split] = rows
         before = sum(1 for _ in (root / f"{split}.jsonl").read_text().splitlines() if _.strip())
-        print(f"  {split:5s} {before:7d} -> {len(rows):7d} examples")
+        print(f"  {split:5s} generated {len(rows):7d}  (was {before:7d})")
+
+    manifests, stab = stabilize_relational_manifests(manifests, corpus.vocab)
+    print(
+        f"\ntriple stability (global unique target): "
+        f"kept {stab['examples_kept']}  dropped {stab['examples_dropped_unstable_triple']}  "
+        f"triples {stab['triples_stable']}/{stab['triples_total']} stable"
+    )
+    for split, rows in manifests.items():
+        print(f"  {split:5s} {len(rows):7d} examples after stability filter")
 
     if args.dry_run:
         print("\ndry run: nothing written")
@@ -81,7 +94,12 @@ def main() -> int:
         n_anchors=n_anchors,
         targets=corpus.meta["targets"],
         shuffle_clauses=shuffle,
-        extra={k: v for k, v in corpus.meta.items() if k in ("source", "label_scheme", "n_subjects", "origin")},
+        extra={
+            **{k: v for k, v in corpus.meta.items()
+               if k in ("source", "label_scheme", "n_subjects", "origin")},
+            "triple_stability": "global-unique-target",
+            "triple_stability_stats": stab,
+        },
     )
     print(f"\nwritten to {root}")
     print("NOTE: manifests changed, so every checkpoint trained on the old ones is"
