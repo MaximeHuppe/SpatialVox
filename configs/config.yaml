@@ -114,7 +114,8 @@ model:
       dilate_radius: 4            # ADR: start at 4; measure coverage vs neighbour invasion
       region_threshold: 0.5
       max_seeds: 16
-      intensity_tol: 0.15         # |I - I_seed| for intensity flood
+      intensity_tol: 1.0          # scale on std(I|region); use tol_mode absolute for fixed bands
+      tol_mode: std               # std | absolute — absolute 0.15 was zero-recall on zscore MRI
       score_null: 0.5             # empty answer when best where_raw(centroid) is below this
     carver:
       width: 16                   # B2 parent path only (`answer_mode: carver`)

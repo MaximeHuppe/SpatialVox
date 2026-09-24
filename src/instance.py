@@ -104,6 +104,31 @@ def local_maxima_seeds(
     return [(int(z), int(y), int(x)) for z, y, x in picked.tolist()]
 
 
+def _resolve_intensity_tol(
+    image: np.ndarray,
+    region: np.ndarray,
+    intensity_tol: float,
+    *,
+    tol_mode: str = "std",
+) -> float:
+    """Absolute intensity band, or a multiple of ``std(I | region)``.
+
+    Fixed ``0.15`` is fine on synthetic unit-range blobs and far too tight on
+    z-scored MRI, where within-structure texture routinely exceeds that. The
+    shipped default is therefore ``tol_mode='std'`` with ``intensity_tol`` as a
+    scale on the region's intensity std.
+    """
+    scale = max(float(intensity_tol), 0.0)
+    if tol_mode == "absolute":
+        return max(scale, 1e-6)
+    if tol_mode != "std":
+        raise ValueError(f"tol_mode must be 'std' or 'absolute', got {tol_mode!r}")
+    vals = image[region]
+    if vals.size == 0:
+        return max(scale, 1e-6)
+    return max(scale * float(vals.std()), 1e-4)
+
+
 def _flood_intensity(
     image: np.ndarray,
     seed: tuple[int, int, int],
@@ -141,21 +166,45 @@ def propose_seed_flood(
     dilate_radius: int = 4,
     region_threshold: float = 0.5,
     max_seeds: int = 16,
-    intensity_tol: float = 0.15,
+    intensity_tol: float = 1.0,
+    tol_mode: str = "std",
     min_voxels: int = 8,
 ) -> tuple[Tensor, Tensor]:
-    """Seed-flood proposals inside the relational region."""
+    """Seed-flood proposals inside the relational region.
+
+    ``intensity_tol`` is an absolute band when ``tol_mode='absolute'``, otherwise
+    a multiple of ``std(I)`` inside the region (MRI default).
+    """
     if image.ndim == 4:
         image = image[0]
     if where_raw.ndim == 4:
         where_raw = where_raw[0]
     region = region_mask(where_raw, region_threshold, dilate_radius)[0, 0]
     seeds = local_maxima_seeds(where_raw, region, max_seeds=max_seeds, image=image)
+    # Always keep the region's where_raw argmax — local-max pool can miss a flat peak.
+    flat = (where_raw.float() * (region > 0.5).float()).flatten()
+    if flat.numel() and float(flat.max()) > 0:
+        idx = int(flat.argmax())
+        d, h, w = where_raw.shape
+        peak = (idx // (h * w), (idx // w) % h, idx % w)
+        if peak not in seeds:
+            seeds = [peak, *seeds][:max_seeds]
     image_np = image.detach().float().cpu().numpy()
     region_np = region.detach().cpu().numpy() > 0.5
+    tol = _resolve_intensity_tol(image_np, region_np, intensity_tol, tol_mode=tol_mode)
+    # Drop near-median seeds: a roomy where_raw plateau over CSF/background
+    # otherwise grows a large empty body whose centroid still sits in the field
+    # and outscores the real structure under the pure where(centroid) rule.
+    if region_np.any():
+        median = float(np.median(image_np[region_np]))
+        spread = float(np.std(image_np[region_np])) + 1e-6
+        seeds = [
+            s for s in seeds
+            if abs(float(image_np[s]) - median) >= 0.25 * spread
+        ] or seeds
     bodies: list[np.ndarray] = []
     for seed in seeds:
-        body = _flood_intensity(image_np, seed, region_np, intensity_tol=float(intensity_tol))
+        body = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
         if int(body.sum()) < int(min_voxels):
             continue
         if any(float((body & other).sum()) / max(float(body.sum()), 1.0) > 0.9 for other in bodies):
@@ -217,7 +266,8 @@ def run_instance(
     dilate_radius: int = 4,
     region_threshold: float = 0.5,
     max_seeds: int = 16,
-    intensity_tol: float = 0.15,
+    intensity_tol: float = 1.0,
+    tol_mode: str = "std",
     min_voxels: int = 8,
     score_null: float = 0.5,
 ) -> InstanceResult:
@@ -228,6 +278,7 @@ def run_instance(
         region_threshold=region_threshold,
         max_seeds=max_seeds,
         intensity_tol=intensity_tol,
+        tol_mode=tol_mode,
         min_voxels=min_voxels,
     )
     scores, centroids = score_proposals(proposals, where_raw, spacing)

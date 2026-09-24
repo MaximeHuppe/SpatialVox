@@ -140,7 +140,8 @@ model:
       dilate_radius: 4
       region_threshold: 0.5
       max_seeds: 16
-      intensity_tol: 0.15
+      intensity_tol: 1.0
+      tol_mode: std
       score_null: 0.5
     carver:
       width: 16

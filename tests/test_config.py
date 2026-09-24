@@ -48,7 +48,8 @@ def test_the_shipped_config_builds_both_stages(cfg):
         dilate_radius=int(block.get("instance", {}).get("dilate_radius", 4)),
         region_threshold=float(block.get("instance", {}).get("region_threshold", 0.5)),
         max_seeds=int(block.get("instance", {}).get("max_seeds", 16)),
-        intensity_tol=float(block.get("instance", {}).get("intensity_tol", 0.15)),
+        intensity_tol=float(block.get("instance", {}).get("intensity_tol", 1.0)),
+        tol_mode=str(block.get("instance", {}).get("tol_mode", "std")),
         score_null=float(block.get("instance", {}).get("score_null", 0.5)),
     )
     # The relational half is meant to be small beside the frozen segmenter.

@@ -6,7 +6,9 @@ Measures, on a corpus split:
 * mapper gate: fraction of target centroids with ``where_raw > 0.5``;
 * oracle instance: Dice of the labelled structure whose centroid maximises
   ``where_raw`` (design ceiling ~0.97 on unique prompts);
-* seed-flood recall@K: whether some proposal overlaps the GT body (IoU ≥ 0.5).
+* seed-flood recall@K: whether some proposal overlaps the GT body (IoU ≥ 0.5);
+* diagnostics: mean best IoU, mean K, GT coverage by the dilated region,
+  and flood-from-GT-centroid IoU (upper bound on intensity flood alone).
 
     scripts/oracle_instance.py --split val --limit 200
 """
@@ -26,8 +28,22 @@ from src.config import load_config, parse_overrides
 from src.data import Corpus, ExampleDataset
 from src.engine import dice_iou
 from src.geometry import volume_center_world
-from src.instance import oracle_label_instances, propose_seed_flood
-from src.mapper import PositionalMapper3D
+from src.instance import (
+    _flood_intensity,
+    _resolve_intensity_tol,
+    oracle_label_instances,
+    propose_seed_flood,
+    region_mask,
+)
+
+
+def _cfg_get(block, key, default):
+    if block is None:
+        return default
+    if hasattr(block, "get"):
+        value = block.get(key, default)
+        return default if value is None else value
+    return default
 
 
 def main() -> int:
@@ -45,20 +61,26 @@ def main() -> int:
         corpus, args.split, targets=targets, limit=args.limit,
         normalize_mode=cfg.data.normalize,
     )
+    from src.mapper import PositionalMapper3D
+
     mapper = PositionalMapper3D(
         tau=float(cfg.model.stage_b.mapper.tau),
         min_mass=float(cfg.model.stage_b.mapper.min_mass),
     )
     inst = cfg.model.stage_b.get("instance", {})
-    dilate_radius = int(inst.get("dilate_radius", 4) if hasattr(inst, "get") else 4)
+    dilate_radius = int(_cfg_get(inst, "dilate_radius", 4))
+    intensity_tol = float(_cfg_get(inst, "intensity_tol", 1.0))
+    tol_mode = str(_cfg_get(inst, "tol_mode", "std"))
+    region_threshold = float(_cfg_get(inst, "region_threshold", 0.5))
+    max_seeds = int(_cfg_get(inst, "max_seeds", 16))
 
     gate, oracle_dice, recall = [], [], []
+    best_ious, n_props, gt_cover, gt_flood = [], [], [], []
     for item in dataset:
         labels = item["labels"].numpy()
         target = int(item["target"])
         if target == 0:
             continue
-        # Oracle soft anchors from labels (offline ceiling, not Stage A).
         anchors = torch.zeros(1, 3, *labels.shape)
         for slot, label in enumerate(item["anchors"].tolist()):
             anchors[0, slot] = torch.from_numpy((labels == int(label)).astype(np.float32))
@@ -80,25 +102,55 @@ def main() -> int:
         _, _, oracle_mask = oracle_label_instances(labels, where, corpus.spacing)
         gt = torch.from_numpy((labels == target).astype(np.float32))[None, None]
         pred = torch.from_numpy(oracle_mask)[None, None]
-        oracle_dice.append(float(dice_iou(pred, gt)[0]))
+        oracle_dice.append(float(dice_iou(pred, gt)[0].reshape(-1)[0]))
 
         image = item["image"]
+        region = region_mask(where, region_threshold, dilate_radius)[0, 0]
+        gt_np = (labels == target)
+        gt_cover.append(float(gt_np[region.numpy() > 0.5].mean()) if gt_np.any() else 0.0)
+
         proposals, _ = propose_seed_flood(
-            image, where, dilate_radius=dilate_radius, max_seeds=16, min_voxels=4,
+            image, where,
+            dilate_radius=dilate_radius,
+            region_threshold=region_threshold,
+            max_seeds=max_seeds,
+            intensity_tol=intensity_tol,
+            tol_mode=tol_mode,
+            min_voxels=4,
         )
+        n_props.append(int(proposals.shape[0]))
+        best = 0.0
         hit = False
         for k in range(proposals.shape[0]):
-            iou = float(dice_iou(proposals[k][None, None], gt)[1])
+            iou = float(dice_iou(proposals[k][None, None], gt)[1].reshape(-1)[0])
+            best = max(best, iou)
             if iou >= 0.5:
                 hit = True
-                break
+        best_ious.append(best)
         recall.append(hit)
 
+        # Upper bound: flood from the GT centroid with the same tolerance.
+        image_np = image[0].numpy() if image.ndim == 4 else image.numpy()
+        region_np = region.numpy() > 0.5
+        seed = (iz, iy, ix)
+        if region_np[seed]:
+            tol = _resolve_intensity_tol(image_np, region_np, intensity_tol, tol_mode=tol_mode)
+            flooded = _flood_intensity(image_np, seed, region_np, intensity_tol=tol)
+            gt_flood.append(float(dice_iou(
+                torch.from_numpy(flooded.astype(np.float32))[None, None], gt
+            )[1].reshape(-1)[0]))
+        else:
+            gt_flood.append(0.0)
+
     n = max(len(gate), 1)
-    print(f"split={args.split} n={len(gate)}")
+    print(f"split={args.split} n={len(gate)}  tol_mode={tol_mode} intensity_tol={intensity_tol} r={dilate_radius}")
     print(f"mapper_gate (where>0.5 at target centroid): {sum(gate) / n:.4f}")
     print(f"oracle_instance Dice:                     {sum(oracle_dice) / n:.4f}")
     print(f"seed_flood recall@K (IoU≥0.5):            {sum(recall) / n:.4f}")
+    print(f"mean best IoU over proposals:             {sum(best_ious) / n:.4f}")
+    print(f"mean K proposals:                         {sum(n_props) / n:.2f}")
+    print(f"mean GT voxel coverage by dilated region: {sum(gt_cover) / n:.4f}")
+    print(f"mean IoU flood-from-GT-centroid:           {sum(gt_flood) / n:.4f}")
     return 0
 
 

@@ -647,7 +647,8 @@ class StageB(nn.Module):
         dilate_radius: int = 4,
         region_threshold: float = 0.5,
         max_seeds: int = 16,
-        intensity_tol: float = 0.15,
+        intensity_tol: float = 1.0,
+        tol_mode: str = "std",
         score_null: float = 0.5,
     ) -> None:
         super().__init__()
@@ -665,7 +666,7 @@ class StageB(nn.Module):
             background_logit=float(background_logit), prior_foreground=float(prior_foreground),
             dilate_radius=int(dilate_radius), region_threshold=float(region_threshold),
             max_seeds=int(max_seeds), intensity_tol=float(intensity_tol),
-            score_null=float(score_null),
+            tol_mode=str(tol_mode), score_null=float(score_null),
         )
         self.n_anchors = int(n_anchors)
         self.spacing = tuple(float(v) for v in spacing)
@@ -678,6 +679,7 @@ class StageB(nn.Module):
         self.region_threshold = float(region_threshold)
         self.max_seeds = int(max_seeds)
         self.intensity_tol = float(intensity_tol)
+        self.tol_mode = str(tol_mode)
         self.score_null = float(score_null)
 
         self.segmenter = StageA(**segmenter)
@@ -796,6 +798,7 @@ class StageB(nn.Module):
                 region_threshold=self.region_threshold,
                 max_seeds=self.max_seeds,
                 intensity_tol=self.intensity_tol,
+                tol_mode=self.tol_mode,
                 score_null=self.score_null,
             )
             # Finite background so BCE against a disagreeing target stays finite.
