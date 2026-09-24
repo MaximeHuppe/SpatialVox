@@ -76,7 +76,6 @@ Silicon).
 .venv/bin/python scripts/train.py b --overfit 1 --set train.stage_b.epochs=120   # wiring test
 .venv/bin/python scripts/train.py boundary                                       # optional: pretrain B(I)
 .venv/bin/python scripts/train.py b
-.venv/bin/python scripts/train.py b --prompt-only    # the mandatory ablation: B(I) removed
 
 # 5. the report
 .venv/bin/python scripts/evaluate.py runs/stage_b/best.pt --split val --classes val

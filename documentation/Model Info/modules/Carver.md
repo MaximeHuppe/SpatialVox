@@ -5,94 +5,99 @@ tags:
 
 ### Relations
 - `StageB.carver`; the only module that produces the mask
-- reads [[BoundaryEncoder]] (twice) and [[PositionalMapper3D]] (six channels plus three scalars-as-planes)
-- reads the detached anchor masks from [[MODEL PHASE A]]
+- stem reads geometry from [[PositionalMapper3D]] and, when `carver_sees_anchors`, the detached anchor masks from [[MODEL PHASE A]]
+- reads [[BoundaryEncoder]] only as keys and values
 - owns the heatmap 1×1 whose soft-argmax is the reported centroid
 - documented in [[SpatialVox#12. Step 8 — Carver]]
 
 > §N in this note is a section of the original proposal; [[SpatialVox#20. Deviations from the original proposal]] maps each one to the document.
 
-The WHAT. Ten channels in, target logits and a heatmap out. It never receives a name, a direction id, a token or a coordinate grid — everything it knows about the prompt arrives as geometry that [[PositionalMapper3D]] already computed.
+The mask head. Eight geometry channels in, target logits and a heatmap out. It never receives a name, a direction id, a token or a coordinate grid — everything it knows about the prompt arrives as geometry that [[PositionalMapper3D]] already computed. `boundary` is not a stem channel.
 
 ```mermaid
 flowchart LR
-    A["B(I) 16@128³<br/>A_i 3@128³, F_i 3@128³<br/>where, log where, mass"] --> B["**Carver**<br/>stride-2 stem → 2 blocks"]
-    B --> C["logits [B,1,128³]"]
-    B --> D["heatmap [B,1,64³]"]
+    A["A_i 3, F_i 3<br/>where, log where"] --> B["**stem**<br/>stride 2 → 2 blocks"]
+    B --> G["geometry_features 16@64³"]
+    G --> C["coarse 1×1, upsample"]
+    G --> H["heatmap 1×1"]
+    G --> Q["Q, upsample"]
+    D["B(I) 16@128³"] --> K["K, V"]
+    Q --> R["channel attention"]
+    K --> R
+    R --> F["refine, zero at init"]
+    C --> L["logits"]
+    F --> L
 ```
 
 ---
 
 ### Params (`__init__`)
 
-`Carver(in_channels, boundary_channels, *, width=16, blocks=2, act="leaky_relu", full_resolution_skip=True, prior_foreground=0.0016)`
+`Carver(in_channels, boundary_channels, *, width=16, blocks=2, act="leaky_relu", prior_foreground=0.0016)`
 
 | param | source | shipped | role |
 | --- | --- | --- | --- |
-| `in_channels` | derived | `25` | `boundary_channels + (2 if carver_sees_anchors else 1)·n_anchors + 3`: 22 without the anchor masks, 9 in the prompt-only ablation |
-| `boundary_channels` | `B.out_channels` | `16` | 0 when `use_image=False` |
+| `in_channels` | derived | `8` | `(2 if carver_sees_anchors else 1)·n_anchors + 2`: 5 without the anchor masks. Not `boundary` |
+| `boundary_channels` | `B.out_channels` | `16` | width of Q, K, V, and `refine`. Required |
 | `width` | `model.stage_b.carver.width` | `16` | §4's "two 16-channel blocks" |
 | `blocks` | `model.stage_b.carver.blocks` | `2` | residual blocks after the stem |
-| `full_resolution_skip` | `model.stage_b.carver.full_resolution_skip` | `True` | carry `B(I)` past the stem |
-| `prior_foreground` | `model.stage_b.prior_foreground` | `0.0016` | head bias |
+| `prior_foreground` | `model.stage_b.prior_foreground` | `0.0016` | `coarse` bias |
 
 | attribute | what | # params |
 | --- | --- | --- |
-| `stem` | `ConvBlock(25 → 16, stride 2)` | 10,800 |
-| `blocks` | `2 × ResBlock(16)` | 27,648 |
-| `head` | `Conv3d(16+16 → 1, 1×1)` — zero weight, bias `logit(0.0016)` | 33 |
-| `heatmap` | `Conv3d(16 → 1, 1×1)` | 17 |
-| **total** | | **38,498** |
+| `stem` | `ConvBlock(8 → 16, stride 2)` | 3,456 |
+| `blocks` | `2 × ResBlock(16)` → `geometry_features` | 27,648 |
+| `coarse` | `Conv3d(16 → 1, 1×1)` — zero weight, bias `logit(0.0016)` | 17 |
+| `heatmap` | `Conv3d(16 → 1, 1×1)`, separate, default init | 17 |
+| `query` | `Conv3d(16 → 16, 1×1)` on `geometry_features`. Default init | 272 |
+| `key`, `value` | `Conv3d(16 → 16, 1×1)` on `boundary`. Default init | 544 |
+| `refine` | `Conv3d(16 → 1, 1×1)` — weight and bias **zero** | 17 |
+| **total** | | **31,971** |
 
-**38.5k parameters** — 14% of Stage B's trainable weight, against [[BoundaryEncoder]]'s 228.5k. The carver is the small half.
+**32.0k parameters** — 12.2% of Stage B's trainable weight, against [[BoundaryEncoder]]'s 228.5k.
 
-`head` weight is zeroed and its bias is `log(p/(1−p))` with `p = 0.0016`, so an untrained model outputs the base rate rather than 0.5. One structure covers well under 1% of a volume; without this, training begins by pushing two million background logits down before Dice carries usable gradient.
+`coarse` weight is zeroed and its bias is `log(p/(1−p))` with `p = 0.0016`, so an untrained model outputs the base rate rather than 0.5. `query`, `key`, and `value` are **not** zeroed: a zero projection makes `retrieved` zero, and a zero `refine` then gets no gradient. `refine` itself is zero, so at step 0 the logits equal the upsampled coarse and do not depend on `boundary`.
 
-#### The ten channels, counted
+#### The eight channels, counted
 
-`25 = 16 + 3 + 3 + 1 + 1 + 1`
+`8 = 3 + 3 + 1 + 1`
 
 | channels | what | from |
 | --- | --- | --- |
-| 16 | `B(I)` | [[BoundaryEncoder]] |
 | 3 | `A_0..2` — detached soft anchor masks | [[MODEL PHASE A]], `stop_gradient(sigmoid(·))` |
 | 3 | `F_0..2` — the three pyramids | [[PositionalMapper3D]] |
 | 1 | `where_raw` | ” |
 | 1 | `log(where_raw)`, clamped and normalised | ” |
-| 1 | `log(where_mass)`, broadcast across space | ” |
 
-With `carver_sees_anchors: false` the three `A_i` rows drop out: 22 channels, a 9,504-parameter stem, 37,202 parameters in all. The anchor exclusion is unchanged. That arm has not yet run with the flag actually off (`B11 arm-noanchor` (archived)).
+`log(where_mass)` is not here. It is one scalar broadcast over the volume, and `InstanceNorm3d(affine=False)` subtracts the spatial mean, so that channel would be identically zero. [[NullHead]] still reads the scalar.
 
-`tests/test_models.py::test_the_carver_takes_exactly_the_ten_declared_channels` counts this off `stem[0].in_channels`, so a smuggled coordinate grid changes the number and fails.
+With `carver_sees_anchors: false` the three `A_i` rows drop out: 5 channels, a 2,160-parameter stem, 30,675 parameters in all. The anchor exclusion is unchanged. That arm has not yet run with the flag actually off (`B11 arm-noanchor` (archived)).
 
-Both logs are clamped at `LOG_FLOOR = 1e-9` and divided by `−log(LOG_FLOOR)`, mapping them onto `[-1, 0]`. Measured, `where_mass` spans **1e-21 to 2e-2**: the raw number is indistinguishable from zero after one convolution whose other nine channels live in `[0,1]`. Monotone reparameterisation, same information ([[SpatialVox#20.2 Quantities rescaled to be usable (monotone, no new information)]]).
+`tests/test_models.py::test_the_stem_reads_eight_geometry_channels_and_not_the_boundary` counts this off `stem[0].in_channels` and checks that swapping the volume `B` reads leaves the stem input bit-identical.
+
+`log(where_raw)` is clamped at `LOG_FLOOR = 1e-9` and divided by `−log(LOG_FLOOR)`, mapping it onto `[-1, 0]`.
 
 ---
 
 ### Source Code
 
 ```python
-class Carver(nn.Module):
-    def __init__(self, in_channels, boundary_channels, *, width=16, blocks=2,
-                 act="leaky_relu", full_resolution_skip=True, prior_foreground=0.0016):
-        super().__init__()
-        self.full_resolution_skip = bool(full_resolution_skip) and boundary_channels > 0
-        self.stem = ConvBlock(in_channels, width, act, stride=2)
-        self.blocks = nn.Sequential(*[ResBlock(width, act) for _ in range(int(blocks))])
-        self.head = nn.Conv3d(width + (boundary_channels if self.full_resolution_skip else 0), 1, 1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.constant_(self.head.bias, prior_bias(prior_foreground))
-        self.heatmap = nn.Conv3d(width, 1, 1)
-
-    def forward(self, x: Tensor, boundary: Tensor | None) -> tuple[Tensor, Tensor]:
-        features = self.blocks(self.stem(x))
-        width = features.shape[1]
-        coarse = F.conv3d(features, self.head.weight[:, :width], self.head.bias)
-        logits = F.interpolate(coarse, size=x.shape[2:], mode="trilinear", align_corners=True)
-        if self.full_resolution_skip:
-            logits = logits + F.conv3d(boundary, self.head.weight[:, width:])
-        return logits, self.heatmap(features)
+def forward(self, geometry: Tensor, boundary: Tensor) -> tuple[Tensor, Tensor]:
+    geometry_features = self.blocks(self.stem(geometry))
+    coarse = F.interpolate(
+        self.coarse(geometry_features), size=geometry.shape[2:],
+        mode="trilinear", align_corners=True,
+    )
+    query = F.interpolate(
+        self.query(geometry_features), size=boundary.shape[2:],
+        mode="trilinear", align_corners=True,
+    )
+    retrieved = channel_attention(query, self.key(boundary), self.value(boundary))
+    logits = coarse + self.refine(retrieved)
+    return logits, self.heatmap(geometry_features)
 ```
+
+`channel_attention` chunks the voxel axis (4096). Softmax is over the key channel: `score_ij = Q_i K_j / sqrt(C)`, `retrieved_i = Σ_j α_ij V_j`. It does not build `[B, 16, 16, 128³]`.
 
 ---
 
@@ -100,31 +105,19 @@ class Carver(nn.Module):
 
 | step | shape | note |
 | --- | --- | --- |
-| `x` | `[B,25,128³]` | concatenated in the *boundary features'* dtype, so the 25-channel tensor stays off the float32 path under autocast |
-| `stem` | `[B,16,64³]` | stride 2; what keeps 3×3×3 affordable on a 128³ volume |
-| `blocks` | `[B,16,64³]` | two residual blocks — §4's "two 16-channel blocks" |
-| `head`, feature half | `[B,1,64³]` | first 16 input weights of the 1×1, plus its bias, on the working grid |
-| `interpolate` | `[B,1,128³]` | trilinear, back to full — **one channel** |
-| `head`, `B(I)` half | `[B,1,128³]` | last 16 input weights on `B(I)`, added; only when `full_resolution_skip` |
-| `heatmap` | `[B,1,64³]` | from the **pre-upsample** features |
+| `geometry` | `[B,8,128³]` | stem input. `boundary` is not in it |
+| `geometry_features` | `[B,16,64³]` | stem, stride 2, then two residual blocks |
+| `coarse` | `[B,1,64³]` then `[B,1,128³]` | zero weight, prior bias, one channel upsampled |
+| `heatmap` | `[B,1,64³]` | separate 1×1 on `geometry_features`. Independent of `boundary` |
+| `query` | `[B,16,128³]` | 1×1 on `geometry_features`, then trilinear |
+| `key`, `value` | `[B,16,128³]` | 1×1s on `boundary` |
+| `logits` | `[B,1,128³]` | upsampled coarse + `refine(retrieved)`. `refine` is zero at init |
 
-#### The head runs in two exact halves (2026-09-22)
-
-Until 2026-09-22 the forward upsampled all 16 feature channels, concatenated `B(I)` into a `[B,32,128³]` tensor and applied the 1×1 there. A 1×1 convolution and a trilinear upsample are both linear, and the upsample's weights sum to one, so $\mathrm{head}(\mathrm{cat}[\mathrm{up}(f), B]) = \mathrm{up}(W_f f + b) + W_B B$ exactly. It is the same function with the same parameters, and old checkpoints load unchanged. Measured with forward and backward in bf16, the carver alone uses 40% less peak memory (3.6 → 2.1 GB at 128³ with batch 4) and runs 7–8% faster; the fp32 difference is 1.9e-6. Pinned by `test_the_split_mask_head_is_exactly_the_1x1_on_the_upsampled_concatenation`; see `_update_ideas/2026-09-22-null-head-decides-emptiness.md`.
-
-#### What the mask is trained on: `mask_on`
-
-Since 2026-09-22 the shipped setting is **`mask_on: valid`**. The mask term only supervises prompts that name a structure, and "names nothing" is left to [[NullHead]] through `null_gated`. Under the earlier `all`, flips that name nothing trained the mask towards empty. That made the carver its own image-based null detector: silent on 94.5% of impossible prompts, and also on 75% of held-out prompts that do name a structure ([[B03 relational-seed1]]). See [[SpatialVox#14. Step 10 — Losses]].
-
-#### `full_resolution_skip` — an addition, recorded
-
-§4 reads literally as *"stride-2 stem, then 1×1 up to 128³"*, which makes the stem the only path from `B(I)` to the output — every full-resolution boundary detail destroyed before the first convolution, leaving a trilinear upsample of a 2.5 mm grid. That defeats §4's own claim that the mask is drawn where `B(I)` carries a boundary, on a corpus whose targets are 300–4000 voxel nuclei.
-
-With the flag on, the final 1×1 reads `concat(upsample(residual), B(I))`, computed in the two exact halves above. It is still one 1×1 at 128³, but it sees boundaries at their own resolution. It is a **flag, not a silent change**, so the literal form stays runnable as an ablation ([[SpatialVox#20.4 Architectural additions]]).
+Checkpoints of the previous carver do not load. There is no weight translator.
 
 #### The heatmap is a separate head
 
-Not a reading of the mask. §4 asks for *"a separate 1×1, soft-argmax → centroid"*, and §5 keeps the heatmap trained when the mask target is empty — which only works if it is independent of the mask. Taken from the 64³ working grid; soft-argmax is an **expectation**, so the coordinate is continuous and is not quantised to that grid ([[SpatialVox#20.3 Where the specification was ambiguous]]).
+Not a reading of the mask, and not a function of `boundary`. §4 asks for *"a separate 1×1, soft-argmax → centroid"*. Taken from the 64³ working grid; soft-argmax is an **expectation**, so the coordinate is continuous ([[SpatialVox#20.3 Where the specification was ambiguous]]).
 
 #### Anchor exclusion happens *after* the carver
 
@@ -134,21 +127,24 @@ In [[MODEL PHASE B]], not here:
 logits = logits.masked_fill(anchors.amax(dim=1, keepdim=True) > 0.5, self.background_logit)
 ```
 
-The anchors are the given, not the answer. It uses the **predicted soft mask**, never the label volume, and it is not dilated. `background_logit = −10.0`, finite rather than `−inf`: a `−inf` makes `BCEWithLogits` produce `nan` whenever the target disagrees, which happens when Stage A paints part of the target as an anchor — a real event that deserves a finite gradient, not a crashed run.
+The anchors are the given, not the answer. It uses the **predicted soft mask**, never the label volume, and it is not dilated. `background_logit = −10.0`, finite rather than `−inf`.
 
 ---
 
 ### Invariants
 
 1. **No name, no direction id, no token, no coordinate grid.** Everything prompt-derived arrives as geometry.
-2. **Exactly ten channel groups**, counted off the first convolution.
-3. **The head starts at the foreground prior**, not at 0.5.
-4. **The heatmap is separate** and survives an empty mask.
-5. **Anchor voxels become background**, from the predicted mask, undilated.
+2. **Eight stem channels with anchors, five without.** `boundary` is not one of them.
+3. **`coarse` starts at the foreground prior**, not at 0.5. **`refine` starts at zero**, so the initial logits ignore `boundary`.
+4. **`query`, `key`, and `value` are not zero** at init.
+5. **The heatmap is separate** and does not read `boundary`.
+6. **Anchor voxels become background**, from the predicted mask, undilated, after the head.
 
 ---
 
 ### What limits it — measured
+
+The numbers below are the previous carver (25-channel stem, split 1×1). They are not a measurement of this module.
 
 Not capacity, as an earlier reading of the overfit suggested. Memorising a *single scene* reached 0.7877, but by epoch 11 of the real run the same 38.5k-parameter carver passes that on **training** Dice (0.8048) with 160 subjects. The overfit is a wiring check — it says the channel order, the world coordinates and the prompt indices are right — and nothing more.
 

@@ -178,13 +178,11 @@ A bare Dice is not interpretable in this project. Any reported Dice must carry:
    `cat`. A flat control is a much weaker statement here than it was under the
    attention architecture.
 
-3. **The two mandatory tests of §7**, before a Dice is treated as evidence that
-   the image was used at all:
-   - **prompt-only carver** (`scripts/train.py b --prompt-only`): `B(I)` removed.
-     If its Dice approaches the full model's, the mask is a spatial prior.
-   - **image replacement** (in `scripts/evaluate.py`): another subject's MRI into
-     `B`, this subject's anchors and fields kept. The centroid should hold and
-     the Dice should fall.
+3. **Image replacement**, before a Dice is treated as evidence that the image
+   was used at all. `scripts/evaluate.py` feeds another subject's MRI into `B`
+   and keeps this subject's anchors and fields. The centroid should hold and the
+   Dice should fall. There is no prompt-only carver: `B` is required, and at
+   init `refine` is zero so the mask does not yet depend on `boundary`.
 
 4. **The gate.** `scripts/gate_mapper.py` measures the fraction of target
    centroids with `where_raw > 0.5`. §2 of the proposal makes it a precondition:

@@ -39,8 +39,7 @@ def test_the_shipped_config_builds_both_stages(cfg):
         tau=block.mapper.tau, min_mass=block.mapper.min_mass,
         boundary_widths=tuple(block.boundary_widths), carver_width=block.carver.width,
         carver_blocks=block.carver.blocks,
-        full_resolution_skip=block.carver.full_resolution_skip,
-        use_image=block.use_image, additive_prior=block.additive_prior, alpha=block.alpha,
+        additive_prior=block.additive_prior, alpha=block.alpha,
         background_logit=block.background_logit, prior_foreground=block.prior_foreground,
     )
     # The relational half is meant to be small beside the frozen segmenter.
@@ -59,9 +58,11 @@ def test_the_shipped_constants_are_the_measured_ones(cfg):
 def test_every_block_the_code_reads_is_present(cfg):
     for block in ("data", "targets", "mri", "model", "train", "logging", "evaluation"):
         assert block in cfg
-    for key in ("mapper", "boundary_widths", "carver", "use_image", "additive_prior",
+    for key in ("mapper", "boundary_widths", "carver", "additive_prior",
                 "alpha", "background_logit", "prior_foreground"):
         assert key in cfg.model.stage_b, key
+    assert "use_image" not in cfg.model.stage_b
+    assert "full_resolution_skip" not in cfg.model.stage_b.carver
     for key in ("epochs", "optimizer", "scheduler", "phase_a_checkpoint", "anchor_source",
                 "flip_probability", "loss", "far", "field_centroid_on", "mask_on",
                 "boundary_checkpoint", "boundary_lr_scale"):

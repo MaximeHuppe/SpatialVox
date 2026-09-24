@@ -75,29 +75,27 @@ flowchart TB
     BI["B(I) [B,16,128³]"]
     U1 --> BI
 
-    RES["rescale onto -1..0<br/>log where_raw / 20.7<br/>log where_mass / 20.7, broadcast"]
+    RES["rescale onto -1..0<br/>log where_raw / 20.7<br/>log where_mass is not a stem channel"]
     PRD --> RES
-    WMS --> RES
-    CAT["concat [B,25,128³]<br/>B(I) 16 + A 3 + F 3 + where_raw 1 + log where 1 + log mass 1<br/>22 channels if carver_sees_anchors is off, 9 if prompt-only"]
-    BI --> CAT
+    CAT["concat [B,8,128³]<br/>A 3 + F 3 + where_raw 1 + log where 1<br/>5 channels if carver_sees_anchors is off"]
     ANCH -->|"if carver_sees_anchors"| CAT
     FLD --> CAT
     PRD --> CAT
     RES --> CAT
 
-    subgraph CV["Carver - 38,498 params - mask trained on valid prompts only (mask_on: valid)"]
+    subgraph CV["Carver - 31,971 params - mask trained on valid prompts only (mask_on: valid)"]
         direction TB
-        STEM["stem: ConvBlock 25 to 16, stride 2<br/>[B,16,64³]"]
-        BLK["2 x ResBlock 16<br/>[B,16,64³]"]
-        UP["head, feature half: 1x1 at 64³<br/>then trilinear upsample of ONE channel<br/>[B,1,128³]"]
-        SKIP["plus head, B(I) half: 1x1 on B(I)<br/>full_resolution_skip<br/>[B,1,128³]"]
-        HEAD["logits: the one 1x1 head, in two exact halves<br/>zero weight, bias = logit of 0.0016<br/>[B,1,128³]"]
-        HM["heatmap: separate 1x1 conv<br/>[B,1,64³]"]
+        STEM["stem: ConvBlock 8 to 16, stride 2<br/>[B,16,64³]"]
+        BLK["2 x ResBlock 16<br/>geometry_features [B,16,64³]"]
+        UP["coarse: 1x1 at 64³, zero weight<br/>bias = logit of 0.0016<br/>trilinear upsample of ONE channel<br/>[B,1,128³]"]
+        SKIP["channel attention at 128³<br/>Q from geometry_features<br/>K, V from B(I)<br/>refine 1x1, weight and bias 0"]
+        HEAD["logits = upsampled coarse + refine<br/>[B,1,128³]"]
+        HM["heatmap: separate 1x1 on geometry_features<br/>does not read B(I)<br/>[B,1,64³]"]
         STEM --> BLK --> UP --> SKIP --> HEAD
         BLK --> HM
     end
     CAT --> STEM
-    BI -->|"full-resolution skip"| SKIP
+    BI -->|"K, V"| SKIP
 
     ALPHA["ablation only, off by default<br/>+ alpha · logit of where_raw"]
     EXC["anchor exclusion<br/>logit = -10 wherever max_i A_i is above 0.5"]
@@ -133,7 +131,7 @@ flowchart TB
 
 **Baseline:** [[B0 mask-valid-seed1]], commit `d14f201`, on `data/synthetic-mri`. Trained classes 0.962; held-out 0.724 / 0.775 against floors of 0.247 / 0.162; one seed.
 
-**Legend.** Blue boxes are frozen: Stage A never trains here. Purple boxes are parameter-free and carry no gradient: the mapper, the rescaling, the exclusion, the soft-argmax. Orange boxes are the 268,275 trainable parameters: `B(I)`, the carver and the null head. Yellow boxes are tensors that cross a module boundary. Dashed boxes are optional inputs or ablations.
+**Legend.** Blue boxes are frozen: Stage A never trains here. Purple boxes are parameter-free and carry no gradient: the mapper, the rescaling, the exclusion, the soft-argmax. Orange boxes are the 261,748 trainable parameters: `B(I)`, the carver and the null head. Yellow boxes are tensors that cross a module boundary. Dashed boxes are optional inputs or ablations.
 
 **What the picture enforces**
 - `name_ids` has exactly one exit, into Stage A. Downstream of `A_i` no name exists.

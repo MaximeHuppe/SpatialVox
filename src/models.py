@@ -19,8 +19,9 @@ prompt never names::
 embedding, no pair embedding, no slot embedding downstream. The direction ids
 are consumed by :mod:`src.mapper` and by nothing else - the direction is already
 the shape of ``F_i``, and a token would let the triple of anchor names stand in
-for the target. The carver sees ``B(I)`` beside maps computed from detached
-masks, and no coordinate grid.
+for the target. The carver's stem reads those maps and nothing from the image.
+``B(I)`` re-enters only as the keys and values of a channel attention. There is
+no coordinate grid.
 
 Stage A's feature pyramid stays out too. Those features were trained to light up
 *named* structures; ``B`` is a separate encoder trained without class ids, so a
@@ -44,12 +45,13 @@ from src.mapper import PositionalMapper3D
 
 EPS = 1e-6
 
-#: Floor under ``log(where_raw)`` and ``log(where_mass)``, and the scale both are
-#: divided by. The measured range of ``where_mass`` on ``data/mri`` spans 1e-21
-#: to 2e-2, so the raw number is indistinguishable from zero to a convolution
-#: whose other nine input channels live in ``[0, 1]``. Dividing by ``-log(floor)``
-#: maps the clamped log onto ``[-1, 0]``: the same one number, monotonically
-#: reparameterised, still saying "the conjunction has no mass".
+#: Floor under ``log(where_raw)``, and the scale that log is divided by.
+#: ``where_raw`` can sit far below the other stem channels, which live in
+#: ``[0, 1]``. Dividing by ``-log(floor)`` maps the clamped log onto ``[-1, 0]``.
+#: ``log(where_mass)`` is not a stem channel: it is one scalar broadcast over the
+#: volume, and :class:`ConvBlock`'s ``InstanceNorm3d(affine=False)`` subtracts
+#: the spatial mean, so a constant channel is identically zero. The null head
+#: still reads the scalar ``where_mass``.
 LOG_FLOOR = 1e-9
 
 
@@ -502,31 +504,56 @@ class NullHead(nn.Module):
         return self.mlp(features.float()).squeeze(-1)
 
 
+def channel_attention(q: Tensor, k: Tensor, v: Tensor, chunk: int = 4096) -> Tensor:
+    """Per-voxel attention over channels. Softmax runs over the key channel, never space.
+
+    ``score_ij = Q_i * K_j / sqrt(C)`` and ``retrieved_i = Σ_j α_ij V_j``. The
+    voxel axis is chunked so the ``[B, C, C, N]`` score is never the full volume:
+    at 16 channels and 128³ that tensor is about 2 GB per sample.
+    """
+    if q.shape != k.shape or q.shape != v.shape:
+        raise ValueError(
+            f"Q, K, and V must share a shape, got {tuple(q.shape)}, {tuple(k.shape)}, {tuple(v.shape)}"
+        )
+    batch, channels, *spatial = q.shape
+    voxels = 1
+    for size in spatial:
+        voxels *= int(size)
+    if channels == 0 or voxels == 0:
+        return q
+    scale = channels ** 0.5
+    query = q.reshape(batch, channels, voxels)
+    key = k.reshape(batch, channels, voxels).to(dtype=q.dtype)
+    value = v.reshape(batch, channels, voxels).to(dtype=q.dtype)
+    pieces = []
+    step = max(int(chunk), 1)
+    for start in range(0, voxels, step):
+        stop = min(start + step, voxels)
+        score = query[:, :, start:stop].unsqueeze(2) * key[:, :, start:stop].unsqueeze(1) / scale
+        alpha = torch.softmax(score, dim=2)
+        pieces.append((alpha * value[:, :, start:stop].unsqueeze(1)).sum(dim=2))
+    return torch.cat(pieces, dim=-1).reshape(batch, channels, *spatial)
+
+
 class Carver(nn.Module):
-    """The WHAT: ``B(I)`` and the geometric maps in, target logits and a heatmap out.
+    """Geometry in the stem; ``boundary`` only as keys and values.
 
-    ``residual = two 16-channel blocks, stride-2 stem, then 1x1 up to 128^3``.
-    The stem is what keeps 3x3x3 convolutions affordable on a 128^3 volume.
+    The stem and the residual blocks read the geometry concat and emit
+    ``geometry_features`` at half resolution. ``coarse`` and ``heatmap`` are
+    separate 1x1s on that tensor. ``boundary`` is not a stem channel and is not
+    added as a prompt-free residual on the logits.
 
-    ``full_resolution_skip`` carries ``B(I)`` past that stem, so the final 1x1
-    sees the boundary features at the resolution they were computed at. It
-    defaults on, and it is a departure from the literal reading of §4 recorded in
-    ``documentation/SpatialVox.md`` (Deviations): a stride-2 stem otherwise destroys exactly
-    the full-resolution boundary detail the method claims the mask is drawn from,
-    which would leave a trilinear upsample of a 2.5 mm grid as the only path to
-    the output. It is a flag so the claim stays measurable.
+    Channel attention runs at full resolution, softmax over channels. ``query``
+    is a 1x1 on ``geometry_features``, then trilinear to full resolution.
+    ``key`` and ``value`` are 1x1s on ``boundary``. ``logits`` are the upsampled
+    coarse plus ``refine`` of the retrieved values. ``refine`` is zero at init,
+    so the initial mask equals the upsampled coarse and does not depend on
+    ``boundary``. ``query``, ``key``, and ``value`` keep the default convolution
+    init: zeroing them would make ``retrieved`` zero, and a zero ``refine``
+    would then receive no gradient.
 
-    The heatmap is a *separate* 1x1 on the working grid, not a reading of the
-    mask: it survives the prompt being empty, which the mask does not.
-
-    The mask head is applied in two halves that are *exactly* the 1x1 above
-    (``_update_ideas/2026-09-22-null-head-decides-emptiness.md``). A 1x1
-    convolution and a trilinear upsample are both linear, and the upsample's
-    weights sum to one, so ``head(cat[up(f), B]) = up(W_f f + b) + W_B B``: the
-    feature half runs on the working grid and a single channel is upsampled,
-    instead of upsampling ``width`` channels and concatenating them with ``B(I)``
-    into a ``(width + 16)``-channel tensor at full resolution. Same parameters,
-    same checkpoints, same function.
+    The anchor exclusion is applied by :class:`StageB` after this forward, not
+    here. Checkpoints of the previous carver do not load; there is no translator.
     """
 
     def __init__(
@@ -537,27 +564,45 @@ class Carver(nn.Module):
         width: int = 16,
         blocks: int = 2,
         act: str = "leaky_relu",
-        full_resolution_skip: bool = True,
         prior_foreground: float = 0.0016,
     ) -> None:
         super().__init__()
-        self.full_resolution_skip = bool(full_resolution_skip) and boundary_channels > 0
+        if int(boundary_channels) < 1:
+            raise ValueError(
+                f"Carver requires boundary features, got boundary_channels={boundary_channels}"
+            )
         self.stem = ConvBlock(in_channels, width, act, stride=2)
         self.blocks = nn.Sequential(*[ResBlock(width, act) for _ in range(int(blocks))])
-        self.head = nn.Conv3d(width + (boundary_channels if self.full_resolution_skip else 0), 1, 1)
-        nn.init.zeros_(self.head.weight)
-        nn.init.constant_(self.head.bias, prior_bias(prior_foreground))
+        self.coarse = nn.Conv3d(width, 1, 1)
+        nn.init.zeros_(self.coarse.weight)
+        nn.init.constant_(self.coarse.bias, prior_bias(prior_foreground))
         self.heatmap = nn.Conv3d(width, 1, 1)
+        self.query = nn.Conv3d(width, boundary_channels, 1)
+        self.key = nn.Conv3d(boundary_channels, boundary_channels, 1)
+        self.value = nn.Conv3d(boundary_channels, boundary_channels, 1)
+        self.refine = nn.Conv3d(boundary_channels, 1, 1)
+        nn.init.zeros_(self.refine.weight)
+        nn.init.zeros_(self.refine.bias)
 
-    def forward(self, x: Tensor, boundary: Tensor | None) -> tuple[Tensor, Tensor]:
+    def forward(self, geometry: Tensor, boundary: Tensor) -> tuple[Tensor, Tensor]:
         """``-> (logits [B, 1, D, H, W], heatmap logits [B, 1, D/2, H/2, W/2])``."""
-        features = self.blocks(self.stem(x))
-        width = features.shape[1]
-        coarse = F.conv3d(features, self.head.weight[:, :width], self.head.bias)
-        logits = F.interpolate(coarse, size=x.shape[2:], mode="trilinear", align_corners=True)
-        if self.full_resolution_skip:
-            logits = logits + F.conv3d(boundary, self.head.weight[:, width:])
-        return logits, self.heatmap(features)
+        if boundary.shape[2:] != geometry.shape[2:]:
+            raise ValueError(
+                f"boundary spatial size {tuple(boundary.shape[2:])} does not match "
+                f"geometry {tuple(geometry.shape[2:])}"
+            )
+        geometry_features = self.blocks(self.stem(geometry))
+        coarse = F.interpolate(
+            self.coarse(geometry_features), size=geometry.shape[2:],
+            mode="trilinear", align_corners=True,
+        )
+        query = F.interpolate(
+            self.query(geometry_features), size=boundary.shape[2:],
+            mode="trilinear", align_corners=True,
+        )
+        retrieved = channel_attention(query, self.key(boundary), self.value(boundary))
+        logits = coarse + self.refine(retrieved)
+        return logits, self.heatmap(geometry_features)
 
 
 def soft_argmax(
@@ -608,8 +653,8 @@ class StageB(nn.Module):
     One forward: the three names go to the frozen Stage A and produce detached
     soft masks; :class:`~src.mapper.PositionalMapper3D` turns those masks and the
     three direction ids into the fields and their product; ``B`` reads the image
-    with no knowledge of any of that; the carver puts them together; and the null
-    head reads four scalars.
+    with no knowledge of any of that; the carver's stem reads the geometry and
+    queries ``B``; and the null head reads four scalars.
 
     The segmenter is a submodule so the checkpoint is self-contained and the
     signature can admit nothing else - but it is frozen at construction, it is
@@ -628,8 +673,6 @@ class StageB(nn.Module):
         boundary_widths: Sequence[int] = (16, 32, 32),
         carver_width: int = 16,
         carver_blocks: int = 2,
-        full_resolution_skip: bool = True,
-        use_image: bool = True,
         carver_sees_anchors: bool = True,
         additive_prior: bool = False,
         alpha: float = 0.35,
@@ -642,14 +685,12 @@ class StageB(nn.Module):
             n_anchors=int(n_anchors), tau=float(tau), min_mass=float(min_mass),
             boundary_widths=tuple(int(w) for w in boundary_widths),
             carver_width=int(carver_width), carver_blocks=int(carver_blocks),
-            full_resolution_skip=bool(full_resolution_skip), use_image=bool(use_image),
             carver_sees_anchors=bool(carver_sees_anchors),
             additive_prior=bool(additive_prior), alpha=float(alpha),
             background_logit=float(background_logit), prior_foreground=float(prior_foreground),
         )
         self.n_anchors = int(n_anchors)
         self.spacing = tuple(float(v) for v in spacing)
-        self.use_image = bool(use_image)
         # Whether the three detached anchor MASKS go into the carver alongside
         # the fields. They are Stage A outputs, so their shapes identify the
         # anchor classes, and the unordered anchor set alone recovers the target
@@ -671,15 +712,14 @@ class StageB(nn.Module):
         self.center = tuple(volume_center_world((resolution,) * 3, self.spacing).tolist())
 
         self.mapper = PositionalMapper3D(tau=tau, min_mass=min_mass)
-        self.boundary = BoundaryEncoder(boundary_widths) if self.use_image else None
-        boundary_channels = self.boundary.out_channels if self.boundary is not None else 0
-        # A_i (n, optional) + F_i (n) + where_raw + log(where_raw) + where_mass,
-        # plus B(I).
-        geometry = (2 if self.carver_sees_anchors else 1) * self.n_anchors + 3
+        self.boundary = BoundaryEncoder(boundary_widths)
+        # A_i (n, optional) + F_i (n) + where_raw + log(where_raw).
+        # log(where_mass) is a scalar and is not a stem channel. B(I) is not one
+        # either: it enters Carver only as keys and values.
+        geometry = self.n_anchors + 2 + (self.n_anchors if self.carver_sees_anchors else 0)
         self.carver = Carver(
-            boundary_channels + geometry, boundary_channels,
-            width=carver_width, blocks=carver_blocks,
-            full_resolution_skip=full_resolution_skip, prior_foreground=prior_foreground,
+            geometry, self.boundary.out_channels,
+            width=carver_width, blocks=carver_blocks, prior_foreground=prior_foreground,
         )
         self.null = NullHead(self.n_anchors)
         #: Set by the trainer when ``B`` came from a pretraining run; 1.0 otherwise.
@@ -777,26 +817,17 @@ class StageB(nn.Module):
             field = self.mapper(anchors, direction_ids, self.spacing, self.center)
         where = field.where_raw
         log_where = where.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
-        log_mass = (
-            field.where_mass.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
-        ).reshape(-1, 1, 1, 1, 1).expand_as(where)
 
-        boundary = None
-        if self.boundary is not None:
-            source = image if boundary_image is None else boundary_image
-            boundary = self.boundary(source.to(torch.float32))
+        source = image if boundary_image is None else boundary_image
+        boundary = self.boundary(source.to(torch.float32))
         parts = ([anchors] if self.carver_sees_anchors else []) + [
-            field.fields, where, log_where, log_mass
+            field.fields, where, log_where
         ]
         # Under autocast the boundary features come back in the low-precision
-        # dtype while the geometry is float32; the concatenation has to agree,
-        # and matching the features is what keeps the 25-channel input at 128^3
-        # off the float32 path.
-        dtype = boundary.dtype if boundary is not None else torch.float32
-        logits, heatmap = self.carver(
-            torch.cat(([boundary] if boundary is not None else []) + [p.to(dtype) for p in parts], dim=1),
-            boundary,
-        )
+        # dtype while the geometry is float32. The stem concat is cast to that
+        # dtype. boundary is not one of its channels.
+        geometry = torch.cat([part.to(dtype=boundary.dtype) for part in parts], dim=1)
+        logits, heatmap = self.carver(geometry, boundary)
 
         if self.alpha is not None:
             # The ablation: a weak explicit bias, one scalar, no other input.
