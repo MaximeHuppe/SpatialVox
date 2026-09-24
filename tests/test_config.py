@@ -37,11 +37,19 @@ def test_the_shipped_config_builds_both_stages(cfg):
     model = StageB.from_segmenter(
         segmenter, spacing=(1.25, 1.25, 1.25), n_anchors=cfg.data.n_anchors,
         tau=block.mapper.tau, min_mass=block.mapper.min_mass,
+        answer_mode=str(block.get("answer_mode", "instance")),
         boundary_widths=tuple(block.boundary_widths), carver_width=block.carver.width,
         carver_blocks=block.carver.blocks,
         full_resolution_skip=block.carver.full_resolution_skip,
-        use_image=block.use_image, additive_prior=block.additive_prior, alpha=block.alpha,
+        use_image=block.use_image,
+        carver_sees_anchors=bool(block.get("carver_sees_anchors", False)),
+        additive_prior=block.additive_prior, alpha=block.alpha,
         background_logit=block.background_logit, prior_foreground=block.prior_foreground,
+        dilate_radius=int(block.get("instance", {}).get("dilate_radius", 4)),
+        region_threshold=float(block.get("instance", {}).get("region_threshold", 0.5)),
+        max_seeds=int(block.get("instance", {}).get("max_seeds", 16)),
+        intensity_tol=float(block.get("instance", {}).get("intensity_tol", 0.15)),
+        score_null=float(block.get("instance", {}).get("score_null", 0.5)),
     )
     # The relational half is meant to be small beside the frozen segmenter.
     trainable = sum(p.numel() for p in model.trainable_parameters())
@@ -60,7 +68,7 @@ def test_every_block_the_code_reads_is_present(cfg):
     for block in ("data", "targets", "mri", "model", "train", "logging", "evaluation"):
         assert block in cfg
     for key in ("mapper", "boundary_widths", "carver", "use_image", "additive_prior",
-                "alpha", "background_logit", "prior_foreground"):
+                "alpha", "background_logit", "prior_foreground", "answer_mode", "instance"):
         assert key in cfg.model.stage_b, key
     for key in ("epochs", "optimizer", "scheduler", "phase_a_checkpoint", "anchor_source",
                 "flip_probability", "loss", "far", "field_centroid_on", "mask_on",

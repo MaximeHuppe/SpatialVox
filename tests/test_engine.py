@@ -34,6 +34,7 @@ def tiny_stage_b(corpus) -> StageB:
     return StageB.from_segmenter(
         tiny_stage_a(len(corpus.vocab), resolution),
         spacing=corpus.spacing, n_anchors=corpus.n_anchors, tau=0.5, min_mass=1e-6,
+        answer_mode="carver", carver_sees_anchors=True,
         boundary_widths=(4, 8), carver_width=4, carver_blocks=1, prior_foreground=0.01,
     )
 

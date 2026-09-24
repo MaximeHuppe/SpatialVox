@@ -131,21 +131,23 @@ model:
     deep_supervision: [0.1, 0.3, 0.6]
 
   stage_b:
+    answer_mode: instance
     mapper:
       tau: 0.5              # world units, and this corpus is 1.0 unit/voxel
       min_mass: 1.0e-6
     boundary_widths: [16, 32, 32]
+    instance:
+      dilate_radius: 4
+      region_threshold: 0.5
+      max_seeds: 16
+      intensity_tol: 0.15
+      score_null: 0.5
     carver:
       width: 16
       blocks: 2
       full_resolution_skip: true
     use_image: true
-    # The three anchor MASKS into the carver alongside the fields. Their shapes
-    # identify the anchor classes, and the unordered anchor set alone recovers
-    # the target 67.8% of the time on data/mri - a channel through which the
-    # carver can name the target instead of solving for it. `F_i` and `where_raw`
-    # already carry the geometry it needs. The anchor EXCLUSION is unaffected.
-    carver_sees_anchors: true
+    carver_sees_anchors: false
     additive_prior: false
     alpha: 0.35
     background_logit: -10.0

@@ -34,6 +34,7 @@ def model() -> StageB:
     torch.manual_seed(0)
     return StageB(
         SEGMENTER, spacing=SPACING, n_anchors=3, tau=0.5, min_mass=1e-6,
+        answer_mode="carver", carver_sees_anchors=True,
         boundary_widths=(4, 8), carver_width=4, carver_blocks=2, prior_foreground=0.01,
     ).eval()
 
@@ -204,8 +205,9 @@ def test_anchor_voxels_above_a_half_are_written_to_background(model):
 
 def test_the_prompt_only_carver_builds_without_b():
     """§7: "``B(I)`` is removed. Anchors and ``where_raw`` stay"."""
-    model = StageB(SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4,
-                   use_image=False).eval()
+    model = StageB(SEGMENTER, spacing=SPACING, answer_mode="carver",
+                   boundary_widths=(4, 8), carver_width=4,
+                   use_image=False, carver_sees_anchors=True).eval()
     assert model.boundary is None
     assert model.carver.stem[0].in_channels == 2 * model.n_anchors + 3
     image, directions, names = inputs()
@@ -216,8 +218,10 @@ def test_the_prompt_only_carver_builds_without_b():
 
 def test_the_additive_prior_is_one_scalar_with_no_other_input():
     """§4: "``alpha`` is a single scalar... It cannot depend on the MRI, a class, or a name"."""
-    off = StageB(SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4)
-    on = StageB(SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4,
+    off = StageB(SEGMENTER, spacing=SPACING, answer_mode="carver",
+                 boundary_widths=(4, 8), carver_width=4)
+    on = StageB(SEGMENTER, spacing=SPACING, answer_mode="carver",
+                boundary_widths=(4, 8), carver_width=4,
                 additive_prior=True, alpha=0.35)
     assert off.alpha is None
     assert on.alpha.shape == () and on.alpha.item() == pytest.approx(0.35)
@@ -280,9 +284,11 @@ def test_soft_argmax_is_an_expectation_in_world_units():
 def test_the_config_carries_every_architectural_constant(model):
     """§8: ``mapper.tau``, ``mapper.min_mass``, ``alpha``, and the width of ``B``."""
     for key in ("tau", "min_mass", "alpha", "boundary_widths", "carver_width",
-                "full_resolution_skip", "use_image", "additive_prior", "spacing"):
+                "full_resolution_skip", "use_image", "additive_prior", "spacing",
+                "answer_mode"):
         assert key in model.config, key
     assert model.config["segmenter"] == SEGMENTER
+    assert model.config["answer_mode"] == "carver"
 
 
 def test_a_checkpoint_round_trips_through_load_model(tmp_path, model):
@@ -300,7 +306,8 @@ def test_a_checkpoint_round_trips_through_load_model(tmp_path, model):
 def test_a_pretrained_boundary_encoder_loads_into_stage_b():
     """§4: ``B`` is pretrained, then its weights continue inside Stage B."""
     pretrainer = BoundaryPretrainer(widths=(4, 8))
-    model = StageB(SEGMENTER, spacing=SPACING, boundary_widths=(4, 8), carver_width=4)
+    model = StageB(SEGMENTER, spacing=SPACING, answer_mode="carver",
+                   boundary_widths=(4, 8), carver_width=4)
     model.boundary.load_state_dict(pretrainer.encoder.state_dict())
     for a, b in zip(model.boundary.parameters(), pretrainer.encoder.parameters()):
         assert torch.equal(a, b)

@@ -10,7 +10,7 @@ aliases:
 ---
 # Class-agnostic instance selection — design for discussion
 
-**Status:** design only. **No training code, config, or corpus change in this branch.**  
+**Status:** design approved; §7 frozen in [[ClassAgnosticInstance-ADR]]. Implementation follows on this branch.  
 **Base:** `dev-SpatialVox-V1` / Phase B baseline method **B2** (`mask_on: valid`, dense carver).  
 **Date:** 2026-09-24.  
 **Branch:** `cursor/class-agnostic-instance-design-f966`.
@@ -22,6 +22,7 @@ This note is the discussion document for replacing the dense carver with **regio
 | [[SpatialVox]] | current B2 architecture (dense carver) — the baseline we compare against |
 | [[Flowchart]] | current model drawing |
 | [[Result_tracker]] | B2 and parents |
+| [[ClassAgnosticInstance-ADR]] | frozen §7 decisions for v1 implementation |
 | `_update_ideas/2026-09-24-deep-analysis-class-agnostic-transfer.md` | evidence that dense image paths class-gate on MRI |
 | This note §8 | publishability |
 
