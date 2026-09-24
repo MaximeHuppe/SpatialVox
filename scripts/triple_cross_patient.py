@@ -75,6 +75,7 @@ def analyse(corpus: Corpus) -> dict:
                 "targets": sorted(targets),
             })
 
+    train_scenes = set(corpus.scene_ids("train")) if (corpus.root / "train.jsonl").is_file() else set()
     collisions = []
     same_target_reused = 0
     unique_once = 0
@@ -95,6 +96,7 @@ def analyse(corpus: Corpus) -> dict:
                 },
                 "n_targets": n_targets,
                 "n_uses": n_uses,
+                "involves_train": any(s in train_scenes for scenes in target_map.values() for s in scenes),
                 "n_scenes": n_scenes,
             })
 
@@ -106,6 +108,9 @@ def analyse(corpus: Corpus) -> dict:
         "triples_used_once": unique_once,
         "triples_reused_same_target": same_target_reused,
         "triples_with_different_targets": len(collisions),
+        # The ones the stability filter must remove: a train use and any other use
+        # naming different targets. Val/test-only collisions are never supervised.
+        "train_triples_with_different_targets": sum(c["involves_train"] for c in collisions),
         "fraction_triples_collide": len(collisions) / max(len(by_triple), 1),
         "within_scene_multi_target": within_scene_multi,
         "collisions": collisions,
@@ -179,6 +184,7 @@ def print_report(report: dict, *, show: int = 15) -> None:
     print(f"  reused, always same target:   {report['triples_reused_same_target']}")
     print(f"  DIFFERENT targets across uses:{report['triples_with_different_targets']}  "
           f"({report['fraction_triples_collide']:.2%} of distinct triples)")
+    print(f"  ...of which involve train:    {report['train_triples_with_different_targets']}  (should be 0)")
     print(f"  within-scene multi-target:    {len(report['within_scene_multi_target'])}  "
           "(should be 0)")
     if report["within_scene_multi_target"][:3]:

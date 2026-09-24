@@ -111,16 +111,17 @@ anchor set serves several targets and only the direction words tell them apart.
 A triple whose conjunction is not unique **on that scene** is dropped, so
 per-scene well-posedness holds by construction.
 
-**Global triple stability.** Per-scene uniqueness is not enough on real MRI: the
-same unordered set of `(anchor name, direction)` pairs can uniquely mean
-Left-Thalamus on one subject and Left-Caudate on another. After per-scene
-generation, `stabilize_relational_manifests` keeps a row only when **every** use
-of its triple across the corpus names the **same** target. Unstable triples are
-removed entirely. That guarantees a held-out-target prompt never reuses a triple
-that supervised a trained target. Rebuild with `scripts/rebuild_manifests.py`
-(or re-import); `meta.json` records `triple_stability: global-unique-target`.
-Audit with `scripts/triple_cross_patient.py` — `triples_with_different_targets`
-must be 0.
+**Triple stability, measured on train.** Per-scene uniqueness is not enough on
+real MRI: the same unordered set of `(anchor name, direction)` pairs can uniquely
+mean Left-Thalamus on one subject and Left-Caudate on another. After per-scene
+generation, `stabilize_relational_manifests` keeps a train row only when every
+*train* use of its triple names the same target, and drops a val/test row whose
+triple names a *different* target in train. So a held-out-target prompt never
+reuses a triple that supervised another target, and **no val/test label decides
+which training rows exist**. Rebuild with `scripts/rebuild_manifests.py` (or
+re-import); `meta.json` records `triple_stability: train-unique-target`. Audit
+with `scripts/triple_cross_patient.py`: the collisions that involve train must
+be 0 (val/test-only collisions are never supervised).
 
 The target-first generator is **deleted, not configurable**. It picked the
 anchors nearest the target, which on fixed anatomy made the anchor identities a
@@ -138,10 +139,14 @@ empty-mask prompts would move `best.pt` for reasons unrelated to the model, and
 an empty prediction against an empty target scores Dice 1.0. `scripts/evaluate.py`
 builds the empty-prompt population separately.
 
-**A flip is re-scored, never assumed empty.** Measured: it names two or more
-structures 33.2% of the time (dropped), names none 65.5% (empty mask, null target
-invalid) and retargets 1.2%. "Dropped" is the per-example `keep` weight, and it
-must reach *every* loss term and `Metrics` — `weighted_mean` is that weight.
+**A flip is re-scored, never assumed empty.** Measured on `data/mri`: 37% of
+flips duplicate a direction and 0.1% name two or more structures (both dropped),
+62% name none (empty mask, null target invalid) and 1.2% retarget. **A retarget
+is kept only onto the dataset's own `targets`** (`ExampleDataset.retarget_to`);
+onto a held-out class or a landmark it is dropped, or that class would be
+supervised as a relational target. "Dropped" is the per-example `keep` weight,
+and it must reach *every* loss term and `Metrics` — `weighted_mean` is that
+weight.
 
 ## 5. Generalisation the project claims
 

@@ -104,11 +104,11 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
     flip = 0.0 if overfit else float(stage_cfg.flip_probability)
 
     datasets = {
-        # `train` is filtered to `targets.train` by the corpus, which is what
-        # "supervised on eight classes" means in code.
+        # `train` is filtered to the config's `targets.train`, which is what
+        # "supervised on eight classes" means in code (never the manifest's copy).
         "train": ExampleDataset(
-            corpus, "train", scenes=scenes["train"], flip_probability=flip,
-            anchor_cache=anchors, normalize_mode=cfg.data.normalize,
+            corpus, "train", scenes=scenes["train"], targets=list(cfg.targets.train),
+            flip_probability=flip, anchor_cache=anchors, normalize_mode=cfg.data.normalize,
             # Episodic leave-one-class-out: one SUPERVISED class withheld from
             # the loss each epoch. It never touches val, which must keep scoring
             # every trained class or the selection curve changes meaning.
@@ -140,8 +140,8 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
             pass
     if overfit:  # validate on what we are trying to memorise
         datasets["val"] = ExampleDataset(
-            corpus, "train", scenes=scenes["train"], anchor_cache=anchors,
-            normalize_mode=cfg.data.normalize,
+            corpus, "train", scenes=scenes["train"], targets=list(cfg.targets.train),
+            anchor_cache=anchors, normalize_mode=cfg.data.normalize,
         )
         extra = {}
 

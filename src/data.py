@@ -188,35 +188,33 @@ def stabilize_relational_manifests(
     subject and Left-Caudate on another. Training then teaches "this sentence →
     paint a trained class", and held-out eval of the same sentence fails.
 
-    This pass keeps a row only when **every** use of its triple across the whole
-    corpus (all splits) names the **same** target structure. Unstable triples are
-    removed entirely. That guarantees a held-out-target prompt never reuses a
-    triple that supervised a trained target (and the converse).
+    Stability is measured on the **train split only**: a train row is kept when
+    every train use of its triple names the same target, and a val/test row is
+    dropped when its triple names a *different* target in train. So a
+    held-out-target prompt never reuses a triple that supervised another target,
+    and no val/test label ever decides which training rows exist.
 
     Returns ``(filtered_manifests, stats)`` with counts of kept / dropped rows
-    and how many distinct triples were stable vs colliding.
+    and how many distinct train triples were stable vs colliding.
     """
     by_key: dict[frozenset[tuple[str, str]], set[str]] = {}
-    for rows in manifests.values():
-        for row in rows:
-            key = relational_triple_key(row, vocab)
-            by_key.setdefault(key, set()).add(vocab.name(int(row["target"])))
-    stable = {key for key, names in by_key.items() if len(names) == 1}
+    for row in manifests.get("train", ()):
+        by_key.setdefault(relational_triple_key(row, vocab), set()).add(vocab.name(int(row["target"])))
 
-    filtered: dict[str, list[dict[str, Any]]] = {split: [] for split in manifests}
-    kept = dropped = 0
-    for split, rows in manifests.items():
-        for row in rows:
-            if relational_triple_key(row, vocab) in stable:
-                filtered[split].append(dict(row))
-                kept += 1
-            else:
-                dropped += 1
+    def keep(split: str, row: Mapping[str, Any]) -> bool:
+        names = by_key.get(relational_triple_key(row, vocab))
+        if split == "train":
+            return len(names) == 1
+        return names is None or names == {vocab.name(int(row["target"]))}
+
+    filtered = {split: [dict(row) for row in rows if keep(split, row)] for split, rows in manifests.items()}
+    kept = sum(map(len, filtered.values()))
+    stable = sum(len(names) == 1 for names in by_key.values())
     stats = {
         "examples_kept": kept,
-        "examples_dropped_unstable_triple": dropped,
-        "triples_stable": len(stable),
-        "triples_colliding": len(by_key) - len(stable),
+        "examples_dropped_unstable_triple": sum(map(len, manifests.values())) - kept,
+        "triples_stable": stable,
+        "triples_colliding": len(by_key) - stable,
         "triples_total": len(by_key),
     }
     return filtered, stats
@@ -317,7 +315,7 @@ def import_corpus(
     manifests, stab = stabilize_relational_manifests(manifests, vocab)
     meta_extra = {
         **dict(extra or {}),
-        "triple_stability": "global-unique-target",
+        "triple_stability": "train-unique-target",
         "triple_stability_stats": stab,
     }
     return write_corpus(
@@ -603,6 +601,11 @@ class ExampleDataset(Dataset):
             records = [records[int(i)] for i in sorted(picked)]
         self.records = records[: limit or None]
         self.flip_probability = float(flip_probability)
+        # A flip may retarget only onto this dataset's own target classes. Any
+        # other structure it names (a held-out class, a landmark) drops the
+        # example, so nothing outside `targets` is ever supervised as a target.
+        names = corpus.meta["targets"].get(split, corpus.vocab.names) if targets is None else targets
+        self.retarget_to = {corpus.vocab.label(str(name)) for name in names}
         # Episodic leave-one-class-out. Each epoch one supervised class is
         # withheld from the loss, so the model is asked, DURING TRAINING, to
         # segment a class it is not being supervised on this epoch.
@@ -655,7 +658,7 @@ class ExampleDataset(Dataset):
         centroids = centroids_world(labels, len(vocab), spacing)
         center = volume_center_world(labels.shape, spacing)
         solutions = solutions_for(record["anchors"], directions, centroids, present, center)
-        if len(solutions) > 1:
+        if len(solutions) > 1 or (solutions and solutions[0] not in self.retarget_to):
             return record, 0
         clauses = [
             {"direction": d, "anchor": vocab.name(a)}

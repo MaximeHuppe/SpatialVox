@@ -76,7 +76,7 @@ def main() -> int:
 
     manifests, stab = stabilize_relational_manifests(manifests, corpus.vocab)
     print(
-        f"\ntriple stability (global unique target): "
+        f"\ntriple stability (train-unique target): "
         f"kept {stab['examples_kept']}  dropped {stab['examples_dropped_unstable_triple']}  "
         f"triples {stab['triples_stable']}/{stab['triples_total']} stable"
     )
@@ -97,7 +97,7 @@ def main() -> int:
         extra={
             **{k: v for k, v in corpus.meta.items()
                if k in ("source", "label_scheme", "n_subjects", "origin")},
-            "triple_stability": "global-unique-target",
+            "triple_stability": "train-unique-target",
             "triple_stability_stats": stab,
         },
     )

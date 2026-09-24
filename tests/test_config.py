@@ -84,6 +84,12 @@ def test_overrides_reach_a_nested_leaf():
         resolve_anchor_source({"anchor_source": "guess"})
 
 
+def test_yaml_words_parse_as_bool_and_none_in_any_case():
+    """`--set x=false` used to stay the string "false", which bool() reads as True."""
+    parsed = parse_overrides(["a=false", "b=True", "c=null", "d=NONE", "e=1e-4", "f=oracle"])
+    assert parsed == {"a": False, "b": True, "c": None, "d": None, "e": 1e-4, "f": "oracle"}
+
+
 def test_stage_b_always_needs_a_segmenter():
     """Stage A is inside Stage B; there is no mode in which it is absent."""
     cfg = load_config()

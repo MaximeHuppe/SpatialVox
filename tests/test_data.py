@@ -208,6 +208,16 @@ def test_a_flip_is_retargeted_emptied_or_dropped_and_never_assumed_empty(corpus)
     assert seen["empty"] > 0 and seen["dropped"] > 0, seen
 
 
+def test_a_flip_never_retargets_onto_a_class_the_dataset_does_not_supervise(corpus):
+    """A retarget onto a held-out class would supervise it as a relational target."""
+    targets = list(corpus.vocab.names[:2])
+    dataset = ExampleDataset(corpus, "train", targets=targets, flip_probability=1.0, normalize_mode="none")
+    items = [dataset[i] for i in range(len(dataset))]
+    retargeted = {int(item["target"]) for item in items if int(item["keep"]) and int(item["valid"])}
+    assert retargeted <= {corpus.vocab.label(name) for name in targets}
+    assert any(int(item["keep"]) == 0 for item in items)
+
+
 def test_a_record_with_target_zero_is_an_empty_prompt_however_it_got_there(corpus):
     """`scripts/evaluate.py` writes an empty-prompt population straight into
     `records`; `valid` has to follow the target, not a separate flag."""
@@ -379,8 +389,9 @@ def test_stabilize_keeps_a_triple_reused_for_the_same_target(vocab):
     assert stats["triples_colliding"] == 0
 
 
-def test_stabilize_drops_cross_split_train_vs_heldout_collision(vocab):
-    """A held-out-target row must not reuse a triple that supervised a train target."""
+def test_stabilize_drops_a_heldout_row_that_reuses_a_train_triple_for_another_target(vocab):
+    """A held-out-target row must not reuse a triple that supervised a train target,
+    and dropping it must not cost the train row: val never decides train rows."""
     shared = {
         "anchors": [1, 2, 3],
         "directions": ["superior", "medial", "anterior"],
@@ -388,10 +399,26 @@ def test_stabilize_drops_cross_split_train_vs_heldout_collision(vocab):
     }
     manifests = {
         "train": [{**shared, "scene": "s0", "id": "train_hit", "target": vocab.label("alpha")}],
-        "val": [{**shared, "scene": "s1", "id": "held_hit", "target": vocab.label("gamma")}],
+        "val": [
+            {**shared, "scene": "s1", "id": "held_hit", "target": vocab.label("gamma")},
+            {**shared, "scene": "s2", "id": "same_meaning", "target": vocab.label("alpha")},
+        ],
     }
     filtered, stats = stabilize_relational_manifests(manifests, vocab)
-    assert filtered["train"] == []
-    assert filtered["val"] == []
-    assert stats["examples_dropped_unstable_triple"] == 2
-    assert stats["triples_colliding"] == 1
+    assert [row["id"] for row in filtered["train"]] == ["train_hit"]
+    assert [row["id"] for row in filtered["val"]] == ["same_meaning"]
+    assert stats["examples_dropped_unstable_triple"] == 1
+    assert stats["triples_colliding"] == 0
+
+
+def test_stabilize_never_reads_val_or_test_labels(vocab):
+    """Triples absent from train are kept whatever val and test say about each other."""
+    unseen = {"anchors": [4, 5, 6], "directions": ["inferior", "lateral", "posterior"], "prompt": "y"}
+    manifests = {
+        "train": [],
+        "val": [{**unseen, "scene": "v0", "id": "v", "target": vocab.label("gamma")}],
+        "test": [{**unseen, "scene": "t0", "id": "t", "target": vocab.label("beta")}],
+    }
+    filtered, stats = stabilize_relational_manifests(manifests, vocab)
+    assert len(filtered["val"]) == len(filtered["test"]) == 1
+    assert stats["examples_dropped_unstable_triple"] == 0 and stats["triples_total"] == 0

@@ -765,10 +765,13 @@ def seed_all(seed: int) -> None:
 
 
 def git_revision() -> str | None:
+    """HEAD, with ``-dirty`` when tracked files differ from it."""
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout.strip()
+
     try:
-        return subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        ).stdout.strip()
+        dirty = git("status", "--porcelain", "--untracked-files=no")
+        return git("rev-parse", "HEAD") + ("-dirty" if dirty else "")
     except (subprocess.CalledProcessError, OSError):
         return None
 
@@ -787,7 +790,7 @@ def save_checkpoint(path: Path | str, model: nn.Module, meta: Mapping[str, Any])
         "state_dict": model.state_dict(),
         "model": model.config,
         "kind": type(model).__name__,
-        "meta": {**dict(meta), "git": git_revision(), "torch": torch.__version__},
+        "meta": {"git": git_revision(), **dict(meta), "torch": torch.__version__},
     }
     torch.save(payload, path)
     path.with_suffix(".json").write_text(
@@ -867,6 +870,8 @@ class Trainer:
         self.probe_loader: DataLoader | None = None
         self.history: list[dict[str, Any]] = []
         self.best = -1.0
+        #: The code this run started from, not whatever HEAD is when a checkpoint is saved.
+        self.git = git_revision()
 
     @property
     def wants_hausdorff(self) -> bool:
@@ -1056,7 +1061,8 @@ class Trainer:
                 f"{self.task.name}: {trainable:.2f}M trainable of {total:.2f}M "
                 f"on {self.device} ({self.cfg['precision']})"
             )
-        log = (self.out_dir / "metrics.jsonl").open("w", encoding="utf-8")
+        # A relaunch into the same directory extends the log; it never truncates it.
+        log = (self.out_dir / "metrics.jsonl").open("a", encoding="utf-8")
         run = _logger(self.logging, self.out_dir.name, {**self.cfg, **self.stage})
         try:
             for epoch in range(self.epochs):
@@ -1129,6 +1135,7 @@ class Trainer:
 
     def _meta(self, epoch: int, metrics: Mapping[str, Any]) -> dict[str, Any]:
         return {
+            "git": self.git,
             "stage": self.task.name,
             "epoch": epoch,
             "best_dice": self.best,

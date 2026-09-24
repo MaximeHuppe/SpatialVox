@@ -73,15 +73,24 @@ def parse_overrides(assignments: list[str] | None) -> dict[str, Any]:
     """Turn ``["train.epochs=5", "data.root=/tmp/x"]`` into a mapping.
 
     Values are parsed as Python literals when possible (so ``5`` is an int and
-    ``[1,2]`` a list) and kept as strings otherwise.
+    ``[1,2]`` a list), ``true``/``false``/``null`` in any case as YAML does, and
+    kept as strings otherwise. Without the YAML words ``x=false`` stayed the
+    string ``"false"``, which every ``bool()`` read as True.
     """
     parsed: dict[str, Any] = {}
     for assignment in assignments or []:
         if "=" not in assignment:
             raise ValueError(f"--set expects key=value, got {assignment!r}")
         key, raw = assignment.split("=", 1)
+        word = raw.strip().lower()
+        if word in _YAML_WORDS:
+            parsed[key.strip()] = _YAML_WORDS[word]
+            continue
         try:
             parsed[key.strip()] = ast.literal_eval(raw)
         except (ValueError, SyntaxError):
             parsed[key.strip()] = raw
     return parsed
+
+
+_YAML_WORDS = {"true": True, "false": False, "null": None, "none": None}

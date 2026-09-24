@@ -285,7 +285,7 @@ def main() -> int:
     parser.add_argument("checkpoint", type=Path, help="a Stage B checkpoint")
     parser.add_argument("--split", default="test")
     parser.add_argument("--classes", default=None,
-                        help="targets.<name> to score; default = every class in the split")
+                        help="targets.<name> to score; default = every target class in the config")
     parser.add_argument("--limit", type=int, default=None, help="score this many examples")
     parser.add_argument("--out", type=Path, help="report directory (default next to the checkpoint)")
     parser.add_argument("--save-masks", action="store_true", help="also write every predicted mask")
@@ -310,7 +310,9 @@ def main() -> int:
     anchors = anchor_cache_dir(corpus.root, checkpoint) if checkpoint.is_file() else None
     anchors = anchors if anchors is not None and (anchors / "meta.json").is_file() else None
 
-    classes = list(cfg.targets[args.classes]) if args.classes else None
+    classes = list(cfg.targets[args.classes]) if args.classes else [
+        name for split in ("train", "val", "test") for name in cfg.targets[split]
+    ]
     common = dict(anchor_cache=anchors, normalize_mode=cfg.data.normalize)
     dataset = ExampleDataset(corpus, args.split, targets=classes, limit=args.limit, **common)
     batches = loader(dataset, batch_size=cfg.train.batch_size, shuffle=False, workers=cfg.train.workers)
