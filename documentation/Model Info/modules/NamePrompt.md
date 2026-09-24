@@ -7,7 +7,7 @@ tags:
 none — basic block
 - documented in [[SpatialVox#8. Step 4 — Stage A, the frozen segmenter]] (8.3)
 
-Closed-vocabulary name → token. 23 names on `data/mri`; a lookup is exact. `text_dim` is the only seam for a frozen sentence encoder later.
+Closed-vocabulary name → token. 23 names on `data/mri`; a lookup is exact. Open-vocabulary text is out of scope (closed compiler).
 
 ```mermaid
 flowchart LR
@@ -15,21 +15,18 @@ flowchart LR
     C --> D["Stage A: attention queries"]
 ```
 
-**One instance now.** Under the attention architecture there were three separate name tables — this one, `RelationPrompt`'s, and `StructureEncoder`'s — because Stage B conditioned on anchor identity all the way to the decoder. That is exactly what the current architecture forbids: **names stop at Stage A**. This is the only name embedding in the project, and it lives on the far side of the freeze. See [[MODEL PHASE B]].
+**One instance now.** Older Stage B variants carried separate name tables past the freeze. The current architecture forbids that: **names stop at Stage A**. This is the only name embedding in the project, and it lives on the far side of the freeze. See [[MODEL PHASE B]].
 
 ---
 
 ### Params (`__init__`)
 
-`NamePrompt(vocab_size, dim, text_dim=None)`
+`NamePrompt(vocab_size, dim)`
 
 | param | source | runtime | role |
 | --- | --- | --- | --- |
 | `vocab_size` `V` | `len(corpus.vocab)` | `23` | rows of `table`; **not** the sequence length `P` |
-| `dim` `d` | `token_dim` | `256` | output width; must equal the last encoder width, since the queries attend over the bottleneck directly |
-| `text_dim` `d_text` | unused (always `None`) | `= dim` = `256` | table width; set this (only) to swap in a sentence encoder |
-
-`text_dim or dim` sizes both `table` and `projection` in. Shipped: `text_dim is None` → square `256 → 256`.
+| `dim` `d` | `token_dim` | `256` | table and projection width; must equal the last encoder width |
 
 | attribute                | type           | runtime shape | init                               | # params   |
 | ------------------------ | -------------- | ------------- | ---------------------------------- | ---------- |
@@ -40,7 +37,7 @@ flowchart LR
 
 A vocabulary-sized table is legal **here and nowhere else**. Anchors are consumed by name, and a held-out class still appears as an anchor, so its row is trained — which is precisely why the project may claim "never supervised as a relational target" and may **not** claim "zero-shot on an unseen structure". No module downstream of Stage A may have a parameter sized by the vocabulary; `tests/test_models.py::test_names_reach_stage_a_and_stop_there` holds every Stage B output bit-identical under an arbitrary renaming.
 
-The square projection is mathematically redundant with the table. It was kept for compatibility with the reference Stage A checkpoint. The bitwise parity test that compared it, `tests/test_reference_parity.py`, was deleted with the attention Stage B.
+The square projection is mathematically redundant with the table. It was kept for compatibility with the reference Stage A checkpoint.
 
 ---
 
@@ -52,14 +49,14 @@ class NamePrompt(nn.Module):
 
     The vocabulary is closed, so an embedding table is the exact and
     deterministic representation - there is no open-vocabulary text to
-    generalise over. Swap this module for a frozen sentence encoder to accept
-    free-text names.
+    generalise over. This is the **only** name embedding in the project, and it
+    lives on the far side of the freeze.
     """
 
-    def __init__(self, vocab_size: int, dim: int, text_dim: int | None = None) -> None:
+    def __init__(self, vocab_size: int, dim: int) -> None:
         super().__init__()
-        self.table = nn.Embedding(vocab_size, text_dim or dim)
-        self.projection = nn.Linear(text_dim or dim, dim)
+        self.table = nn.Embedding(vocab_size, dim)
+        self.projection = nn.Linear(dim, dim)
         nn.init.trunc_normal_(self.table.weight, std=0.02)
 
     def forward(self, name_ids: Tensor) -> Tensor:
@@ -109,7 +106,7 @@ The token never leaves Stage A. What crosses into the relational path is a mask.
 #### 1. Table lookup
 
 ```python
-self.table(name_ids)    # [B, P] → [B, P, d_text]
+self.table(name_ids)    # [B, P] → [B, P, dim]
 ```
 
 | | Stage A | Stage B |
@@ -122,11 +119,11 @@ Embedding lookup is **not** autocast. Row `k` is `table.weight[k]`. Duplicate id
 #### 2. Projection
 
 ```python
-return self.projection(...)    # [B, P, d_text] → [B, P, dim]
+return self.projection(...)    # [B, P, dim] → [B, P, dim]
 ```
 
 $$
-t_p = W\, E[\text{name}_p] + b, \qquad E \in \mathbb{R}^{V \times d_{\text{text}}},\; W \in \mathbb{R}^{d \times d_{\text{text}}}
+t_p = W\, E[\text{name}_p] + b, \qquad E \in \mathbb{R}^{V \times d},\; W \in \mathbb{R}^{d \times d}
 $$
 
 | | Stage A | Stage B |
@@ -134,7 +131,7 @@ $$
 | shape | `(2, 23, 256)` | `(2, 3, 256)` |
 | dtype | **`bfloat16`** | **`bfloat16`** under autocast; Stage A's `norm` after attention is `float32` |
 
-Shipped (`d_text = d = 256`): \(W\) is square. Changing `text_dim` only changes this Linear; `table` becomes `(V, text_dim)`.
+Shipped: \(W\) is square (`d = 256`).
 
 #### 3. Output
 

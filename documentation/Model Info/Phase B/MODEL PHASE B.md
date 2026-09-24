@@ -122,8 +122,6 @@ With probability `train.stage_b.flip_probability` (0.25) one clause is replaced 
 
 Training only. A validation curve mixing retargeted and empty prompts would move `best.pt` for reasons unrelated to the model, and an empty prediction against an empty target scores Dice 1.0.
 
-There is a second source of `keep = 0`. With `train.stage_b.leave_one_out: true`, one supervised class per epoch is withheld from the loss, cycling through `targets.train`. It is off by default and tested as `B10 arm-loo` (archived). The flip is applied after the withholding, so a withheld row that a flip empties or retargets is kept with its new target.
-
 ---
 
 ### 02 / what may enter

@@ -60,7 +60,7 @@ synthetic:
   seeds: {train: 1000000, val: 2000000, test: 3000000}
   spacing: [1.0, 1.0, 1.0]
   margin: 2
-  packing: {max_object_attempts: 200, max_scene_attempts: 50}
+  packing: {max_scene_attempts: 50}
   size: 1.8                    # scales every structure. At 1.0 the primitives are ~8 voxels
                                # across in a 64^3 volume and the carver's stride-2 stem sees
                                # them at four, so Dice measures the discretisation rather than
@@ -131,21 +131,26 @@ model:
     deep_supervision: [0.1, 0.3, 0.6]
 
   stage_b:
+    answer_mode: instance
     mapper:
       tau: 0.5              # world units, and this corpus is 1.0 unit/voxel
       min_mass: 1.0e-6
     boundary_widths: [16, 32, 32]
+    instance:
+      dilate_radius: 4
+      region_threshold: 0.5
+      max_seeds: 16
+      intensity_tol: 1.0
+      tol_mode: local_std
+      feature_tol: 0.30
+      barrier_tol: 0.35
+      score_null: 0.5
     carver:
       width: 16
       blocks: 2
       full_resolution_skip: true
     use_image: true
-    # The three anchor MASKS into the carver alongside the fields. Their shapes
-    # identify the anchor classes, and the unordered anchor set alone recovers
-    # the target 67.8% of the time on data/mri - a channel through which the
-    # carver can name the target instead of solving for it. `F_i` and `where_raw`
-    # already carry the geometry it needs. The anchor EXCLUSION is unaffected.
-    carver_sees_anchors: true
+    carver_sees_anchors: false
     additive_prior: false
     alpha: 0.35
     background_logit: -10.0
@@ -201,10 +206,6 @@ train:
     # valid | all - see configs/config.yaml. `all` reproduces mri-stage-b and the
     # two arms; `valid` leaves "names nothing" to the null head alone.
     mask_on: valid
-    # Withhold one supervised class from the loss each epoch, cycling. Makes the
-    # recognise-and-recall route fail DURING training, which is the only pressure
-    # that reaches it. `keep = 0` is the existing per-example drop.
-    leave_one_out: false
 
 
 logging:

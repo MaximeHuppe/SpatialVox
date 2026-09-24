@@ -38,6 +38,7 @@ def tiny_model(corpus) -> StageB:
                        deep_supervision=(0.3, 0.7))
     model = StageB.from_segmenter(
         segmenter, spacing=corpus.spacing, n_anchors=corpus.n_anchors,
+        answer_mode="carver", carver_sees_anchors=True,
         boundary_widths=(4, 8), carver_width=4, carver_blocks=1,
     ).eval()
     # The mask head is zero-initialised, so nothing can move the logits until it

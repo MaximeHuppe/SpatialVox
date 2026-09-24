@@ -229,3 +229,78 @@ def test_tau_only_sharpens_it_never_moves_the_boundary():
     soft = fields_for(anchors, ["superior"], tau=4.0).fields[0, 0]
     assert ((sharp > 0.5) == (soft > 0.5)).float().mean() > 0.99
     assert float(sharp.std()) > float(soft.std())
+
+
+def test_classify_and_margin_agree_on_random_pairs():
+    """Corpus truth (:func:`classify`) and the soft field share one predicate.
+
+    Random distinct world points: the direction ``classify`` returns must have
+    positive ``margin_at``, and every other direction must be non-positive. That
+    is the clause/relation contract the instance scorer inherits.
+    """
+    rng = np.random.default_rng(0)
+    center = np.array(CENTER, float)
+    for _ in range(80):
+        target = rng.uniform(1.0, SIZE - 2.0, size=3)
+        anchor = rng.uniform(1.0, SIZE - 2.0, size=3)
+        if np.linalg.norm(target - anchor) < 1.0:
+            continue
+        try:
+            word = classify(target, anchor, center)
+        except Exception:
+            continue
+        ids = torch.tensor([[DIRECTIONS.index(d) for d in DIRECTIONS]])
+        points = torch.tensor([[target.tolist()] * len(DIRECTIONS)], dtype=torch.float32)
+        centroids = torch.tensor([[anchor.tolist()] * len(DIRECTIONS)], dtype=torch.float32)
+        values = margin_at(points, centroids, ids, CENTER)[0]
+        winner = DIRECTIONS.index(word)
+        assert float(values[winner]) > 0.0
+        for i, name in enumerate(DIRECTIONS):
+            if i == winner:
+                continue
+            assert float(values[i]) <= 0.0 + 1e-5, (word, name, float(values[i]))
+
+
+def test_conjunction_product_matches_solutions_for_on_a_toy_scene():
+    """Three hard masks: the unique ``solutions_for`` label is the only soft peak.
+
+    Builds six labelled balls, picks an anchor-first unique conjunction, and
+    checks ``where_raw`` is high at that target's centroid and low at every
+    other structure's.
+    """
+    from src.geometry import AmbiguousDirection, solutions_for
+
+    labels = np.zeros(SHAPE, dtype=np.int16)
+    centres = {
+        1: (6, 12, 12),
+        2: (12, 6, 12),
+        3: (12, 12, 12),  # near midline; lateral term grows with target x
+        4: (18, 18, 22),  # superior to 1, anterior to 2, lateral to 3
+        5: (18, 6, 6),
+        6: (6, 18, 6),
+    }
+    for label, c in centres.items():
+        ball_mask = ball(c, radius=1.5) > 0.5
+        labels[ball_mask] = label
+
+    spacing = SPACING
+    center = np.array(CENTER, float)
+    from src.geometry import centroids_world
+
+    cents = centroids_world(labels, 6, spacing)
+    anchors, directions, target = [1, 2, 3], ["superior", "anterior", "lateral"], 4
+    assert solutions_for(anchors, directions, cents, list(centres), center) == [target]
+
+    masks = torch.zeros(1, 3, *SHAPE)
+    for slot, label in enumerate(anchors):
+        masks[0, slot] = torch.from_numpy((labels == label).astype(np.float32))
+    ids = torch.tensor([[DIRECTIONS.index(d) for d in directions]])
+    out = PositionalMapper3D(tau=0.5, min_mass=1e-6)(masks, ids, spacing, CENTER)
+
+    to_zyx = lambda xyz: (xyz[2] / spacing[2], xyz[1] / spacing[1], xyz[0] / spacing[0])
+    peak = at(out.where_raw[0, 0], to_zyx(cents[target]))
+    assert peak > 0.9, peak
+    for label, c in centres.items():
+        if label == target or label in anchors:
+            continue
+        assert at(out.where_raw[0, 0], c) < peak

@@ -109,11 +109,6 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         "train": ExampleDataset(
             corpus, "train", scenes=scenes["train"], targets=list(cfg.targets.train),
             flip_probability=flip, anchor_cache=anchors, normalize_mode=cfg.data.normalize,
-            # Episodic leave-one-class-out: one SUPERVISED class withheld from
-            # the loss each epoch. It never touches val, which must keep scoring
-            # every trained class or the selection curve changes meaning.
-            leave_out=(list(cfg.targets.train)
-                       if bool(stage_cfg.get("leave_one_out", False)) else None),
         ),
         # The selection curve: held-out *subjects*, trained *classes*.
         "val": ExampleDataset(
@@ -151,23 +146,36 @@ def stage_b(cfg, corpus: Corpus, overfit: int | None, segmenter: StageA,
         n_anchors=corpus.n_anchors,
         tau=float(model_cfg.mapper.tau),
         min_mass=float(model_cfg.mapper.min_mass),
+        answer_mode=str(model_cfg.get("answer_mode", "instance")),
         boundary_widths=tuple(model_cfg.boundary_widths),
         carver_width=int(model_cfg.carver.width),
         carver_blocks=int(model_cfg.carver.blocks),
         full_resolution_skip=bool(model_cfg.carver.full_resolution_skip),
         use_image=bool(model_cfg.use_image) and not prompt_only,
-        carver_sees_anchors=bool(model_cfg.get("carver_sees_anchors", True)),
+        carver_sees_anchors=bool(model_cfg.get("carver_sees_anchors", False)),
         additive_prior=bool(model_cfg.additive_prior),
         alpha=float(model_cfg.alpha),
         background_logit=float(model_cfg.background_logit),
         prior_foreground=float(model_cfg.prior_foreground),
+        dilate_radius=int(model_cfg.get("instance", {}).get("dilate_radius", 4)),
+        region_threshold=float(model_cfg.get("instance", {}).get("region_threshold", 0.5)),
+        max_seeds=int(model_cfg.get("instance", {}).get("max_seeds", 16)),
+        intensity_tol=float(model_cfg.get("instance", {}).get("intensity_tol", 1.0)),
+        tol_mode=str(model_cfg.get("instance", {}).get("tol_mode", "local_std")),
+        feature_tol=float(model_cfg.get("instance", {}).get("feature_tol", 0.30)),
+        barrier_tol=float(model_cfg.get("instance", {}).get("barrier_tol", 0.35)),
+        score_null=float(model_cfg.get("instance", {}).get("score_null", 0.5)),
     )
     checkpoint = stage_cfg.get("boundary_checkpoint")
     if checkpoint not in (None, "", "null") and model.boundary is not None:
         pretrained = load_model(checkpoint)
         model.boundary.load_state_dict(pretrained.encoder.state_dict())
         model.boundary_lr_scale = float(stage_cfg.boundary_lr_scale)
-        print(f"B(I) initialised from {checkpoint}, lr scale {model.boundary_lr_scale}")
+        if str(model_cfg.get("answer_mode", "instance")) == "instance" and hasattr(pretrained, "boundary"):
+            model.attach_boundary_head(pretrained.boundary)
+            print(f"B(I) + boundary head from {checkpoint} (barrier flood)")
+        else:
+            print(f"B(I) initialised from {checkpoint}, lr scale {model.boundary_lr_scale}")
     task = StageBTask(
         model, corpus.vocab,
         spacing=corpus.spacing,

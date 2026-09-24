@@ -17,7 +17,8 @@ Every experiment gets one note in `Result_tracker/Experiments/`. Its properties 
 >   Provisional: **one seed**.
 > - **Its Phase A:** [[A09 mri-stage-a]].
 > - **Easy-corpus sanity check:** [[B1 easy-mask-valid-seed1]] passed: 0.994 / 0.997 / 0.998 on the trivial corpus, 0% empty masks, and a gated leak of 26–29% on impossible prompts. Stage A is [[A03 synthetic-stage-a]].
-> - **Real MRI:** the only Phase B reference is still [[B03 relational-seed1]], trained under the old `mask_on: all` (held-out 0.005 against a 0.110 floor), on [[A01 phase-a-current]]. Rerunning it with `mask_on: valid` is the next milestone.
+> - **Real MRI:** the Phase B baseline method is [[B2 mri-mask-valid-seed1]] (`mask_on: valid`). Held-out collapses (dense carver class-gates). See `_update_ideas/2026-09-24-deep-analysis-class-agnostic-transfer.md`.
+> - **Design (no run yet):** [[ClassAgnosticInstance]] — replace the dense carver with region → class-agnostic instance selection; parent = B2. Branch `cursor/class-agnostic-instance-design-f966`. Checklist: [[ClassAgnosticInstance-Checklist]]. Visuals: [[ClassAgnosticInstance-Flowchart]].
 > - **Archive:** every other run was moved to `SpatialVox-MRI/runs_archive_2026-09-23/` and its note deleted. The numbers they contributed are kept in `_update_ideas/` and in the noise table below.
 
 ## All experiments

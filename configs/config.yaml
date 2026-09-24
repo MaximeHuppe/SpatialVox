@@ -99,6 +99,7 @@ model:
   # Stage B: the relational model. No name, pair or slot embedding; no occupancy;
   # no coordinate grid; no candidate list.
   stage_b:
+    answer_mode: instance       # instance = seed-flood + where_raw(centroid); carver = B2 parent
     mapper:
       tau: 0.5              # world units (the corpus is 1.25 mm/voxel), the ONLY geometric
                             # constant. measured: the proposal starts at 2.0, where only 65%
@@ -109,19 +110,24 @@ model:
                             # `runs/phase-a/current` is 3.2e-6, and the proposal's 1e-3 would
                             # reject every structure in the vocabulary.
     boundary_widths: [16, 32, 32]   # B(I): three stages at 128/64/32 and back. Image only.
+    instance:
+      dilate_radius: 4            # ADR: start at 4; measure coverage vs neighbour invasion
+      region_threshold: 0.5
+      max_seeds: 16
+      intensity_tol: 1.0          # scale on local std(I) around each seed (intensity fallback)
+      tol_mode: local_std         # local_std | std | absolute — used only without B features
+      feature_tol: 0.30           # 1 - cosine (legacy feature flood; barrier preferred)
+      barrier_tol: 0.35           # refuse voxels with P(boundary) above this
+      score_null: 0.5             # empty answer when best where_raw(centroid) is below this
     carver:
-      width: 16                   # "two 16-channel blocks, stride-2 stem"
+      width: 16                   # B2 parent path only (`answer_mode: carver`)
       blocks: 2
-      full_resolution_skip: true  # let the final 1x1 see B(I) at 128^3. Off = the literal
-                                  # reading of §4, where the stride-2 stem is the only path
-                                  # and the mask is a trilinear upsample of a 64^3 map.
-    use_image: true               # the method. false is the §7 prompt-only carver - B(I) removed,
-                                  # anchors and fields kept - which `scripts/train.py b
-                                  # --prompt-only` sets for that ablation.
-    additive_prior: false         # the ablation `logits = residual + alpha * logit(where_raw)`
-    alpha: 0.35                   # its one scalar, with no other input
-    background_logit: -10.0       # what "logits = background where A_i > 0.5" writes. Finite,
-                                  # because BCE against a target that disagrees must stay finite.
+      full_resolution_skip: true
+    use_image: true
+    carver_sees_anchors: false    # never feed anchor shapes into the answer path
+    additive_prior: false
+    alpha: 0.35
+    background_logit: -10.0
     prior_foreground: 0.0016
 
 

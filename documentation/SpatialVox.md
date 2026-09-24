@@ -170,7 +170,7 @@ flowchart LR
 | `scripts/train.py` | `a` \| `boundary` \| `b`, with `--prompt-only`, `--overfit N`, `--segmenter`, `--out`, `--config`, `--set` |
 | `scripts/evaluate.py` | the six-block report of a Stage B checkpoint |
 | `tests/` | the contract (§19): what must hold for a number to mean what it says |
-| `vizualization/` | `demonstrate.py` (does the prompt find the right thing), `inspect_stage_b.py` (`A_i`, the fields, the feature maps), `single_forward.ipynb`. They write self-contained HTML files into `vizualization/out/` |
+| `vizualization/` | `inspect_stage_b.py` (`A_i`, the fields, the feature maps), `single_forward.ipynb`. They write self-contained HTML files into `vizualization/out/` |
 | `documentation/` | this Obsidian vault: this note, [[Flowchart]] (and `Flowchart.drawio`), [[Result_tracker]], and `Model Info/` (one note per module) |
 | `runs/`, `data/` | symlinks to `SpatialVox-MRI/runs` and to the shared corpus directory. Both are untracked |
 
@@ -464,19 +464,13 @@ Two further leaks were closed along the way:
 
 ### 7.2 `ExampleDataset.__getitem__`
 
-**Purpose.** Turn one manifest row into one Stage B item: the image, the ids the model will see, and the label volume plus flags the *task* will need. The flip and the leave-one-out drop are also applied here.
+**Purpose.** Turn one manifest row into one Stage B item: the image, the ids the model will see, and the label volume plus flags the *task* will need. The direction flip is also applied here.
 
 ```python
     def __getitem__(self, index: int) -> dict[str, Any]:
         record = self.records[index]
         image, labels = self._cache.get(record["scene"])
         keep = 1
-        if self.leave_out:
-            # One class per epoch, cycled deterministically so every class takes
-            # its turn and a run is reproducible from its seed alone.
-            withheld = self.leave_out[int(self.epoch) % len(self.leave_out)]
-            if self.corpus.vocab.name(record["target"]) == withheld:
-                keep = 0
         if self.flip_probability > 0:
             rng = np.random.default_rng([int(self.epoch), index])
             if float(rng.random()) < self.flip_probability:
@@ -570,11 +564,7 @@ The only augmentation Stage B has. With probability `train.stage_b.flip_probabil
 
 At `p = 0.25` about 8% of training items are therefore dropped and 16% carry an empty mask. A flip is **never assumed to be empty**. The RNG is seeded by `(epoch, index)`, so a flip can be reproduced from the epoch and the index alone. Flipping is **training-only**: a validation curve that mixed retargeted and empty prompts would move `best.pt` for reasons that have nothing to do with the model, and an empty prediction against an empty target scores Dice 1.0. `scripts/evaluate.py` builds the empty-prompt population separately (§16.2).
 
-### 7.4 Episodic leave-one-class-out (`train.stage_b.leave_one_out`)
-
-When on, each epoch withholds one **supervised** class from the loss (`keep = 0` for rows whose target is `targets.train[epoch % len]`), cycling through all of them. The idea: a model trained on every class at once learns to *recognise* which one the prompt is asking for and paint that class's remembered shape, and rotating a class out makes that route fail *during training*. It never touches validation. The flip is applied after the withholding, so a withheld row whose flip empties or retargets it is kept with its new target, which is necessarily a different structure. Off by default. Tested as `B10 arm-loo` (archived).
-
-### 7.5 The anchor cache
+### 7.4 The anchor cache
 
 Stage A is frozen and Stage B does not rotate, so `sigmoid(anchor_logits)` for a scene is a **constant**. `scripts/cache_anchors.py` writes it once per scene:
 
@@ -600,7 +590,7 @@ Stage A is frozen and Stage B does not rotate, so `sigmoid(anchor_logits)` for a
 
 `take` expands only the three structures a prompt names, in **slot order**, and returns `[3, 128, 128, 128]` float16. Inside the model these masks are cast to float32 and detached like any other anchor source (§13).
 
-### 7.6 Collation, loaders and validation sets
+### 7.5 Collation, loaders and validation sets
 
 `collate` stacks tensors along a new batch axis and keeps strings as per-sample lists. `loader` returns a `DataLoader` with persistent workers and, for shuffled loaders, a generator seeded with `train.seed`. `scripts/train.py b` builds:
 
@@ -709,10 +699,10 @@ class Encoder(nn.Module):
 
 ```python
 class NamePrompt(nn.Module):
-    def __init__(self, vocab_size: int, dim: int, text_dim: int | None = None) -> None:
+    def __init__(self, vocab_size: int, dim: int) -> None:
         super().__init__()
-        self.table = nn.Embedding(vocab_size, text_dim or dim)
-        self.projection = nn.Linear(text_dim or dim, dim)
+        self.table = nn.Embedding(vocab_size, dim)
+        self.projection = nn.Linear(dim, dim)
         nn.init.trunc_normal_(self.table.weight, std=0.02)
 
     def forward(self, name_ids: Tensor) -> Tensor:
@@ -1882,7 +1872,6 @@ This architecture was first specified as a proposal, together with a separate fi
 - **`carver.full_resolution_skip` (default on)**: the final 1×1 reads `concat(upsample(residual), B(I))` (§12.2). The literal reading remains an ablation, and it has not been run.
 - **No residual block at full resolution in `B`**: 350 of the 530 ms of a step (§11.1).
 - **`carver_sees_anchors` (default on)**, a flag added later to remove the three anchor-mask channels from the carver (§12.1). It is an architectural parameter and is recorded in `StageB.config`.
-- **`train.stage_b.leave_one_out` (default off)**, episodic class withholding (§7.4). It is a training-schedule value.
 - **`train.stage_b.mask_on` (shipped `valid` since 2026-09-22; `all` reproduces every earlier run)**. The proposal's loss table trains a prompt that names nothing towards the empty mask. That turned the carver into a second, image-based null detector, and the detector also rejects unfamiliar valid targets: 75% of held-out masks come out empty on `data/mri` ([[B03 relational-seed1]]). `valid` trains the mask only on prompts that name a structure and leaves emptiness to the null head's gate (§14.2). It is a training-schedule value, recorded in `meta["config"]["stage"]`. It is untested; see `_update_ideas/2026-09-22-null-head-decides-emptiness.md`.
 - **The mask head is applied in two exact halves** (§12.2): 1×1 on the working grid, then one upsampled channel plus the `B(I)` half at full resolution. Same function and checkpoints; carver peak memory −40%.
 
@@ -1914,7 +1903,7 @@ This architecture was first specified as a proposal, together with a separate fi
 Every tunable lives in a config file, and nothing in `src/` hard-codes a value from one. Any leaf can be overridden: `scripts/train.py b --set train.stage_b.epochs=5 --set model.stage_b.mapper.tau=1.0`.
 
 > [!warning] Booleans on the command line
-> `--set` parses values with `ast.literal_eval`, and anything that is not a Python literal is **kept as a string**. `--set model.stage_b.carver_sees_anchors=false` therefore passes the string `"false"`, and `bool("false")` is **True**. Write **`False` / `True`**, capitalised. This silently turned `B11 arm-noanchor` (archived) into a replicate of its parent (its checkpoint records `carver_sees_anchors: true`), and it is also the only reason `leave_one_out=true` worked in `B10 arm-loo` (archived): the string `"true"` happens to be truthy. After launching any arm, check `best.json → model` and `meta.config.stage`.
+> `--set` parses values with `ast.literal_eval`, and anything that is not a Python literal is **kept as a string**. `--set model.stage_b.carver_sees_anchors=false` therefore passes the string `"false"`, and `bool("false")` is **True**. Write **`False` / `True`**, capitalised. This silently turned `B11 arm-noanchor` (archived) into a replicate of its parent (its checkpoint records `carver_sees_anchors: true`). After launching any arm, check `best.json → model` and `meta.config.stage`.
 
 | config file | corpus (`data.root`) | notes |
 |---|---|---|
@@ -1946,7 +1935,6 @@ Every tunable lives in a config file, and nothing in `src/` hard-codes a value f
 | `train.stage_b.far` | ε 0.05, dilation 8 | ε 0.05, dilation 4 | `L_far` |
 | `train.stage_b.field_centroid_on` | `always` | `always` | or `empty-only` |
 | `train.stage_b.mask_on` | `valid` | `valid` | or `all`, which reproduces every run before 2026-09-22 (§14.2) |
-| `train.stage_b.leave_one_out` | *(absent → off)* | false | §7.4 |
 | `train.stage_a` | 50 epochs, lr 1e-3, warm-up 2, augment | same | |
 | `train.boundary` | 30 epochs, lr 5e-4, `mask_fraction` 0.5, `patch` 16, loss 1 / 1 / 0.5 | `patch` 8 | §11.2 |
 | `logging.backend` | wandb (`spatial-vox-mri`) | wandb (`spatial-vox`) | `metrics.jsonl` is written either way |

@@ -10,10 +10,10 @@ import torch
 
 from src.data import ExampleDataset, collate, loader
 from src.engine import (
-    BoundaryTask, Metrics, Prediction, StageATask, StageBTask, Trainer,
+    BoundaryTask, Metrics, StageATask, StageBTask, Trainer,
     build_optimizer, build_scheduler, dice_iou, dilate, far_mass, hausdorff,
-    label_boundary, load_model, mask_centroid_world, masks_from, null_gated, null_summary,
-    roll_anchors, save_checkpoint, segmentation_loss, weighted_mean,
+    label_boundary, load_model, mask_centroid_world, null_gated, null_summary,
+    roll_anchors, segmentation_loss, weighted_mean,
 )
 from src.models import BoundaryPretrainer, StageA, StageB
 
@@ -34,6 +34,7 @@ def tiny_stage_b(corpus) -> StageB:
     return StageB.from_segmenter(
         tiny_stage_a(len(corpus.vocab), resolution),
         spacing=corpus.spacing, n_anchors=corpus.n_anchors, tau=0.5, min_mass=1e-6,
+        answer_mode="carver", carver_sees_anchors=True,
         boundary_widths=(4, 8), carver_width=4, carver_blocks=1, prior_foreground=0.01,
     )
 

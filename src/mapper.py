@@ -255,7 +255,7 @@ class PositionalMapper3D(torch.nn.Module):
     not a threshold inside the mapper - is what declares the prompt empty.
     """
 
-    def __init__(self, tau: float = 2.0, min_mass: float = 1e-5) -> None:
+    def __init__(self, tau: float = 0.5, min_mass: float = 1e-6) -> None:
         super().__init__()
         if float(tau) <= 0:
             raise ValueError(f"mapper.tau must be positive, got {tau!r}")

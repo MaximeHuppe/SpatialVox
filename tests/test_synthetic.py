@@ -18,7 +18,6 @@ pin the removal rather than the numbers, which belong to a config.
 from __future__ import annotations
 
 import numpy as np
-import pytest
 
 from src.synthetic import (
     SHAPES, SHAPE_NAMES, bias_field, class_range, generate_scene, pack_scene,

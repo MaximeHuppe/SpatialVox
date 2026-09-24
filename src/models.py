@@ -40,6 +40,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from src.geometry import volume_center_world
+from src.instance import run_instance
 from src.mapper import PositionalMapper3D
 
 EPS = 1e-6
@@ -246,10 +247,10 @@ class NamePrompt(nn.Module):
     lives on the far side of the freeze.
     """
 
-    def __init__(self, vocab_size: int, dim: int, text_dim: int | None = None) -> None:
+    def __init__(self, vocab_size: int, dim: int) -> None:
         super().__init__()
-        self.table = nn.Embedding(vocab_size, text_dim or dim)
-        self.projection = nn.Linear(text_dim or dim, dim)
+        self.table = nn.Embedding(vocab_size, dim)
+        self.projection = nn.Linear(dim, dim)
         nn.init.trunc_normal_(self.table.weight, std=0.02)
 
     def forward(self, name_ids: Tensor) -> Tensor:
@@ -589,11 +590,14 @@ class StageBOutput:
     ``logits`` and ``valid`` are the answers; the rest is what the losses and the
     report need, and is carried rather than recomputed because every piece of it
     is a pure function of inputs the caller no longer holds.
+
+    Under ``answer_mode=instance``, ``logits`` is the logit of the winning
+    proposal mask (or a flat background field when the score is null).
     """
 
     logits: Tensor  # [B, 1, D, H, W]
     valid: Tensor  # [B] one logit: do the clauses name a structure
-    centroid: Tensor  # [B, 3] world (x, y, z), soft-argmax of the heatmap
+    centroid: Tensor  # [B, 3] world (x, y, z)
     where_raw: Tensor  # [B, 1, D, H, W] the product, never renormalised
     where_mass: Tensor  # [B, 1]
     fields: Tensor  # [B, A, D, H, W]
@@ -607,15 +611,19 @@ class StageB(nn.Module):
 
     One forward: the three names go to the frozen Stage A and produce detached
     soft masks; :class:`~src.mapper.PositionalMapper3D` turns those masks and the
-    three direction ids into the fields and their product; ``B`` reads the image
-    with no knowledge of any of that; the carver puts them together; and the null
-    head reads four scalars.
+    three direction ids into the fields and their product; then either
+
+    * **instance** (default on this branch): class-agnostic seed-flood proposals
+      scored by ``where_raw`` at each centroid; or
+    * **carver**: the B2 dense residual path (kept for parent comparison).
 
     The segmenter is a submodule so the checkpoint is self-contained and the
     signature can admit nothing else - but it is frozen at construction, it is
     excluded from :meth:`trainable_parameters`, and :meth:`train` keeps it in
     ``eval``. The relational loss does not flow back into it.
     """
+
+    ANSWER_MODES = ("instance", "carver")
 
     def __init__(
         self,
@@ -625,44 +633,59 @@ class StageB(nn.Module):
         n_anchors: int = 3,
         tau: float = 0.5,
         min_mass: float = 1e-6,
+        answer_mode: str = "instance",
         boundary_widths: Sequence[int] = (16, 32, 32),
         carver_width: int = 16,
         carver_blocks: int = 2,
         full_resolution_skip: bool = True,
         use_image: bool = True,
-        carver_sees_anchors: bool = True,
+        carver_sees_anchors: bool = False,
         additive_prior: bool = False,
         alpha: float = 0.35,
         background_logit: float = -10.0,
         prior_foreground: float = 0.0016,
+        dilate_radius: int = 4,
+        region_threshold: float = 0.5,
+        max_seeds: int = 16,
+        intensity_tol: float = 1.0,
+        tol_mode: str = "local_std",
+        feature_tol: float = 0.30,
+        barrier_tol: float = 0.35,
+        score_null: float = 0.5,
     ) -> None:
         super().__init__()
+        if answer_mode not in self.ANSWER_MODES:
+            raise ValueError(f"answer_mode must be one of {self.ANSWER_MODES}, got {answer_mode!r}")
         self.config = dict(
             segmenter=dict(segmenter), spacing=tuple(float(v) for v in spacing),
             n_anchors=int(n_anchors), tau=float(tau), min_mass=float(min_mass),
+            answer_mode=str(answer_mode),
             boundary_widths=tuple(int(w) for w in boundary_widths),
             carver_width=int(carver_width), carver_blocks=int(carver_blocks),
             full_resolution_skip=bool(full_resolution_skip), use_image=bool(use_image),
             carver_sees_anchors=bool(carver_sees_anchors),
             additive_prior=bool(additive_prior), alpha=float(alpha),
             background_logit=float(background_logit), prior_foreground=float(prior_foreground),
+            dilate_radius=int(dilate_radius), region_threshold=float(region_threshold),
+            max_seeds=int(max_seeds), intensity_tol=float(intensity_tol),
+            tol_mode=str(tol_mode), feature_tol=float(feature_tol),
+            barrier_tol=float(barrier_tol), score_null=float(score_null),
         )
         self.n_anchors = int(n_anchors)
         self.spacing = tuple(float(v) for v in spacing)
+        self.answer_mode = str(answer_mode)
         self.use_image = bool(use_image)
-        # Whether the three detached anchor MASKS go into the carver alongside
-        # the fields. They are Stage A outputs, so their shapes identify the
-        # anchor classes, and the unordered anchor set alone recovers the target
-        # 67.8% of the time on data/mri and pins it 58.3% of the time here. That
-        # is a channel through which the carver can name the target instead of
-        # solving for it, and the geometry it actually needs - three pyramids and
-        # their product - is already in `F_i` and `where_raw`.
-        #
-        # The anchor EXCLUSION below is unaffected: it uses the masks without
-        # letting their shape reach a convolution.
         self.carver_sees_anchors = bool(carver_sees_anchors)
         self.additive_prior = bool(additive_prior)
         self.background_logit = float(background_logit)
+        self.dilate_radius = int(dilate_radius)
+        self.region_threshold = float(region_threshold)
+        self.max_seeds = int(max_seeds)
+        self.intensity_tol = float(intensity_tol)
+        self.tol_mode = str(tol_mode)
+        self.feature_tol = float(feature_tol)
+        self.barrier_tol = float(barrier_tol)
+        self.score_null = float(score_null)
 
         self.segmenter = StageA(**segmenter)
         self.segmenter.requires_grad_(False).eval()
@@ -671,23 +694,37 @@ class StageB(nn.Module):
         self.center = tuple(volume_center_world((resolution,) * 3, self.spacing).tolist())
 
         self.mapper = PositionalMapper3D(tau=tau, min_mass=min_mass)
+        # Instance v1 floods on intensity; BoundaryEncoder is kept when use_image
+        # so a pretrained B can load for a later affinity flood without a rebuild.
         self.boundary = BoundaryEncoder(boundary_widths) if self.use_image else None
-        boundary_channels = self.boundary.out_channels if self.boundary is not None else 0
-        # A_i (n, optional) + F_i (n) + where_raw + log(where_raw) + where_mass,
-        # plus B(I).
-        geometry = (2 if self.carver_sees_anchors else 1) * self.n_anchors + 3
-        self.carver = Carver(
-            boundary_channels + geometry, boundary_channels,
-            width=carver_width, blocks=carver_blocks,
-            full_resolution_skip=full_resolution_skip, prior_foreground=prior_foreground,
-        )
-        self.null = NullHead(self.n_anchors)
-        #: Set by the trainer when ``B`` came from a pretraining run; 1.0 otherwise.
+        if self.answer_mode == "carver":
+            boundary_channels = self.boundary.out_channels if self.boundary is not None else 0
+            geometry = (2 if self.carver_sees_anchors else 1) * self.n_anchors + 3
+            self.carver = Carver(
+                boundary_channels + geometry, boundary_channels,
+                width=carver_width, blocks=carver_blocks,
+                full_resolution_skip=full_resolution_skip, prior_foreground=prior_foreground,
+            )
+            self.null = NullHead(self.n_anchors)
+            self.alpha = nn.Parameter(torch.tensor(float(alpha))) if self.additive_prior else None
+        else:
+            self.carver = None
+            self.null = None
+            self.alpha = None
+        #: Frozen 1x1 from BoundaryPretrainer; turns B features into a boundary
+        #: probability used as a flood barrier. Attached when a boundary
+        #: checkpoint is loaded into instance mode.
+        self.boundary_head: nn.Conv3d | None = None
         self.boundary_lr_scale = 1.0
-        # One scalar, with no other input. It cannot depend on the MRI, a class
-        # or a name - that is what makes the additive form an ablation and not a
-        # second, learned field.
-        self.alpha = nn.Parameter(torch.tensor(float(alpha))) if self.additive_prior else None
+
+    def attach_boundary_head(self, head: nn.Conv3d) -> "StageB":
+        """Copy the frozen BoundaryPretrainer boundary head for barrier floods."""
+        if head.out_channels != 1:
+            raise ValueError(f"boundary head must write one channel, got {head.out_channels}")
+        self.boundary_head = nn.Conv3d(head.in_channels, 1, 1)
+        self.boundary_head.load_state_dict(head.state_dict())
+        self.boundary_head.requires_grad_(False).eval()
+        return self
 
     # -- the freeze -------------------------------------------------------
     def train(self, mode: bool = True) -> "StageB":
@@ -701,12 +738,7 @@ class StageB(nn.Module):
         return [p for p in self.parameters() if id(p) not in frozen]
 
     def parameter_groups(self, lr: float) -> list[dict]:
-        """Two groups when ``B`` was pretrained: the carver at ``lr``, ``B`` below it.
-
-        §4: ``B`` "is pretrained, then given a lower learning rate while the
-        carver trains". ``boundary_lr_scale`` stays 1.0 when ``B`` starts from
-        scratch, because there is nothing to preserve.
-        """
+        """Two groups when ``B`` was pretrained: the answer path at ``lr``, ``B`` below it."""
         if self.boundary is None or self.boundary_lr_scale == 1.0:
             return [{"params": self.trainable_parameters(), "lr": lr}]
         boundary = list(self.boundary.parameters())
@@ -734,11 +766,7 @@ class StageB(nn.Module):
 
     # -- the forward ------------------------------------------------------
     def anchor_probability(self, image: Tensor, name_ids: Tensor) -> Tensor:
-        """``A_i = stop_gradient(sigmoid(anchor_logits_i))``, for those three names only.
-
-        No other mask is offered to the carver, and Stage A's features are
-        discarded here rather than passed on.
-        """
+        """``A_i = stop_gradient(sigmoid(anchor_logits_i))``, for those three names only."""
         return self.segmenter.probability(image, name_ids).detach()
 
     def forward(
@@ -750,17 +778,7 @@ class StageB(nn.Module):
         anchors: Tensor | None = None,
         boundary_image: Tensor | None = None,
     ) -> StageBOutput:
-        """``[B, 1, D, H, W]`` + ``[B, A]`` directions + ``[B, A]`` names -> :class:`StageBOutput`.
-
-        ``anchors`` substitutes the three detached soft masks that Stage A would
-        have produced - the precomputed-anchor cache, and the ground-truth
-        diagnostic. It is the *only* mask input this signature admits, it cannot
-        identify the target, and which source was used is recorded in the run.
-
-        ``boundary_image`` is the §7 image-replacement test: the volume ``B``
-        reads, when it is not the one the anchors came from. The anchors and
-        every field stay this subject's.
-        """
+        """``[B, 1, D, H, W]`` + ``[B, A]`` directions + ``[B, A]`` names -> :class:`StageBOutput`."""
         if name_ids.shape[1] != self.n_anchors or direction_ids.shape != name_ids.shape:
             raise ValueError(
                 f"expected [B, {self.n_anchors}] direction and name ids, got "
@@ -770,12 +788,93 @@ class StageB(nn.Module):
             anchors = self.anchor_probability(image, name_ids)
         anchors = anchors.detach().float()
 
-        # The mapper has no parameters and its inputs are detached, so nothing
-        # here is on the graph. Saying so keeps three full-volume intermediates
-        # from being held for a backward pass that will never read them.
         with torch.no_grad():
             field = self.mapper(anchors, direction_ids, self.spacing, self.center)
         where = field.where_raw
+
+        if self.answer_mode == "instance":
+            return self._forward_instance(image, field, anchors, boundary_image)
+        return self._forward_carver(image, field, anchors, where, boundary_image)
+
+    def _forward_instance(
+        self,
+        image: Tensor,
+        field,
+        anchors: Tensor,
+        boundary_image: Tensor | None,
+    ) -> StageBOutput:
+        """Seed-flood + rule score. No relational mask gradients into G."""
+        source = image if boundary_image is None else boundary_image
+        batch = source.shape[0]
+        features = None
+        barrier = None
+        if self.boundary is not None:
+            with torch.no_grad():
+                features = self.boundary(source.to(torch.float32))
+                if self.boundary_head is not None:
+                    barrier = torch.sigmoid(self.boundary_head(features))
+        logits, centroids, valid = [], [], []
+        for i in range(batch):
+            feat_i = None if features is None else features[i]
+            barrier_i = None if barrier is None else barrier[i, 0]
+            result = run_instance(
+                source[i],
+                field.where_raw[i],
+                self.spacing,
+                features=feat_i,
+                barrier=barrier_i,
+                dilate_radius=self.dilate_radius,
+                region_threshold=self.region_threshold,
+                max_seeds=self.max_seeds,
+                intensity_tol=self.intensity_tol,
+                tol_mode=self.tol_mode,
+                feature_tol=self.feature_tol,
+                barrier_tol=self.barrier_tol,
+                score_null=self.score_null,
+            )
+            # Finite background so BCE against a disagreeing target stays finite.
+            mask_logits = torch.where(
+                result.mask > 0.5,
+                torch.full_like(result.mask, 10.0),
+                torch.full_like(result.mask, self.background_logit),
+            )
+            # Exclude predicted anchors from the answer body.
+            mask_logits = mask_logits.masked_fill(
+                anchors[i].amax(dim=0) > 0.5, self.background_logit
+            )
+            logits.append(mask_logits)
+            if result.winner >= 0:
+                centroids.append(result.centroids[result.winner])
+                valid.append(torch.tensor(8.0, device=source.device))
+            else:
+                centroids.append(torch.zeros(3, device=source.device))
+                # where_mass alone as a soft emptiness signal (threshold null).
+                mass = float(field.where_mass[i, 0])
+                valid.append(torch.tensor(
+                    math.log(max(mass, 1e-12) / max(1.0 - mass, 1e-12)),
+                    device=source.device,
+                ))
+        return StageBOutput(
+            logits=torch.stack(logits).unsqueeze(1),
+            valid=torch.stack(valid),
+            centroid=torch.stack(centroids),
+            where_raw=field.where_raw,
+            where_mass=field.where_mass,
+            fields=field.fields,
+            anchors=anchors,
+            masses=field.masses,
+            anchor_centroids=field.centroids,
+        )
+
+    def _forward_carver(
+        self,
+        image: Tensor,
+        field,
+        anchors: Tensor,
+        where: Tensor,
+        boundary_image: Tensor | None,
+    ) -> StageBOutput:
+        """B2 dense carver path (parent baseline)."""
         log_where = where.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
         log_mass = (
             field.where_mass.clamp_min(LOG_FLOOR).log() / -math.log(LOG_FLOOR)
@@ -788,10 +887,6 @@ class StageB(nn.Module):
         parts = ([anchors] if self.carver_sees_anchors else []) + [
             field.fields, where, log_where, log_mass
         ]
-        # Under autocast the boundary features come back in the low-precision
-        # dtype while the geometry is float32; the concatenation has to agree,
-        # and matching the features is what keeps the 25-channel input at 128^3
-        # off the float32 path.
         dtype = boundary.dtype if boundary is not None else torch.float32
         logits, heatmap = self.carver(
             torch.cat(([boundary] if boundary is not None else []) + [p.to(dtype) for p in parts], dim=1),
@@ -799,10 +894,7 @@ class StageB(nn.Module):
         )
 
         if self.alpha is not None:
-            # The ablation: a weak explicit bias, one scalar, no other input.
             logits = logits + self.alpha * torch.logit(where.clamp(1e-4, 1 - 1e-4))
-        # Anchor voxels are the given, not the answer. The exclusion uses the
-        # predicted soft mask, never the label volume, and it is not dilated.
         logits = logits.masked_fill(anchors.amax(dim=1, keepdim=True) > 0.5, self.background_logit)
 
         return StageBOutput(

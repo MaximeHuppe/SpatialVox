@@ -1007,10 +1007,9 @@ class Trainer:
         ``permute_channels`` and ``permute_clauses``.
 
         ``permute_both`` is the control: it preserves every relation, so it must
-        not move. Note what it can still detect *here*: ``where_raw`` is a product
-        and therefore exactly permutation-invariant, so the only order dependence
-        left in the model is the carver's ``cat``. A flat control is now a much
-        weaker statement than it was under the attention architecture.
+        not move. ``where_raw`` is a product and therefore exactly
+        permutation-invariant, so the only order dependence left is the carver's
+        ``cat``.
         """
         loader = loader or self.probe_loader or self.val_loader
         if loader is None or not isinstance(self.task, StageBTask):
