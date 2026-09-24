@@ -26,7 +26,7 @@ from src.config import load_config, parse_overrides
 from src.data import Corpus, ExampleDataset
 from src.engine import dice_iou
 from src.geometry import volume_center_world
-from src.instance import oracle_label_instances, propose_seed_flood, run_instance
+from src.instance import oracle_label_instances, propose_seed_flood
 from src.mapper import PositionalMapper3D
 
 
@@ -51,7 +51,6 @@ def main() -> int:
     )
     inst = cfg.model.stage_b.get("instance", {})
     dilate_radius = int(inst.get("dilate_radius", 4) if hasattr(inst, "get") else 4)
-    score_null = float(inst.get("score_null", 0.5) if hasattr(inst, "get") else 0.5)
 
     gate, oracle_dice, recall = [], [], []
     for item in dataset:
